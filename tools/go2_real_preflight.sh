@@ -25,11 +25,7 @@ if ! ping -I "${network_interface}" -c 3 -W 1 "${robot_ip}" >"${output_dir}/ping
   exit 2
 fi
 
-source /opt/ros/jazzy/setup.bash
 source "${workspace_root}/tools/env.sh"
-diagnostic_overlay="${workspace_root}/.deps/diagnostic_updater_4.2.7/opt/ros/jazzy/lib"
-export LD_LIBRARY_PATH="${diagnostic_overlay}:${LD_LIBRARY_PATH:-}"
-source "${workspace_root}/install/setup.bash"
 export ROS_LOG_DIR="${output_dir}/ros_logs"
 
 launch_pid=""

@@ -7,9 +7,9 @@ export ROS_LOG_DIR="$PWD/log/offline"
 export GZ_SIM_RESOURCE_PATH="$PWD/install/legbot_bringup/share/legbot_bringup/models${GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}"
 export SDF_PATH="$GZ_SIM_RESOURCE_PATH${SDF_PATH:+:$SDF_PATH}"
 mkdir -p "$ROS_LOG_DIR"
-python tests/check_launch_descriptions.py
-python tests/check_model_offline.py
-python tests/check_estop_offline.py
+python3 tests/check_launch_descriptions.py
+python3 tests/check_model_offline.py
+python3 tests/check_estop_offline.py
 install/legbot_bringup/lib/legbot_bringup/pct_path_mission --self-test
 install/rl_quadruped_controller/lib/rl_quadruped_controller/policy_contract_check src/go2_description/config/himloco
 install/rl_quadruped_controller/lib/rl_quadruped_controller/policy_contract_check src/go2_description/config/go2_cts
@@ -17,8 +17,8 @@ install/rl_quadruped_controller/lib/rl_quadruped_controller/policy_contract_chec
 install/rl_quadruped_controller/lib/rl_quadruped_controller/onnx_policy_contract_check src/go2_description/config/stairs_trot
 install/rl_quadruped_controller/lib/rl_quadruped_controller/onnx_policy_contract_check src/go2_description/config/mjlab_flat
 install/rl_quadruped_controller/lib/rl_quadruped_controller/onnx_policy_contract_check src/go2_description/config/moe_cts_77k
-python tests/check_dependencies_offline.py
-python - <<'PY'
+python3 tests/check_dependencies_offline.py
+python3 - <<'PY'
 import datetime, json, platform
 from pathlib import Path
 

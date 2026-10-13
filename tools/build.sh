@@ -8,7 +8,7 @@ export CMAKE_PREFIX_PATH="${PWD}/third_party/libtorch:${PWD}/third_party/unitree
 export MAKEFLAGS=-j1
 export CMAKE_BUILD_PARALLEL_LEVEL=1
 source /opt/ros/jazzy/setup.bash
-colcon build --executor sequential "$@" --cmake-args \
+colcon build --base-paths src --executor sequential "$@" --cmake-args \
   -DPython3_EXECUTABLE=/usr/bin/python3 \
   -DPYTHON_EXECUTABLE=/usr/bin/python3 \
   -DCMAKE_BUILD_TYPE=Release \
