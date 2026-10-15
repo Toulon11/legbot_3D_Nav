@@ -1,0 +1,36 @@
+/**:
+  ros__parameters:
+    frame_id: odom
+    cloud_topic: /fast_lio/cloud_registered
+    sensor_odom_topic: /fast_lio/odometry_lidar
+    base_odom_topic: /fast_lio/odometry_base
+    waypoint_topic: /scan/waypoint_input
+    scan_goal_topic: /scan/goal
+    ready_topic: /go2/demo_ready
+    resolution: 0.25
+    max_ray_range: 9.0
+    point_stride: 8
+    max_points_per_cloud: 1000
+    max_voxels: 900000
+    sensor_sync_tolerance: 0.03
+    odom_timeout: 1.0
+    cloud_timeout: 2.0
+    obstacle_min_relative_z: -0.15
+    obstacle_max_relative_z: 0.85
+    free_min_relative_z: -0.45
+    robot_radius: 0.35
+    local_search_radius: 10.0
+    min_goal_distance: 1.0
+    max_goal_distance: 8.0
+    min_frontier_cells: 3
+    frontier_gain_weight: 1.0
+    path_cost_weight: 1.0
+    unknown_path_multiplier: 1.5
+    goal_reach_xy: 0.55
+    progress_distance: 0.35
+    progress_timeout: 12.0
+    goal_timeout: 90.0
+    goal_forward_timeout: 3.0
+    failed_frontier_cooldown: 45.0
+    no_frontier_hold: 8.0
+    observation_only: true

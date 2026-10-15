@@ -25,3 +25,4 @@ __pycache__/
 !/data/README.md
 !/data/routes/
 !/data/routes/.gitkeep
+/tmp
