@@ -511,6 +511,20 @@ Visualization Manager:
             Reliability Policy: Reliable
             Value: /fast_lio/odometry_base
           Value: false
+        - Class: rviz_default_plugins/Image
+          Enabled: true
+          Max Value: 1
+          Median window: 5
+          Min Value: 0
+          Name: Gazebo front camera
+          Normalize Range: true
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Best Effort
+            Value: /camera/image
+          Value: true
       Enabled: true
       Name: Robot sensing and state
   Enabled: true

@@ -85,6 +85,8 @@ third_party/  local SDK/runtime installations (not committed)
 | `legbot_bringup` | Launch files, the combined world, adapters, RViz configurations |
 | `go2_description` | GO2 URDF, meshes, ros2_control and policy profiles |
 | `fast_lio` | LiDAR-IMU odometry and registered point clouds |
+| `fast_livo` | Optional LiDAR-visual-inertial odometry |
+| `Sophus`, `rpg_vikit` | Source dependencies for FAST-LIVO2, built from `src/` |
 | `scan_planner` | Occupancy map, local A*, B-spline planning and GO2 command adapter |
 | `pct_planner` | Tomogram/elevation-map multi-floor global planning |
 | `ego_planner` | Optional EGO local trajectory planner |
@@ -121,6 +123,8 @@ third_party/pct/install
 ```
 
 Pinned SDK revisions are listed in [`docs/SENSOR_SDK_UPSTREAM_LOCK.json`](docs/SENSOR_SDK_UPSTREAM_LOCK.json); policy files and hashes are listed in [`docs/GO2_POLICY_MODELS_LOCK.json`](docs/GO2_POLICY_MODELS_LOCK.json). LibTorch must use the C++11 ABI. The current workspace setup uses ONNX Runtime 1.23.2.
+
+FAST-LIVO2 uses `src/Sophus` and `src/rpg_vikit`; `tools/build.sh` builds them with the workspace, without a separate vendor install step. These directories are currently independent Git checkouts, so a fresh clone of the main repository also needs their sources and the local ROS 2 adaptation changes.
 
 ## Build and verify
 

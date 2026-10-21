@@ -40,6 +40,7 @@ def setup(context):
     description = xacro.process_file(os.path.join(share('go2_description'), 'xacro/robot.xacro'),
                                      mappings={'GAZEBO': 'true', 'CLASSIC': 'false',
                                                'ENABLE_LIDAR': cfg('enable_lidar'),
+                                               'ENABLE_CAMERA': cfg('enable_camera'),
                                                'controller_config': os.path.join(share('go2_description'), 'config', controller_file)}).toxml()
     world = cfg('world')
     gz_args = ['-r', '-v', '3']
@@ -61,6 +62,8 @@ def setup(context):
     bridge_arguments = [
         '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
         '/livox/scan/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked',
+        '/camera/image@sensor_msgs/msg/Image[gz.msgs.Image',
+        '/camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo',
         '/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
         '/livox/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
     ]
@@ -144,6 +147,7 @@ def generate_launch_description():
         DeclareLaunchArgument('gui', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('headless_rendering', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('enable_lidar', default_value='true', choices=['true', 'false']),
+        DeclareLaunchArgument('enable_camera', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('require_navigation_data', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('synthetic_stair_cloud', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('synthetic_scene', default_value='stairs', choices=['stairs', 'stairs_obstacles', 'flat']),

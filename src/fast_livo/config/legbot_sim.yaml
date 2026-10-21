@@ -1,0 +1,125 @@
+/**:
+  ros__parameters:
+    common:
+      # FAST-LIVO2 subscriptions from the Gazebo ROS bridge.
+      lid_topic: /livox/points_raw
+      imu_topic: /livox/imu
+      img_topic: /camera/image
+      world_frame: odom
+      img_en: 1
+      lidar_en: 1
+      ros_driver_bug_fix: false
+    extrin_calib:
+      # livox_link -> livox_imu_link from go2_description/xacro/robot.xacro.
+      # Coordinates of the LiDAR origin in the IMU frame; axes are parallel.
+      extrinsic_T: [-0.011, -0.02329, 0.04412]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+      # From livox_link and front_camera joints in robot.xacro, plus the
+      # front_camera -> front_camera_optical rotation in go2_description/xacro/robot.xacro.
+      # p_camera = Rcl * p_lidar + Pcl.
+      Rcl: [0.0, -1.0, 0.0,
+            0.0,  0.0, -1.0,
+            1.0,  0.0, 0.0]
+      Pcl: [0.0, -0.10703, -0.17715]
+    time_offset:
+      imu_time_offset: 0.0
+      lidar_time_offset: 0.0
+      img_time_offset: 0.0
+      exposure_time_init: 0.0
+    preprocess:
+      lidar_type: 8  # Simulated PointCloud2 with XYZ and intensity.
+      scan_line: 1
+      point_filter_num: 2
+      scan_period: 0.1  # Gazebo LiDAR update_rate = 10 Hz.
+      filter_size_surf: 0.1
+      blind: 0.5
+      feature_extract_enabled: false
+    camera:
+      # Upstream FAST-LIVO2 / vikit camera parameter names, now co-located
+      # with mapping parameters on the laserMapping node.
+      cam_model: Pinhole
+      cam_width: 1280
+      cam_height: 720
+      scale: 0.5
+      # Gazebo /camera/camera_info K, measured with the camera simulation running.
+      cam_fx: 369.67277526855469
+      cam_fy: 369.67273235321045
+      cam_cx: 640.0
+      cam_cy: 360.0
+      cam_d0: 0.0
+      cam_d1: 0.0
+      cam_d2: 0.0
+      cam_d3: 0.0
+    vio:
+      max_iterations: 5
+      outlier_threshold: 1000
+      img_point_cov: 100
+      patch_size: 8
+      patch_pyrimid_level: 3
+      normal_en: true
+      raycast_en: false
+      inverse_composition_en: false
+      exposure_estimate_en: true
+      inv_expo_cov: 0.1
+    imu:
+      imu_en: true
+      imu_int_frame: 30
+      acc_cov: 0.1
+      gyr_cov: 0.1
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+    lio:
+      max_iterations: 5
+      dept_err: 0.02
+      beam_err: 0.05
+      min_eigen_value: 0.0025
+      voxel_size: 0.5
+      max_layer: 2
+      max_points_num: 50
+      layer_init_num: [5, 5, 5, 5, 5]
+    local_map:
+      map_sliding_en: false
+      half_map_size: 100
+      sliding_thresh: 8.0
+    publish:
+      dense_map_en: false
+      pub_effect_point_en: false
+      pub_plane_en: false
+      pub_scan_num: 1
+      blind_rgb_points: 0.0
+      navigation_cloud_on_lio: true
+    output_topics:
+      # Navigation-compatible outputs; all other names follow upstream.
+      cloud_registered: /fast_lio/cloud_registered
+      visualization_marker: /visualization_marker
+      cloud_visual_sub_map_before: /cloud_visual_sub_map_before
+      cloud_effected: /cloud_effected
+      laser_map: /Laser_map
+      odometry: /fast_lio/odometry_sensor
+      path: /path
+      planner_normal: /planner_normal
+      voxels: /voxels
+      dyn_obj: /dyn_obj
+      dyn_obj_removed: /dyn_obj_removed
+      dyn_obj_dbg_hist: /dyn_obj_dbg_hist
+      mavros_vision_pose: /mavros/vision_pose/pose
+      rgb_img: /rgb_img
+      imu_propagate: /LIVO2/imu_propagate
+      planes: /planes
+    uav:
+      imu_rate_odom: false
+      gravity_align_en: false
+    evo:
+      seq_name: "CBD_Building_01"
+      pose_output_en: false
+    pcd_save:
+      pcd_save_en: false
+      type: 0  # 0: World Frame, 1: Body Frame.
+      colmap_output_en: false
+      filter_size_pcd: 0.15
+      interval: -1
+    image_save:
+      img_save_en: false
+      interval: 1

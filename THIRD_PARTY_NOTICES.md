@@ -48,3 +48,15 @@ The exact model repositories, revisions and file hashes for the two additional
 GO2 policies are recorded in `docs/GO2_POLICY_MODELS_LOCK.json`. Their model
 licenses cover the weights; their corresponding deployment source remains
 subject to each source repository's own license.
+
+## FAST-LIVO2 source dependencies
+
+The following dependencies are copied into `src/` as ordinary source files.
+Their nested `.git` directories were removed so the parent repository tracks
+the source directly. Both copies came from `/home/likai/robot_ws/src/` at the
+revisions below.
+
+| Directory | Upstream repository | Source revision | Local changes |
+| --- | --- | --- | --- |
+| `src/Sophus/` | `https://github.com/strasdat/Sophus.git` | tag `1.22.10`, commit `de0f8d3d92bf776271e16de56d1803940ebccab9` | None to source files; generated `build/` is ignored. |
+| `src/rpg_vikit/` | `https://github.com/Robotic-Developer-Road/rpg_vikit.git` | commit `4b7abc838f5d2ca9137f70f122eaaeff9eaf0f50` | ROS 2/Jazzy build integration in `vikit_common` and `vikit_ros` CMake/package files; `.gitignore` ignores generated binaries. |

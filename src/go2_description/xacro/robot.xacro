@@ -9,6 +9,7 @@
   <xacro:arg name="GAZEBO" default="false"/>
   <xacro:arg name="CLASSIC" default="false"/>
   <xacro:arg name="ENABLE_LIDAR" default="true"/>
+  <xacro:arg name="ENABLE_CAMERA" default="true"/>
   <xacro:arg name="controller_config" default="$(find go2_description)/config/gazebo.yaml"/>
 
   <xacro:include filename="$(find go2_description)/xacro/const.xacro"/>
@@ -136,6 +137,13 @@
   <link name="front_camera">
   </link>
 
+  <joint name="front_camera_optical_joint" type="fixed">
+    <parent link="front_camera"/>
+    <child link="front_camera_optical"/>
+    <origin xyz="0 0 0" rpy="-1.57079632679 0 -1.57079632679"/>
+  </joint>
+  <link name="front_camera_optical"/>
+
   <joint name="lidar_joint" type="fixed">
     <origin
         xyz="0.28945 0 -0.046825" rpy="0 2.8782 0"/>
@@ -206,6 +214,22 @@
     <gazebo reference="livox_imu_link">
       <sensor name="livox_imu" type="imu"><topic>/livox/imu</topic><gz_frame_id>livox_imu_link</gz_frame_id><always_on>true</always_on><update_rate>200</update_rate></sensor>
     </gazebo>
+    <xacro:if value="$(arg ENABLE_CAMERA)">
+      <gazebo reference="front_camera">
+        <sensor name="front_camera" type="camera">
+          <camera>
+            <horizontal_fov>2.094</horizontal_fov>
+            <image><width>1280</width><height>720</height></image>
+            <clip><near>0.1</near><far>15</far></clip>
+            <noise><type>gaussian</type><mean>0.0</mean><stddev>0.007</stddev></noise>
+            <optical_frame_id>front_camera_optical</optical_frame_id>
+            <camera_info_topic>/camera/camera_info</camera_info_topic>
+          </camera>
+          <topic>/camera/image</topic><gz_frame_id>front_camera_optical</gz_frame_id>
+          <always_on>true</always_on><update_rate>15</update_rate><visualize>false</visualize>
+        </sensor>
+      </gazebo>
+    </xacro:if>
     <xacro:if value="$(arg ENABLE_LIDAR)">
       <gazebo reference="livox_link">
         <sensor name="navigation_lidar" type="gpu_lidar">

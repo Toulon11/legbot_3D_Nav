@@ -83,6 +83,8 @@ third_party/pct/install
 
 SDK 固定版本见 [`docs/SENSOR_SDK_UPSTREAM_LOCK.json`](docs/SENSOR_SDK_UPSTREAM_LOCK.json)，模型来源、输入维度和 SHA-256 见 [`docs/GO2_POLICY_MODELS_LOCK.json`](docs/GO2_POLICY_MODELS_LOCK.json)。
 
+FAST-LIVO2 的源码依赖 `Sophus`、`rpg_vikit` 位于 `src/`，由 `tools/build.sh` 与其他功能包一起构建，不再需要单独执行依赖安装脚本。当前这两个目录仍是独立的 Git 仓库；在新机器克隆主仓库时，需要另外准备它们及本地的 ROS 2 适配修改。
+
 ## 目录说明
 
 | 路径 | 内容 |
@@ -90,6 +92,8 @@ SDK 固定版本见 [`docs/SENSOR_SDK_UPSTREAM_LOCK.json`](docs/SENSOR_SDK_UPSTR
 | `src/legbot_bringup` | 总启动入口、适配器、世界、RViz 配置 |
 | `src/go2_description` | GO2 模型、控制配置、策略权重 |
 | `src/fast_lio` | 激光—惯性里程计 |
+| `src/fast_livo` | 可选的激光—视觉—惯性里程计 |
+| `src/Sophus`、`src/rpg_vikit` | FAST-LIVO2 的源码依赖 |
 | `src/scan_planner` | 局部占据图、搜索、轨迹优化、命令适配 |
 | `src/pct_planner` | 多层层析图、全局规划和轨迹优化 |
 | `src/ego_planner` | EGO 局部规划器 |
