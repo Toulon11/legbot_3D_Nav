@@ -1024,6 +1024,11 @@ namespace scan_planner
       return false;
     }
 
+    // The refreshed global reference starts at the measured current pose.
+    // Its time coordinate cannot be inherited from the previous reference:
+    // the new trajectory may be shorter than the old progress time.
+    reference_progress_time_ = 0.0;
+
     if (!checkGlobalTargetOccupancy())
       return false;
 
@@ -1122,7 +1127,8 @@ namespace scan_planner
   bool SCANReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
   {
 
-    getLocalTarget();
+    if (!getLocalTarget())
+      return false;
 
     // Do not hand an occupied target to A*/B-spline optimization. If the
     // reference has no free point in the local window, keep the robot stopped
@@ -1214,7 +1220,7 @@ namespace scan_planner
     return true;
   }
 
-  void SCANReplanFSM::getLocalTarget()
+  bool SCANReplanFSM::getLocalTarget()
   {
     const bool manual_xy_only = navi_mode_ == NAVI_MODE::MANUAL_TARGET &&
                                 !manual_goal_use_message_z_;
@@ -1252,6 +1258,15 @@ namespace scan_planner
     double t_step = max_vel > 1e-6 ? planning_horizon_ / 20.0 / max_vel : 0.01;
     t_step = std::max(t_step, 0.01);
 
+    if (!std::isfinite(duration) || duration <= 0.0)
+    {
+      ROS_ERROR("[SCANReplanFSM] Invalid global trajectory duration: %.3f.", duration);
+      return false;
+    }
+
+    reference_progress_time_ = std::isfinite(reference_progress_time_)
+                                   ? std::clamp(reference_progress_time_, 0.0, duration)
+                                   : 0.0;
     double t_proj = reference_progress_time_;
     double min_dist_to_start = 9999.0;
     const double search_start = std::max(0.0, reference_progress_time_ - 0.2);
@@ -1417,6 +1432,7 @@ namespace scan_planner
     // reference waypoint, and visualize the corresponding horizontal yaw.
     visualization_->displayLocalTarget(local_target_pt_);
     visualization_->displayHeadingVector(odom_pos_, local_target_pt_);
+    return true;
   }
 
 } // namespace scan_planner

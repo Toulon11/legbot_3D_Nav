@@ -45,6 +45,7 @@ void VoxelMap::mark(const Voxel &v, bool hit) {
 }
 std::size_t VoxelMap::integrate(const Point &origin, const std::vector<Point> &points,
                                 double base_z) {
+  if (!std::isfinite(base_z)) return 0;
   std::size_t used = 0;
   for (const auto &point : points) {
     if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) continue;
@@ -57,7 +58,7 @@ std::size_t VoxelMap::integrate(const Point &origin, const std::vector<Point> &p
       double fraction = static_cast<double>(step) / steps;
       Voxel v = key({origin[0] + delta[0] * fraction,
                      origin[1] + delta[1] * fraction,
-                     origin[2] + delta[2] * fraction});
+                     origin[2] - base_z + delta[2] * fraction});
       if (!last || !(v == *last)) {
         mark(v, false);
         last = v;
@@ -65,19 +66,18 @@ std::size_t VoxelMap::integrate(const Point &origin, const std::vector<Point> &p
     }
     bool obstacle = point[2] >= base_z + cfg_.obstacle_min_relative_z &&
                     point[2] <= base_z + cfg_.obstacle_max_relative_z;
-    mark(key(point), obstacle);
+    mark(key({point[0], point[1], point[2] - base_z}), obstacle);
     ++used;
   }
   if (used) ++version_;
   return used;
 }
-std::unordered_map<Cell, int, CellHash> VoxelMap::project(double base_z,
-                                                            const XY &center_xy) const {
+std::unordered_map<Cell, int, CellHash> VoxelMap::project(const XY &center_xy) const {
   std::unordered_map<Cell, int, CellHash> grid;
   double radius = cfg_.local_search_radius + cfg_.resolution * 2.0;
-  double occupied_low = base_z + cfg_.obstacle_min_relative_z;
-  double free_low = base_z + cfg_.free_min_relative_z;
-  double high = base_z + cfg_.obstacle_max_relative_z;
+  double occupied_low = cfg_.obstacle_min_relative_z;
+  double free_low = cfg_.free_min_relative_z;
+  double high = cfg_.obstacle_max_relative_z;
   for (const auto &[voxel, evidence] : voxels_) {
     auto xyz = center(voxel);
     if (xyz[2] < free_low || xyz[2] > high || std::abs(xyz[0] - center_xy[0]) > radius ||
@@ -90,11 +90,12 @@ std::unordered_map<Cell, int, CellHash> VoxelMap::project(double base_z,
 }
 
 Selection select_frontier(const VoxelMap &map, const Point &robot, const Settings &cfg,
-                          const std::vector<XY> &suppressed) {
+                          const std::vector<XY> &suppressed,
+                          const std::vector<XY> &external_obstacles) {
   Selection result;
   auto robot_voxel = map.key(robot);
   Cell origin{robot_voxel.x, robot_voxel.y};
-  auto grid = map.project(robot[2], {robot[0], robot[1]});
+  auto grid = map.project({robot[0], robot[1]});
   int radius = static_cast<int>(std::ceil(cfg.local_search_radius / cfg.resolution));
   auto inside = [&](const Cell &c) {
     return std::abs(c.x - origin.x) <= radius && std::abs(c.y - origin.y) <= radius;
@@ -107,6 +108,15 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
       for (int dy = -inflation; dy <= inflation; ++dy)
         if (std::hypot(dx, dy) * cfg.resolution <= cfg.robot_radius)
           blocked.insert({cell.x + dx, cell.y + dy});
+  }
+  for (const auto &obstacle : external_obstacles) {
+    if (!std::isfinite(obstacle[0]) || !std::isfinite(obstacle[1])) continue;
+    Cell center{static_cast<int>(std::floor(obstacle[0] / cfg.resolution)),
+                static_cast<int>(std::floor(obstacle[1] / cfg.resolution))};
+    for (int dx = -inflation; dx <= inflation; ++dx)
+      for (int dy = -inflation; dy <= inflation; ++dy)
+        if (std::hypot(dx, dy) * cfg.resolution <= cfg.robot_radius)
+          blocked.insert({center.x + dx, center.y + dy});
   }
   std::unordered_set<Cell, CellHash> frontier;
   for (const auto &[cell, state] : grid) {

@@ -53,7 +53,8 @@ class VoxelMap {
   Point center(const Voxel &voxel) const;
   XY center(const Cell &cell) const;
   std::size_t integrate(const Point &origin, const std::vector<Point> &points, double base_z);
-  std::unordered_map<Cell, int, CellHash> project(double base_z, const XY &center_xy) const;
+  // Z evidence is stored relative to the base height at observation time.
+  std::unordered_map<Cell, int, CellHash> project(const XY &center_xy) const;
   std::size_t size() const { return voxels_.size(); }
   std::size_t version() const { return version_; }
 
@@ -70,6 +71,7 @@ struct Selection {
   std::size_t clusters = 0;
 };
 Selection select_frontier(const VoxelMap &map, const Point &robot, const Settings &cfg,
-                          const std::vector<XY> &suppressed);
+                          const std::vector<XY> &suppressed,
+                          const std::vector<XY> &external_obstacles = {});
 
 }  // namespace legbot_exploration

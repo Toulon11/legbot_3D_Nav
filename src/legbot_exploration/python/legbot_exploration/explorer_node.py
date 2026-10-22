@@ -35,6 +35,7 @@ class Explorer(Node):
             ('frame_id', 'odom'), ('cloud_topic', '/fast_lio/cloud_registered'),
             ('sensor_odom_topic', '/fast_lio/odometry_lidar'),
             ('base_odom_topic', '/fast_lio/odometry_base'),
+            ('planner_occupancy_topic', '/local_planner/grid_map/occupancy_inflate'),
             ('waypoint_topic', '/scan/waypoint_input'), ('scan_goal_topic', '/scan/goal'),
             ('ready_topic', '/go2/demo_ready'), ('point_stride', 8),
             ('max_points_per_cloud', 1000), ('sensor_sync_tolerance', 0.03),
@@ -42,13 +43,19 @@ class Explorer(Node):
             ('goal_reach_xy', 0.55), ('progress_distance', 0.35),
             ('progress_timeout', 12.0), ('goal_timeout', 90.0),
             ('goal_forward_timeout', 3.0), ('failed_frontier_cooldown', 45.0),
-            ('no_frontier_hold', 8.0), ('observation_only', True)):
+            ('no_frontier_hold', 8.0), ('planner_occupancy_timeout', 2.0),
+            ('planner_occupancy_height_tolerance', 0.5),
+            ('near_goal_dwell', 1.5), ('blocked_goal_dwell', 2.0),
+            ('observation_only', True)):
             setattr(self, name, self.declare_parameter(name, default).value)
         if (cfg.resolution <= 0 or cfg.local_search_radius <= 0 or self.point_stride < 1
                 or self.max_points_per_cloud < 1 or cfg.max_voxels < 1):
             raise ValueError('resolution, search radius, stride, max points and max voxels must be positive')
         self.sensor_poses = deque(maxlen=100)
+        self.base_poses = deque(maxlen=100)
         self.pending_clouds = deque(maxlen=5)
+        self.external_obstacles = []
+        self.occupancy_wall = 0.0
         self.base = None
         self.base_wall = 0.0
         self.cloud_wall = 0.0
@@ -56,6 +63,7 @@ class Explorer(Node):
         self.paused = False
         self.active = None
         self.clearing = False
+        self.clearing_reason = ''
         self.last_clear_wall = 0.0
         self.clear_future = None
         self.suppressed = []
@@ -70,6 +78,9 @@ class Explorer(Node):
         self.create_subscription(PointCloud2, self.cloud_topic, self.on_cloud, qos_profile_sensor_data)
         self.create_subscription(Odometry, self.sensor_odom_topic, self.on_sensor, qos_profile_sensor_data)
         self.create_subscription(Odometry, self.base_odom_topic, self.on_base, qos_profile_sensor_data)
+        if self.planner_occupancy_topic:
+            self.create_subscription(PointCloud2, self.planner_occupancy_topic,
+                                     self.on_occupancy, qos_profile_sensor_data)
         self.create_subscription(Bool, self.ready_topic, self.on_ready, state_qos)
         self.create_subscription(PoseStamped, self.waypoint_topic, self.on_input, 10)
         self.create_subscription(PoseStamped, self.scan_goal_topic, self.on_goal, 10)
@@ -104,8 +115,28 @@ class Explorer(Node):
         p = msg.pose.pose.position
         if all(math.isfinite(v) for v in (p.x, p.y, p.z)):
             self.base = (p.x, p.y, p.z)
+            self.base_poses.append((stamp_ns(msg.header.stamp), self.base))
             self.base_wall = time.monotonic()
             self.process_clouds()
+
+    def on_occupancy(self, msg):
+        if msg.header.frame_id != self.frame_id or self.base is None:
+            return
+        try:
+            self.external_obstacles = [
+                (float(p[0]), float(p[1]))
+                for p in point_cloud2.read_points(msg, field_names=('x', 'y', 'z'), skip_nans=True)
+                if abs(float(p[2]) - self.base[2]) <= self.planner_occupancy_height_tolerance]
+        except (ValueError, KeyError) as exc:
+            self.get_logger().warning('Invalid SCAN occupancy cloud: %s' % exc)
+            return
+        self.occupancy_wall = time.monotonic()
+
+    def occupancy_fresh(self, now):
+        return self.occupancy_wall > 0 and now - self.occupancy_wall <= self.planner_occupancy_timeout
+
+    def planner_blocks(self, xy):
+        return any(math.dist(xy, p) <= self.cfg.robot_radius for p in self.external_obstacles)
 
     def on_cloud(self, msg):
         if msg.header.frame_id != self.frame_id:
@@ -114,7 +145,7 @@ class Explorer(Node):
         self.process_clouds()
 
     def process_clouds(self):
-        if self.base is None or not self.sensor_poses:
+        if self.base is None or not self.sensor_poses or not self.base_poses:
             return
         now = time.monotonic()
         if now - self.base_wall > self.odom_timeout:
@@ -123,7 +154,8 @@ class Explorer(Node):
         for msg in self.pending_clouds:
             if not self.integrate_cloud(msg, now):
                 cloud_stamp = stamp_ns(msg.header.stamp)
-                if self.sensor_poses[-1][0] - cloud_stamp <= self.sensor_sync_tolerance * 1e9:
+                if (self.sensor_poses[-1][0] - cloud_stamp <= self.sensor_sync_tolerance * 1e9 or
+                        self.base_poses[-1][0] - cloud_stamp <= self.sensor_sync_tolerance * 1e9):
                     remaining.append(msg)
         self.pending_clouds = remaining
 
@@ -131,6 +163,9 @@ class Explorer(Node):
         cloud_stamp = stamp_ns(msg.header.stamp)
         sensor_stamp, sensor = min(self.sensor_poses, key=lambda item: abs(item[0] - cloud_stamp))
         if abs(sensor_stamp - cloud_stamp) > self.sensor_sync_tolerance * 1e9:
+            return False
+        base_stamp, base_at_cloud = min(self.base_poses, key=lambda item: abs(item[0] - cloud_stamp))
+        if abs(base_stamp - cloud_stamp) > self.sensor_sync_tolerance * 1e9:
             return False
         points = []
         try:
@@ -143,7 +178,7 @@ class Explorer(Node):
         except (ValueError, KeyError) as exc:
             self.get_logger().warning('Invalid point cloud: %s' % exc)
             return True
-        if self.map.integrate(sensor, points, self.base[2]):
+        if self.map.integrate(sensor, points, base_at_cloud[2]):
             self.cloud_wall = now
         return True
 
@@ -185,7 +220,8 @@ class Explorer(Node):
     def on_ack(self, msg):
         if self.active and self.active['stamp'] is not None:
             xy = (msg.pose.position.x, msg.pose.position.y)
-            if (stamp_ns(msg.header.stamp) == self.active['stamp']
+            if (msg.header.frame_id == self.frame_id and
+                    stamp_ns(msg.header.stamp) == self.active['stamp']
                     and math.dist(xy, self.active['xy']) <= self.goal_reach_xy):
                 self.active['ack'] = True
                 self.finish_if_complete()
@@ -216,9 +252,10 @@ class Explorer(Node):
     def start_clear(self, reason):
         if self.active is None or self.clearing:
             return
-        if reason != 'paused':
+        if reason not in ('paused', 'proximity_reached'):
             self.suppressed.append((self.active['xy'], time.monotonic() + self.failed_frontier_cooldown))
         self.clearing = True
+        self.clearing_reason = reason
         self.report('clearing_goal', reason=reason)
         self.request_clear()
 
@@ -242,7 +279,12 @@ class Explorer(Node):
                 self.clearing = False
                 self.last_clear_wall = time.monotonic()
                 self.active = None
-                self.report('goal_cleared')
+                if self.clearing_reason == 'proximity_reached':
+                    self.empty_since = None
+                    self.report('goal_reached', detail='proximity_fallback')
+                else:
+                    self.report('goal_cleared')
+                self.clearing_reason = ''
         return True
 
     def publish_target(self, xy):
@@ -258,7 +300,8 @@ class Explorer(Node):
         self.active = {'xy': xy, 'sent': now, 'input_stamp': stamp_ns(msg.header.stamp),
                        'stamp': None, 'forwarded': None,
                        'best_distance': distance, 'progress_wall': now,
-                       'ack': False, 'armed': False, 'complete': False}
+                       'ack': False, 'armed': False, 'complete': False,
+                       'near_since': None, 'blocked_since': None}
         self.waypoint_pub.publish(msg)
         self.report('goal_sent', goal=xy)
 
@@ -298,6 +341,23 @@ class Explorer(Node):
                     self.report('goal_not_forwarded')
                 return
             distance = math.dist(target['xy'], self.base[:2])
+            if distance <= self.goal_reach_xy:
+                target['blocked_since'] = None
+                if target['near_since'] is None:
+                    target['near_since'] = now
+                elif now - target['near_since'] >= self.near_goal_dwell:
+                    self.start_clear('proximity_reached')
+                    return
+            else:
+                target['near_since'] = None
+                if self.occupancy_fresh(now) and self.planner_blocks(target['xy']):
+                    if target['blocked_since'] is None:
+                        target['blocked_since'] = now
+                    elif now - target['blocked_since'] >= self.blocked_goal_dwell:
+                        self.start_clear('target_occupied_in_scan')
+                        return
+                else:
+                    target['blocked_since'] = None
             if distance < target['best_distance'] - self.progress_distance:
                 target['best_distance'] = distance
                 target['progress_wall'] = now
@@ -309,11 +369,13 @@ class Explorer(Node):
         if len(self.map.voxels) >= self.cfg.max_voxels:
             self.report('map_capacity_reached')
             return
-        if not any(value == 0 for value in self.map.project(self.base[2], self.base[:2]).values()):
+        if not any(value == 0 for value in self.map.project(self.base[:2]).values()):
             self.report('waiting_for_free_space')
             return
         suppressed_xy = [xy for xy, _ in self.suppressed]
-        goal, score, clusters = select_frontier(self.map, self.base, self.cfg, suppressed_xy)
+        obstacles = self.external_obstacles if self.occupancy_fresh(now) else ()
+        goal, score, clusters = select_frontier(
+            self.map, self.base, self.cfg, suppressed_xy, obstacles)
         self.publish_marker(goal, clusters)
         if goal is None:
             if clusters > 0:

@@ -124,7 +124,7 @@ namespace scan_planner
     bool referenceGoalReached() const;
     bool goalFloorMatches() const;
     bool checkGlobalTargetOccupancy();
-    void getLocalTarget();
+    bool getLocalTarget();
     void finishProcess();
     void publishSelfInflationMarker();
     double getOdomYaw() const;

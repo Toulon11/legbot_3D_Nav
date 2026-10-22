@@ -2,6 +2,8 @@
 #define _PLAN_CONTAINER_H_
 
 #include <Eigen/Eigen>
+#include <algorithm>
+#include <cmath>
 #include <vector>
 #include <legbot_runtime/runtime.hpp>
 
@@ -64,6 +66,12 @@ namespace scan_planner
 
     Eigen::Vector3d getPosition(double t)
     {
+      // A new global reference clears the local spline.  Clamp queries and
+      // use the global polynomial until another local spline is installed.
+      t = std::isfinite(t) ? std::clamp(t, 0.0, global_duration_) : 0.0;
+      if (local_traj_.empty())
+        return global_traj_.evaluate(t);
+
       if (t >= -1e-3 && t <= local_start_time_)
       {
         return global_traj_.evaluate(t - time_increase_ + last_time_inc_);
@@ -82,6 +90,10 @@ namespace scan_planner
 
     Eigen::Vector3d getVelocity(double t)
     {
+      t = std::isfinite(t) ? std::clamp(t, 0.0, global_duration_) : 0.0;
+      if (local_traj_.empty())
+        return global_traj_.evaluateVel(t);
+
       if (t >= -1e-3 && t <= local_start_time_)
       {
         return global_traj_.evaluateVel(t);
@@ -100,6 +112,10 @@ namespace scan_planner
 
     Eigen::Vector3d getAcceleration(double t)
     {
+      t = std::isfinite(t) ? std::clamp(t, 0.0, global_duration_) : 0.0;
+      if (local_traj_.empty())
+        return global_traj_.evaluateAcc(t);
+
       if (t >= -1e-3 && t <= local_start_time_)
       {
         return global_traj_.evaluateAcc(t);

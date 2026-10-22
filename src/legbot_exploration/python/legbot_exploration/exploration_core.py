@@ -48,6 +48,8 @@ class VoxelMap:
         self.voxels[key] = max(-3, min(6, (previous or 0) + (3 if hit else -1)))
 
     def integrate(self, origin, points, base_z):
+        if not math.isfinite(base_z):
+            return 0
         inserted = 0
         for point in points:
             if not all(math.isfinite(v) for v in point):
@@ -62,11 +64,11 @@ class VoxelMap:
                 fraction = step / steps
                 cell = self.key((origin[0] + dx * fraction,
                                  origin[1] + dy * fraction,
-                                 origin[2] + dz * fraction))
+                                 origin[2] - base_z + dz * fraction))
                 if cell != last:
                     self._mark(cell, False)
                     last = cell
-            endpoint = self.key(point)
+            endpoint = self.key((point[0], point[1], point[2] - base_z))
             obstacle = (base_z + self.cfg.obstacle_min_relative_z <= point[2]
                         <= base_z + self.cfg.obstacle_max_relative_z)
             self._mark(endpoint, obstacle)
@@ -75,13 +77,13 @@ class VoxelMap:
             self.version += 1
         return inserted
 
-    def project(self, base_z, center_xy):
-        """Return occupied/free XY cells in the current robot height slice."""
+    def project(self, center_xy):
+        """Return occupied/free XY cells in the base-relative height slice."""
         xy = {}
         r = self.cfg.local_search_radius + self.cfg.resolution * 2
-        occupied_low = base_z + self.cfg.obstacle_min_relative_z
-        free_low = base_z + self.cfg.free_min_relative_z
-        high = base_z + self.cfg.obstacle_max_relative_z
+        occupied_low = self.cfg.obstacle_min_relative_z
+        free_low = self.cfg.free_min_relative_z
+        high = self.cfg.obstacle_max_relative_z
         for (x, y, z), value in self.voxels.items():
             wx, wy, wz = self.cell_center((x, y, z))
             if not free_low <= wz <= high or abs(wx - center_xy[0]) > r or abs(wy - center_xy[1]) > r:
@@ -98,10 +100,10 @@ NEIGHBORS4 = ((1, 0), (-1, 0), (0, 1), (0, -1))
 NEIGHBORS8 = NEIGHBORS4 + ((1, 1), (1, -1), (-1, 1), (-1, -1))
 
 
-def select_frontier(voxels, robot_xyz, settings, suppressed=()):
+def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacles=()):
     """Return (goal XY, score, frontier count), or (None, None, count)."""
     center = voxels.key(robot_xyz)[:2]
-    grid = voxels.project(robot_xyz[2], robot_xyz[:2])
+    grid = voxels.project(robot_xyz[:2])
     radius = math.ceil(settings.local_search_radius / settings.resolution)
     occupied = {cell for cell, value in grid.items() if value == 1}
     inflation = math.ceil(settings.robot_radius / settings.resolution)
@@ -111,6 +113,13 @@ def select_frontier(voxels, robot_xyz, settings, suppressed=()):
             for dy in range(-inflation, inflation + 1):
                 if math.hypot(dx, dy) * settings.resolution <= settings.robot_radius:
                     blocked.add((x + dx, y + dy))
+    for x, y in external_obstacles:
+        if math.isfinite(x) and math.isfinite(y):
+            cx, cy = math.floor(x / settings.resolution), math.floor(y / settings.resolution)
+            for dx in range(-inflation, inflation + 1):
+                for dy in range(-inflation, inflation + 1):
+                    if math.hypot(dx, dy) * settings.resolution <= settings.robot_radius:
+                        blocked.add((cx + dx, cy + dy))
 
     def inside(cell):
         return abs(cell[0] - center[0]) <= radius and abs(cell[1] - center[1]) <= radius

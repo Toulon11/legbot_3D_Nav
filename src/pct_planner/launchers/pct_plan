@@ -22,9 +22,9 @@ if [[ ! -x "${pct_python}" ]]; then
   exit 1
 fi
 pct_python="$(cd "$(dirname "${pct_python}")" && pwd)/$(basename "${pct_python}")"
-if [[ ! -f "${pct_lib_dir}/libmetis-gtsam.so" ]]; then
-  echo "[PCT preflight] libmetis-gtsam.so missing: ${pct_lib_dir}" >&2
-  echo "Set PCT_THIRDPARTY_LIB_DIR to the directory containing this library." >&2
+if [[ ! -d "${pct_lib_dir}" ]]; then
+  echo "[PCT preflight] Third-party library directory missing: ${pct_lib_dir}" >&2
+  echo "Set PCT_THIRDPARTY_LIB_DIR to the installed library directory." >&2
   exit 1
 fi
 pct_lib_dir="$(cd "${pct_lib_dir}" && pwd)"
@@ -34,18 +34,22 @@ if ! compgen -G "${pct_native_lib_dir}/a_star*.so" >/dev/null; then
   exit 1
 fi
 
-export LD_LIBRARY_PATH="${pct_lib_dir}:${pct_native_lib_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+pct_library_path="${pct_lib_dir}"
+for multiarch_dir in "${pct_lib_dir}"/*-linux-gnu; do
+  if [[ -d "${multiarch_dir}" ]]; then
+    pct_library_path="${multiarch_dir}:${pct_library_path}"
+  fi
+done
+export LD_LIBRARY_PATH="${pct_library_path}:${pct_native_lib_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export PYTHONPATH="${pct_native_lib_dir}:${pct_planner_dir}:${pct_planner_dir}/scripts${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONDONTWRITEBYTECODE=1
 
 "${pct_python}" -c '
 import ast
-import ctypes
 from pathlib import Path
 import sys
 if sys.version_info[:2] != (3, 12):
     raise SystemExit("[PCT preflight] Native PCT modules require Python 3.12")
-ctypes.CDLL("libmetis-gtsam.so")
 from lib import a_star, ele_planner, traj_opt, py_map_manager
 import open3d, cupy, rclpy
 from planner_wrapper import TomogramPlanner

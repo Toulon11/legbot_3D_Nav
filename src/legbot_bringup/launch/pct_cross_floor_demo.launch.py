@@ -90,11 +90,11 @@ def setup(context):
             # grid-map and marker headers.
             'frame_id': 'odom',
             'manual_goal_use_message_z': 'true',
-            # The learned gait can settle just outside SCAN's generic 0.40 m
-            # point-goal radius after this long route.  A 0.50 m terminal
-            # radius avoids a zero-speed deadlock while remaining much
-            # smaller than a stair tread/platform transition.
-            'finish_dist': '0.50',
+            # The learned gait can settle about 0.54 m from the final goal
+            # after the terminal slowdown. Keep the mission's arrival circle
+            # beyond that repeatable stall while still requiring the top
+            # floor via the separate Z gate.
+            'finish_dist': '0.65',
             'odom_topic': odom_topic,
             'cloud_topic': cloud_topic,
             'sensor_pose_topic': sensor_pose_topic,

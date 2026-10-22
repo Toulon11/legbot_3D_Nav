@@ -60,6 +60,8 @@ class Explorer : public rclcpp::Node {
      auto waypoint_topic = declare_parameter<std::string>("waypoint_topic", "/scan/waypoint_input"); // 手动 waypoint 主题
      auto goal_topic = declare_parameter<std::string>("scan_goal_topic", "/scan/goal"); // 上层规划目标主题
      auto ready_topic = declare_parameter<std::string>("ready_topic", "/go2/demo_ready"); // 探测准备状态主题
+     auto occupancy_topic = declare_parameter<std::string>(
+         "planner_occupancy_topic", "/local_planner/grid_map/occupancy_inflate");
      point_stride_ = declare_parameter<int>("point_stride", 8);                       // 点云抽稀步长
      max_points_ = declare_parameter<int>("max_points_per_cloud", 1000);           // 单帧最大采点数
      sync_tolerance_ = declare_parameter<double>("sensor_sync_tolerance", 0.03);   // 同步容差（秒）
@@ -72,6 +74,10 @@ class Explorer : public rclcpp::Node {
      forward_timeout_ = declare_parameter<double>("goal_forward_timeout", 3.0);
      cooldown_ = declare_parameter<double>("failed_frontier_cooldown", 45.0);
      no_frontier_hold_ = declare_parameter<double>("no_frontier_hold", 8.0);
+     occupancy_timeout_ = declare_parameter<double>("planner_occupancy_timeout", 2.0);
+     occupancy_height_tolerance_ = declare_parameter<double>("planner_occupancy_height_tolerance", 0.5);
+     near_goal_dwell_ = declare_parameter<double>("near_goal_dwell", 1.5);
+     blocked_goal_dwell_ = declare_parameter<double>("blocked_goal_dwell", 2.0);
      observation_only_ = declare_parameter<bool>("observation_only", true);
 
      // 参数合法性检查（分辨率、搜索半径、抽稀步长、点数、体素上限必须 > 0）
@@ -96,6 +102,10 @@ class Explorer : public rclcpp::Node {
      base_sub_ = create_subscription<nav_msgs::msg::Odometry>(
          base_topic, rclcpp::SensorDataQoS(),
          [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) { on_base(*msg); });
+     if (!occupancy_topic.empty())
+       occupancy_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+           occupancy_topic, rclcpp::SensorDataQoS(),
+           [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { on_occupancy(*msg); });
      ready_sub_ = create_subscription<std_msgs::msg::Bool>(
          ready_topic, state_qos,
          [this](std_msgs::msg::Bool::ConstSharedPtr msg) { ready_ = msg->data; });
@@ -148,6 +158,8 @@ class Explorer : public rclcpp::Node {
      bool ack = false;             // 是否收到前进确认（Ack）
      bool armed = false;           // 是否已收到前进前的 “armed” 标记（mission_complete false）
      bool complete = false;        // 是否已收到完成信号（mission_complete true）
+     std::optional<double> near_since;
+     std::optional<double> blocked_since;
    };
    struct Suppressed { le::XY xy; double expiry; }; // 被抑制的前沿（冷却）
 
@@ -214,8 +226,41 @@ class Explorer : public rclcpp::Node {
      const auto &p = msg.pose.pose.position;
      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) return;
      base_ = le::Point{p.x, p.y, p.z};
+     base_poses_.push_back({stamp_ns(msg.header.stamp), *base_});
+     if (base_poses_.size() > 100) base_poses_.pop_front();
      base_wall_ = wall_now();
      process_clouds();
+   }
+
+   void on_occupancy(const sensor_msgs::msg::PointCloud2 &msg) {
+     if (msg.header.frame_id != frame_id_ || !base_) return;
+     bool x_found = false, y_found = false, z_found = false;
+     for (const auto &field : msg.fields) {
+       if (field.name == "x" && field.datatype == sensor_msgs::msg::PointField::FLOAT32) x_found = true;
+       if (field.name == "y" && field.datatype == sensor_msgs::msg::PointField::FLOAT32) y_found = true;
+       if (field.name == "z" && field.datatype == sensor_msgs::msg::PointField::FLOAT32) z_found = true;
+     }
+     if (!x_found || !y_found || !z_found) return;
+     external_obstacles_.clear();
+     sensor_msgs::PointCloud2ConstIterator<float> x(msg, "x"), y(msg, "y"), z(msg, "z");
+     const std::size_t total = static_cast<std::size_t>(msg.width) * msg.height;
+     for (std::size_t i = 0; i < total; ++i, ++x, ++y, ++z) {
+       if (std::isfinite(*x) && std::isfinite(*y) && std::isfinite(*z) &&
+           std::abs(*z - (*base_)[2]) <= occupancy_height_tolerance_)
+         external_obstacles_.push_back({*x, *y});
+     }
+     occupancy_wall_ = wall_now();
+   }
+
+   bool planner_occupancy_fresh(double current) const {
+     return occupancy_wall_ > 0.0 && current - occupancy_wall_ <= occupancy_timeout_;
+   }
+
+   bool planner_blocks(const le::XY &xy) const {
+     return std::any_of(external_obstacles_.begin(), external_obstacles_.end(),
+         [this, &xy](const le::XY &obstacle) {
+           return xy_distance(xy, obstacle) <= cfg_.robot_radius;
+         });
    }
 
    // ---------------------------------------------------------------
@@ -233,12 +278,14 @@ class Explorer : public rclcpp::Node {
    // ---------------------------------------------------------------
    void process_clouds() {
      // 必须同时拥有基座、里程计且基座未超时才能继续
-     if (!base_ || sensor_poses_.empty() || wall_now() - base_wall_ > odom_timeout_) return;
+     if (!base_ || sensor_poses_.empty() || base_poses_.empty() ||
+         wall_now() - base_wall_ > odom_timeout_) return;
      for (auto it = pending_clouds_.begin(); it != pending_clouds_.end();) {
        int64_t stamp = stamp_ns((*it)->header.stamp);
        if (integrate_cloud(**it))
          it = pending_clouds_.erase(it);
-       else if (sensor_poses_.back().first - stamp > sync_tolerance_ * 1e9)
+       else if (sensor_poses_.back().first - stamp > sync_tolerance_ * 1e9 &&
+                base_poses_.back().first - stamp > sync_tolerance_ * 1e9)
          it = pending_clouds_.erase(it); // 超出同步容差，直接丢弃
        else
          ++it; // 仍等待更合适的里程计匹配
@@ -256,6 +303,11 @@ class Explorer : public rclcpp::Node {
                                    return std::llabs(a.first - stamp) < std::llabs(b.first - stamp); // 绝对值比较，找到最接近的时间戳
                                  });
      if (std::llabs(nearest->first - stamp) > sync_tolerance_ * 1e9) return false; // 同步容差外直接返回 false
+     auto nearest_base = std::min_element(base_poses_.begin(), base_poses_.end(),
+         [&stamp](const auto &a, const auto &b) {
+           return std::llabs(a.first - stamp) < std::llabs(b.first - stamp);
+         });
+     if (std::llabs(nearest_base->first - stamp) > sync_tolerance_ * 1e9) return false;
 
      // 检查点云是否包含 x/y/z 三个字段（必须为 FLOAT32）
      bool x_found = false, y_found = false, z_found = false;
@@ -276,7 +328,7 @@ class Explorer : public rclcpp::Node {
          points.push_back({*x, *y, *z});
      }
      // 将抽稀后的点云融合进体素地图（使用最近的里程计姿态）
-     if (map_.integrate(nearest->second, points, (*base_)[2]))
+     if (map_.integrate(nearest->second, points, nearest_base->second[2]))
        cloud_wall_ = wall_now();
      return true;
    }
@@ -371,7 +423,13 @@ class Explorer : public rclcpp::Node {
                clearing_ = false;
                last_clear_wall_ = wall_now();
                active_.reset();
-               report("goal_cleared");
+               if (clearing_reason_ == "proximity_reached") {
+                 empty_since_.reset();
+                 report("goal_reached", "proximity_fallback");
+               } else {
+                 report("goal_cleared");
+               }
+               clearing_reason_.clear();
              }
            } catch (const std::exception &exc) {
              RCLCPP_WARN(get_logger(), "Waypoint clear failed: %s", exc.what());
@@ -384,8 +442,10 @@ class Explorer : public rclcpp::Node {
    // ---------------------------------------------------------------
    void start_clear(const std::string &reason) {
      if (!active_ || clearing_) return;
-     if (reason != "paused") suppressed_.push_back({active_->xy, wall_now() + cooldown_});
+     if (reason != "paused" && reason != "proximity_reached")
+       suppressed_.push_back({active_->xy, wall_now() + cooldown_});
      clearing_ = true;
+     clearing_reason_ = reason;
      report("clearing_goal", reason);
      request_clear();
    }
@@ -405,7 +465,7 @@ class Explorer : public rclcpp::Node {
      double current = wall_now();
      active_ = Active{xy, current, stamp_ns(msg.header.stamp), std::nullopt,
                      xy_distance(xy, {(*base_)[0], (*base_)[1]}), current,
-                     false, false, false};
+                     false, false, false, std::nullopt, std::nullopt};
      waypoint_pub_->publish(msg);
      report("goal_sent");
    }
@@ -462,6 +522,25 @@ class Explorer : public rclcpp::Node {
          return;
        }
        double remaining = xy_distance(active_->xy, {(*base_)[0], (*base_)[1]});
+       if (remaining <= goal_reach_xy_) {
+         active_->blocked_since.reset();
+         if (!active_->near_since) active_->near_since = current;
+         else if (current - *active_->near_since >= near_goal_dwell_) {
+           start_clear("proximity_reached");
+           return;
+         }
+       } else {
+         active_->near_since.reset();
+         if (planner_occupancy_fresh(current) && planner_blocks(active_->xy)) {
+           if (!active_->blocked_since) active_->blocked_since = current;
+           else if (current - *active_->blocked_since >= blocked_goal_dwell_) {
+             start_clear("target_occupied_in_scan");
+             return;
+           }
+         } else {
+           active_->blocked_since.reset();
+         }
+       }
        // 进度检测：若当前距离比历史最佳距离再小 progress_distance_，更新进度计时
        if (remaining < active_->best_distance - progress_distance_) {
          active_->best_distance = remaining;
@@ -479,7 +558,7 @@ class Explorer : public rclcpp::Node {
        return;
      }
      // 投影到水平面，检查是否还有 free（未占据）空间
-     auto projected = map_.project((*base_)[2], {(*base_)[0], (*base_)[1]});
+     auto projected = map_.project({(*base_)[0], (*base_)[1]});
      bool has_free = std::any_of(projected.begin(), projected.end(),
                                  [](const auto &item) { return item.second == 0; });
      if (!has_free) {
@@ -489,7 +568,10 @@ class Explorer : public rclcpp::Node {
      // 构造被抑制的前沿列表（用于前沿选择的过滤）
      std::vector<le::XY> failed;
      for (const auto &s : suppressed_) failed.push_back(s.xy);
-     auto selection = le::select_frontier(map_, *base_, cfg_, failed);
+     static const std::vector<le::XY> no_external_obstacles;
+     const auto &obstacles = planner_occupancy_fresh(current) ?
+         external_obstacles_ : no_external_obstacles;
+     auto selection = le::select_frontier(map_, *base_, cfg_, failed, obstacles);
      // 在 RViz 中展示选中的前沿（若有）
      publish_marker(selection.goal);
      if (!selection.goal) {
@@ -523,14 +605,20 @@ class Explorer : public rclcpp::Node {
    double goal_reach_xy_ = 0.55, progress_distance_ = 0.35, progress_timeout_ = 12.0; // 目标达成阈值与进度检测
    double goal_timeout_ = 90.0, forward_timeout_ = 3.0, cooldown_ = 45.0; // 各类超时与清除冷却
    double no_frontier_hold_ = 8.0; // 前沿缺失时的保持时间阈值
+   double occupancy_timeout_ = 2.0, occupancy_height_tolerance_ = 0.5;
+   double near_goal_dwell_ = 1.5, blocked_goal_dwell_ = 2.0;
    bool observation_only_ = true, ready_ = false, paused_ = false; // 运行模式标志
    bool clearing_ = false, clear_inflight_ = false; // 清除状态标志
    double base_wall_ = 0.0, cloud_wall_ = 0.0, last_clear_wall_ = 0.0; // 时间戳记录
+   double occupancy_wall_ = 0.0;
+   std::string clearing_reason_;
    std::optional<le::Point> base_; // 基座位置（x,y,z）
    std::optional<Active> active_; // 当前活动目标信息
    std::optional<double> empty_since_; // 空前沿持续时间记录
    std::deque<std::pair<int64_t, le::Point>> sensor_poses_; // 里程计姿态缓存
+   std::deque<std::pair<int64_t, le::Point>> base_poses_;
    std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> pending_clouds_; // 点云缓存
+   std::vector<le::XY> external_obstacles_;
    std::vector<Suppressed> suppressed_; // 被抑制的前沿列表（冷却）
 
    // ROS 接口句柄
@@ -538,6 +626,7 @@ class Explorer : public rclcpp::Node {
    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_;
    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr occupancy_sub_;
    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sensor_sub_, base_sub_;
    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr ready_sub_, complete_sub_;
    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr input_sub_, goal_sub_, ack_sub_;
