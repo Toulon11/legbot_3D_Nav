@@ -1,0 +1,261 @@
+<?xml version="1.0"?>
+<sdf version="1.9">
+  <world name="tower">
+    <physics name="physics" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <gravity>0 0 -9.81</gravity>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <scene>
+      <ambient>0.45 0.45 0.45 1</ambient>
+      <background>0.72 0.80 0.88 1</background>
+      <shadows>true</shadows>
+      <grid>false</grid>
+    </scene>
+    <light name="sun" type="directional">
+      <pose>0 0 20 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <direction>-0.5 0.1 -0.9</direction>
+      <cast_shadows>true</cast_shadows>
+    </light>
+
+    <!-- 32 x 32 m single-level exploration arena on the former flat western half.
+         The robot retains the existing spawn point (-27, 6, 0.50). -->
+    <model name="test_ground">
+      <static>true</static>
+      <pose>-16 0 0 0 0 0</pose>
+      <link name="ground">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>32 32</size></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>32 32</size></plane></geometry>
+          <material><ambient>0.48 0.52 0.48 1</ambient><diffuse>0.48 0.52 0.48 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Arena walls make the enlarged map boundary obvious and provide
+         additional vertical returns for LiDAR localization. -->
+    <model name="arena_boundaries">
+      <static>true</static>
+      <link name="north_wall">
+        <pose>-16 16 0.60 0 0 0</pose>
+        <collision name="collision"><geometry><box><size>32 0.20 1.20</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>32 0.20 1.20</size></box></geometry><material><diffuse>0.30 0.34 0.39 1</diffuse></material></visual>
+      </link>
+      <link name="south_wall">
+        <pose>-16 -16 0.60 0 0 0</pose>
+        <collision name="collision"><geometry><box><size>32 0.20 1.20</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>32 0.20 1.20</size></box></geometry><material><diffuse>0.30 0.34 0.39 1</diffuse></material></visual>
+      </link>
+      <link name="west_wall">
+        <pose>-32 0 0.60 0 0 0</pose>
+        <collision name="collision"><geometry><box><size>0.20 32 1.20</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.20 32 1.20</size></box></geometry><material><diffuse>0.30 0.34 0.39 1</diffuse></material></visual>
+      </link>
+      <link name="east_wall">
+        <pose>0 0 0.60 0 0 0</pose>
+        <collision name="collision"><geometry><box><size>0.20 32 1.20</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.20 32 1.20</size></box></geometry><material><diffuse>0.30 0.34 0.39 1</diffuse></material></visual>
+      </link>
+    </model>
+
+    <!-- Dense but traversable cylinder field in the flat western half.
+         The staggered layout forces avoidance while preserving several
+         routes, including a route near y=6 across the flat arena. -->
+    <model name="flat_cylinder_field">
+      <static>true</static>
+      <link name="cylinder_01">
+        <pose>-28 -9.5 0.70 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.45</radius><length>1.40</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.45</radius><length>1.40</length></cylinder></geometry><material><diffuse>0.90 0.28 0.12 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_02">
+        <pose>-27 -2.8 1.00 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.34</radius><length>2.00</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.34</radius><length>2.00</length></cylinder></geometry><material><diffuse>0.95 0.68 0.10 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_03">
+        <pose>-26 11.5 0.85 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.50</radius><length>1.70</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.50</radius><length>1.70</length></cylinder></geometry><material><diffuse>0.12 0.62 0.82 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_04">
+        <pose>-23.5 3.7 0.80 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.50</radius><length>1.60</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.50</radius><length>1.60</length></cylinder></geometry><material><diffuse>0.22 0.70 0.34 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_05">
+        <pose>-22 8.2 0.60 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.40</radius><length>1.20</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.40</radius><length>1.20</length></cylinder></geometry><material><diffuse>0.66 0.30 0.78 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_06">
+        <pose>-21 -7.2 1.10 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.30</radius><length>2.20</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.30</radius><length>2.20</length></cylinder></geometry><material><diffuse>0.10 0.58 0.78 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_07">
+        <pose>-19.5 -0.8 0.75 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.55</radius><length>1.50</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.55</radius><length>1.50</length></cylinder></geometry><material><diffuse>0.88 0.34 0.14 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_08">
+        <pose>-18.5 5.7 0.90 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.42</radius><length>1.80</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.42</radius><length>1.80</length></cylinder></geometry><material><diffuse>0.92 0.70 0.08 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_09">
+        <pose>-16 11.0 1.20 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.34</radius><length>2.40</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.34</radius><length>2.40</length></cylinder></geometry><material><diffuse>0.18 0.66 0.38 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_10">
+        <pose>-15 -10.5 0.65 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.58</radius><length>1.30</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.58</radius><length>1.30</length></cylinder></geometry><material><diffuse>0.62 0.28 0.76 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_11">
+        <pose>-13.5 -3.5 0.95 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.40</radius><length>1.90</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.40</radius><length>1.90</length></cylinder></geometry><material><diffuse>0.10 0.55 0.82 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_12">
+        <pose>-12 8.0 0.80 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.50</radius><length>1.60</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.50</radius><length>1.60</length></cylinder></geometry><material><diffuse>0.90 0.30 0.12 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_13">
+        <pose>-10 2.1 0.60 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.32</radius><length>1.20</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.32</radius><length>1.20</length></cylinder></geometry><material><diffuse>0.94 0.68 0.08 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_14">
+        <pose>-8 -8.0 1.00 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.48</radius><length>2.00</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.48</radius><length>2.00</length></cylinder></geometry><material><diffuse>0.20 0.70 0.36 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_15">
+        <pose>-7 5.0 0.70 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.55</radius><length>1.40</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.55</radius><length>1.40</length></cylinder></geometry><material><diffuse>0.62 0.28 0.78 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_16">
+        <pose>-5 11.0 0.90 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.38</radius><length>1.80</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.38</radius><length>1.80</length></cylinder></geometry><material><diffuse>0.10 0.58 0.82 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_17">
+        <pose>-3.5 -2.7 1.10 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.44</radius><length>2.20</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.44</radius><length>2.20</length></cylinder></geometry><material><diffuse>0.88 0.32 0.12 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_18">
+        <pose>-2 7.5 0.75 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.40</radius><length>1.50</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.40</radius><length>1.50</length></cylinder></geometry><material><diffuse>0.94 0.68 0.08 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_19">
+        <pose>-1 -10.5 0.80 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.52</radius><length>1.60</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.52</radius><length>1.60</length></cylinder></geometry><material><diffuse>0.18 0.66 0.38 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_20">
+        <pose>-29 -4.8 0.90 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.36</radius><length>1.80</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.36</radius><length>1.80</length></cylinder></geometry><material><diffuse>0.16 0.64 0.82 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_21">
+        <pose>-25 -12.5 1.05 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.48</radius><length>2.10</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.48</radius><length>2.10</length></cylinder></geometry><material><diffuse>0.84 0.24 0.16 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_22">
+        <pose>-24 0.2 0.65 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.58</radius><length>1.30</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.58</radius><length>1.30</length></cylinder></geometry><material><diffuse>0.76 0.58 0.10 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_23">
+        <pose>-20 12.5 0.80 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.44</radius><length>1.60</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.44</radius><length>1.60</length></cylinder></geometry><material><diffuse>0.22 0.72 0.38 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_24">
+        <pose>-17 -5.0 1.15 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.33</radius><length>2.30</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.33</radius><length>2.30</length></cylinder></geometry><material><diffuse>0.60 0.26 0.76 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_25">
+        <pose>-14 1.4 0.85 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.46</radius><length>1.70</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.46</radius><length>1.70</length></cylinder></geometry><material><diffuse>0.86 0.30 0.14 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_26">
+        <pose>-10 -12.2 0.70 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.54</radius><length>1.40</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.54</radius><length>1.40</length></cylinder></geometry><material><diffuse>0.12 0.58 0.80 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_27">
+        <pose>-6 -0.2 1.00 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.38</radius><length>2.00</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.38</radius><length>2.00</length></cylinder></geometry><material><diffuse>0.82 0.62 0.10 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_28">
+        <pose>-4 3.0 0.75 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.50</radius><length>1.50</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.50</radius><length>1.50</length></cylinder></geometry><material><diffuse>0.22 0.70 0.38 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_29">
+        <pose>-1 -6.0 1.10 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.35</radius><length>2.20</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.35</radius><length>2.20</length></cylinder></geometry><material><diffuse>0.62 0.28 0.78 1</diffuse></material></visual>
+      </link>
+      <link name="cylinder_30">
+        <pose>-28 8.5 0.80 0 0 0</pose>
+        <collision name="collision"><geometry><cylinder><radius>0.45</radius><length>1.60</length></cylinder></geometry></collision>
+        <visual name="visual"><geometry><cylinder><radius>0.45</radius><length>1.60</length></cylinder></geometry><material><diffuse>0.88 0.28 0.14 1</diffuse></material></visual>
+      </link>
+    </model>
+
+    <!-- Three segmented arch gates add overhead and side constraints while
+         retaining about 2.1 m of clear width for the GO2. -->
+    <model name="flat_arch_field">
+      <static>true</static>
+      <!-- Arch 1: x=-21, y=6. -->
+      <link name="arch_01_left"><pose>-21 4.75 0.80 0 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.38 1.60</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.38 1.60</size></box></geometry><material><diffuse>0.56 0.18 0.10 1</diffuse></material></visual></link>
+      <link name="arch_01_right"><pose>-21 7.25 0.80 0 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.38 1.60</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.38 1.60</size></box></geometry><material><diffuse>0.56 0.18 0.10 1</diffuse></material></visual></link>
+      <link name="arch_01_crown_1"><pose>-21 5.08 1.80 0.60 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.68 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.68 0.22</size></box></geometry><material><diffuse>0.72 0.26 0.12 1</diffuse></material></visual></link>
+      <link name="arch_01_crown_2"><pose>-21 5.52 2.08 0.30 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.62 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.62 0.22</size></box></geometry><material><diffuse>0.72 0.26 0.12 1</diffuse></material></visual></link>
+      <link name="arch_01_crown_3"><pose>-21 6.00 2.18 0 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.62 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.62 0.22</size></box></geometry><material><diffuse>0.72 0.26 0.12 1</diffuse></material></visual></link>
+      <link name="arch_01_crown_4"><pose>-21 6.48 2.08 -0.30 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.62 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.62 0.22</size></box></geometry><material><diffuse>0.72 0.26 0.12 1</diffuse></material></visual></link>
+      <link name="arch_01_crown_5"><pose>-21 6.92 1.80 -0.60 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.68 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.68 0.22</size></box></geometry><material><diffuse>0.72 0.26 0.12 1</diffuse></material></visual></link>
+
+      <!-- Arch 2: x=-11, y=6. -->
+      <link name="arch_02_left"><pose>-11 4.75 0.80 0 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.38 1.60</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.38 1.60</size></box></geometry><material><diffuse>0.08 0.38 0.50 1</diffuse></material></visual></link>
+      <link name="arch_02_right"><pose>-11 7.25 0.80 0 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.38 1.60</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.38 1.60</size></box></geometry><material><diffuse>0.08 0.38 0.50 1</diffuse></material></visual></link>
+      <link name="arch_02_crown_1"><pose>-11 5.08 1.80 0.60 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.68 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.68 0.22</size></box></geometry><material><diffuse>0.10 0.52 0.66 1</diffuse></material></visual></link>
+      <link name="arch_02_crown_2"><pose>-11 5.52 2.08 0.30 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.62 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.62 0.22</size></box></geometry><material><diffuse>0.10 0.52 0.66 1</diffuse></material></visual></link>
+      <link name="arch_02_crown_3"><pose>-11 6.00 2.18 0 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.62 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.62 0.22</size></box></geometry><material><diffuse>0.10 0.52 0.66 1</diffuse></material></visual></link>
+      <link name="arch_02_crown_4"><pose>-11 6.48 2.08 -0.30 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.62 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.62 0.22</size></box></geometry><material><diffuse>0.10 0.52 0.66 1</diffuse></material></visual></link>
+      <link name="arch_02_crown_5"><pose>-11 6.92 1.80 -0.60 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.68 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.68 0.22</size></box></geometry><material><diffuse>0.10 0.52 0.66 1</diffuse></material></visual></link>
+
+      <!-- Arch 3: x=-1, y=6. -->
+      <link name="arch_03_left"><pose>-1 4.75 0.80 0 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.38 1.60</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.38 1.60</size></box></geometry><material><diffuse>0.38 0.14 0.50 1</diffuse></material></visual></link>
+      <link name="arch_03_right"><pose>-1 7.25 0.80 0 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.38 1.60</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.38 1.60</size></box></geometry><material><diffuse>0.38 0.14 0.50 1</diffuse></material></visual></link>
+      <link name="arch_03_crown_1"><pose>-1 5.08 1.80 0.60 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.68 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.68 0.22</size></box></geometry><material><diffuse>0.52 0.20 0.66 1</diffuse></material></visual></link>
+      <link name="arch_03_crown_2"><pose>-1 5.52 2.08 0.30 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.62 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.62 0.22</size></box></geometry><material><diffuse>0.52 0.20 0.66 1</diffuse></material></visual></link>
+      <link name="arch_03_crown_3"><pose>-1 6.00 2.18 0 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.62 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.62 0.22</size></box></geometry><material><diffuse>0.52 0.20 0.66 1</diffuse></material></visual></link>
+      <link name="arch_03_crown_4"><pose>-1 6.48 2.08 -0.30 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.62 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.62 0.22</size></box></geometry><material><diffuse>0.52 0.20 0.66 1</diffuse></material></visual></link>
+      <link name="arch_03_crown_5"><pose>-1 6.92 1.80 -0.60 0 0</pose><collision name="collision"><geometry><box><size>0.40 0.68 0.22</size></box></geometry></collision><visual name="visual"><geometry><box><size>0.40 0.68 0.22</size></box></geometry><material><diffuse>0.52 0.20 0.66 1</diffuse></material></visual></link>
+    </model>
+
+  </world>
+</sdf>

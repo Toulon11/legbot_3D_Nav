@@ -2,8 +2,10 @@ import os
 from ament_index_python.packages import get_package_share_directory as share
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def setup(context):
@@ -24,6 +26,15 @@ def setup(context):
              remappings=[('input','/fast_lio/odometry_sensor'),
                          ('output','/fast_lio/odometry_base'),
                          ('lidar_output','/fast_lio/odometry_lidar')]),
+        Node(package='legbot_bringup', executable='global_navigation_adapter',
+             condition=IfCondition(LaunchConfiguration('publish_global')),
+             parameters=[{'use_sim_time': use_sim_time,
+                          'source': 'fastlio',
+                          'alignment_mode': LaunchConfiguration('alignment_mode'),
+                          'spawn_x': ParameterValue(LaunchConfiguration('spawn_x'), value_type=float),
+                          'spawn_y': ParameterValue(LaunchConfiguration('spawn_y'), value_type=float),
+                          'spawn_z': ParameterValue(LaunchConfiguration('spawn_z'), value_type=float),
+                          'spawn_yaw': ParameterValue(LaunchConfiguration('spawn_yaw'), value_type=float)}]),
     ]
 
 
@@ -33,5 +44,12 @@ def generate_launch_description():
         DeclareLaunchArgument('config', default_value=os.path.join(share('legbot_bringup'),'config/fastlio_real.yaml')),
         DeclareLaunchArgument('sensor_frame', default_value='livox_imu_link'),
         DeclareLaunchArgument('lidar_frame', default_value='livox_link'),
+        DeclareLaunchArgument('publish_global', default_value='false', choices=['true', 'false']),
+        DeclareLaunchArgument('alignment_mode', default_value='gazebo_truth',
+                              choices=['gazebo_truth', 'spawn_pose']),
+        DeclareLaunchArgument('spawn_x', default_value='-27.0'),
+        DeclareLaunchArgument('spawn_y', default_value='6.0'),
+        DeclareLaunchArgument('spawn_z', default_value='0.50'),
+        DeclareLaunchArgument('spawn_yaw', default_value='0.0'),
         OpaqueFunction(function=setup),
     ])

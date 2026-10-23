@@ -80,13 +80,61 @@ std::unordered_map<Cell, int, CellHash> VoxelMap::project(const XY &center_xy) c
   double high = cfg_.obstacle_max_relative_z;
   for (const auto &[voxel, evidence] : voxels_) {
     auto xyz = center(voxel);
-    if (xyz[2] < free_low || xyz[2] > high || std::abs(xyz[0] - center_xy[0]) > radius ||
-        std::abs(xyz[1] - center_xy[1]) > radius) continue;
+    if (xyz[2] < free_low || xyz[2] > high) continue;
+    if (cfg_.global_search) {
+      if (xyz[0] < cfg_.exploration_min_x || xyz[0] > cfg_.exploration_max_x ||
+          xyz[1] < cfg_.exploration_min_y || xyz[1] > cfg_.exploration_max_y) continue;
+    } else if (std::abs(xyz[0] - center_xy[0]) > radius ||
+               std::abs(xyz[1] - center_xy[1]) > radius) continue;
     Cell cell{voxel.x, voxel.y};
     if (evidence > 0 && xyz[2] >= occupied_low) grid[cell] = 1;
     else if (evidence <= 0) grid.emplace(cell, 0);
   }
   return grid;
+}
+
+void VoxelMap::set_exploration_bounds(double min_x, double max_x,
+                                      double min_y, double max_y) {
+  cfg_.exploration_min_x = min_x;
+  cfg_.exploration_max_x = max_x;
+  cfg_.exploration_min_y = min_y;
+  cfg_.exploration_max_y = max_y;
+}
+
+bool RecoveryGate::waiting_for_new_cells(std::size_t observed_cells) const {
+  return blocked_at_ && observed_cells - std::min(observed_cells, *blocked_at_) <
+                            min_new_cells_;
+}
+
+bool RecoveryGate::eligible(const Selection &selection, std::size_t observed_cells) const {
+  return selection.clusters > 0 && selection.reachable_frontier_cells == 0 &&
+         selection.candidate_goals == 0 && !waiting_for_new_cells(observed_cells);
+}
+
+void RecoveryGate::start(std::size_t observed_cells) { started_at_ = observed_cells; }
+
+void RecoveryGate::finish(std::size_t observed_cells) {
+  if (!started_at_) return;
+  if (observed_cells - std::min(observed_cells, *started_at_) < min_new_cells_)
+    blocked_at_ = observed_cells;
+  else
+    blocked_at_.reset();
+  started_at_.reset();
+}
+
+void GoalProgressGate::finish(const XY &goal, std::size_t before, std::size_t after) {
+  if (after - std::min(after, before) >= min_new_cells_) return;
+  entries_.push_back({goal, after + min_new_cells_});
+}
+
+std::vector<XY> GoalProgressGate::blocked(std::size_t observed_cells) {
+  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+      [observed_cells](const Entry &entry) { return observed_cells >= entry.unlock_at; }),
+      entries_.end());
+  std::vector<XY> goals;
+  goals.reserve(entries_.size());
+  for (const auto &entry : entries_) goals.push_back(entry.goal);
+  return goals;
 }
 
 Selection select_frontier(const VoxelMap &map, const Point &robot, const Settings &cfg,
@@ -98,6 +146,11 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
   auto grid = map.project({robot[0], robot[1]});
   int radius = static_cast<int>(std::ceil(cfg.local_search_radius / cfg.resolution));
   auto inside = [&](const Cell &c) {
+    if (cfg.global_search) {
+      XY xy = map.center(c);
+      return xy[0] >= cfg.exploration_min_x && xy[0] <= cfg.exploration_max_x &&
+             xy[1] >= cfg.exploration_min_y && xy[1] <= cfg.exploration_max_y;
+    }
     return std::abs(c.x - origin.x) <= radius && std::abs(c.y - origin.y) <= radius;
   };
   std::unordered_set<Cell, CellHash> blocked;
@@ -126,6 +179,7 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
       if (inside(next) && !grid.count(next) && !blocked.count(next)) frontier.insert(next);
     }
   }
+  result.frontier_cells = frontier.size();
   std::vector<std::vector<Cell>> clusters;
   while (!frontier.empty()) {
     Cell seed = *frontier.begin();
@@ -148,11 +202,18 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
       clusters.push_back(std::move(cluster));
   }
   result.clusters = clusters.size();
+  if (clusters.empty() || !inside(origin)) return result;
+
+  for (const auto &d : kEight) {
+    Cell next{origin.x + d.x, origin.y + d.y};
+    if (inside(next) && !blocked.count(next)) ++result.open_start_neighbors;
+  }
 
   using QueueItem = std::pair<double, Cell>;
   auto greater = [](const QueueItem &a, const QueueItem &b) { return a.first > b.first; };
   std::priority_queue<QueueItem, std::vector<QueueItem>, decltype(greater)> queue(greater);
   std::unordered_map<Cell, double, CellHash> costs;
+  std::unordered_map<Cell, Cell, CellHash> parents;
   costs[origin] = 0.0;
   queue.push({0.0, origin});
   while (!queue.empty()) {
@@ -170,6 +231,7 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
       auto it = costs.find(next);
       if (it == costs.end() || next_cost < it->second) {
         costs[next] = next_cost;
+        parents[next] = cell;
         queue.push({next_cost, next});
       }
     }
@@ -177,6 +239,8 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
 
   double best_score = -std::numeric_limits<double>::infinity();
   for (auto &cluster : clusters) {
+    for (const auto &cell : cluster)
+      if (costs.count(cell)) ++result.reachable_frontier_cells;
     double mx = 0.0, my = 0.0;
     for (const auto &c : cluster) { mx += c.x; my += c.y; }
     mx /= cluster.size(); my /= cluster.size();
@@ -188,11 +252,35 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
       if (found == costs.end()) continue;
       XY xy = map.center(cell);
       double range = distance(xy, {robot[0], robot[1]});
-      if (range < cfg.min_goal_distance || range > cfg.max_goal_distance) continue;
+      if (range < cfg.min_goal_distance) continue;
+      if (range > cfg.max_goal_distance) {
+        // The frontier is beyond the local planner's observed horizon. Follow
+        // its lowest-cost path back to an observed free staging cell nearby.
+        std::optional<XY> stage_goal;
+        Cell stage = cell;
+        while (!(stage == origin)) {
+          auto parent = parents.find(stage);
+          if (parent == parents.end()) break;
+          auto state = grid.find(stage);
+          if (state != grid.end() && state->second == 0 && !blocked.count(stage)) {
+            XY candidate = map.center(stage);
+            double stage_range = distance(candidate, {robot[0], robot[1]});
+            if (stage_range >= cfg.min_goal_distance &&
+                stage_range <= cfg.max_goal_distance) {
+              stage_goal = candidate;
+              break;
+            }
+          }
+          stage = parent->second;
+        }
+        if (!stage_goal) continue;
+        xy = *stage_goal;
+      }
+      ++result.candidate_goals;
       bool rejected = false;
       for (const auto &failed : suppressed)
         if (distance(xy, failed) < cfg.robot_radius * 2.0) { rejected = true; break; }
-      if (rejected) continue;
+      if (rejected) { ++result.suppressed_goals; continue; }
       double score = cfg.frontier_gain_weight * std::log1p(cluster.size()) -
                      cfg.path_cost_weight * found->second;
       if (score > best_score) {

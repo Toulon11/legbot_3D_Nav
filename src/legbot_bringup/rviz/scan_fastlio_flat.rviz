@@ -411,6 +411,23 @@ Visualization Manager:
       Name: Local planning
     - Class: rviz_common/Group
       Displays:
+        - Alpha: 0.8
+          Class: rviz_default_plugins/PointCloud2
+          Color: 255; 170; 0
+          Color Transformer: FlatColor
+          Decay Time: 0.5
+          Enabled: true
+          Name: Raw Livox sensor cloud
+          Position Transformer: XYZ
+          Queue Size: 5
+          Selectable: true
+          Size (Pixels): 2
+          Size (m): 0.025
+          Style: Points
+          Topic: /livox/points_raw
+          Unreliable: true
+          Use Fixed Frame: true
+          Value: true
         - Alpha: 0.75
           Autocompute Intensity Bounds: true
           Autocompute Value Bounds:
@@ -489,7 +506,7 @@ Visualization Manager:
               Scale: 1
               Value: true
             Value: true
-          Enabled: false
+          Enabled: true
           Keep: 100
           Name: FAST-LIO base odometry
           Position Tolerance: 0.05000000074505806
@@ -510,7 +527,7 @@ Visualization Manager:
             History Policy: Keep Last
             Reliability Policy: Reliable
             Value: /fast_lio/odometry_base
-          Value: false
+          Value: true
         - Class: rviz_default_plugins/Image
           Enabled: true
           Max Value: 1

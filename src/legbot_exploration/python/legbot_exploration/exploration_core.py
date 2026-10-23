@@ -20,12 +20,63 @@ class Settings:
     free_min_relative_z: float = -0.45
     robot_radius: float = 0.35
     local_search_radius: float = 10.0
+    global_search: bool = False
+    exploration_min_x: float = -31.5
+    exploration_max_x: float = -0.5
+    exploration_min_y: float = -15.5
+    exploration_max_y: float = 15.5
     min_goal_distance: float = 1.0
     max_goal_distance: float = 8.0
     min_frontier_cells: int = 3
     frontier_gain_weight: float = 1.0
     path_cost_weight: float = 1.0
     unknown_path_multiplier: float = 1.5
+
+
+class RecoveryGate:
+    """Avoid blind backtracks when no usable frontier remains or no map grows."""
+
+    def __init__(self, min_new_cells):
+        self.min_new_cells = min_new_cells
+        self.started_at = None
+        self.blocked_at = None
+
+    def waiting_for_new_cells(self, observed_cells):
+        return (self.blocked_at is not None and
+                observed_cells - min(observed_cells, self.blocked_at) < self.min_new_cells)
+
+    def eligible(self, clusters, reachable_frontier_cells, candidate_goals, observed_cells):
+        return (clusters > 0 and reachable_frontier_cells == 0 and candidate_goals == 0
+                and not self.waiting_for_new_cells(observed_cells))
+
+    def start(self, observed_cells):
+        self.started_at = observed_cells
+
+    def finish(self, observed_cells):
+        if self.started_at is None:
+            return
+        if observed_cells - min(observed_cells, self.started_at) < self.min_new_cells:
+            self.blocked_at = observed_cells
+        else:
+            self.blocked_at = None
+        self.started_at = None
+
+
+class GoalProgressGate:
+    """Suppress reached goals that revealed no new XY cells until the map grows."""
+
+    def __init__(self, min_new_cells):
+        self.min_new_cells = min_new_cells
+        self.entries = []
+
+    def finish(self, goal, before, after):
+        if after - min(after, before) < self.min_new_cells:
+            self.entries.append((goal, after + self.min_new_cells))
+
+    def blocked(self, observed_cells):
+        self.entries = [(goal, unlock_at) for goal, unlock_at in self.entries
+                        if observed_cells < unlock_at]
+        return [goal for goal, _ in self.entries]
 
 
 class VoxelMap:
@@ -86,7 +137,13 @@ class VoxelMap:
         high = self.cfg.obstacle_max_relative_z
         for (x, y, z), value in self.voxels.items():
             wx, wy, wz = self.cell_center((x, y, z))
-            if not free_low <= wz <= high or abs(wx - center_xy[0]) > r or abs(wy - center_xy[1]) > r:
+            if not free_low <= wz <= high:
+                continue
+            if self.cfg.global_search:
+                if not (self.cfg.exploration_min_x <= wx <= self.cfg.exploration_max_x
+                        and self.cfg.exploration_min_y <= wy <= self.cfg.exploration_max_y):
+                    continue
+            elif abs(wx - center_xy[0]) > r or abs(wy - center_xy[1]) > r:
                 continue
             cell = (x, y)
             if value > 0 and wz >= occupied_low:
@@ -101,7 +158,7 @@ NEIGHBORS8 = NEIGHBORS4 + ((1, 1), (1, -1), (-1, 1), (-1, -1))
 
 
 def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacles=()):
-    """Return (goal XY, score, frontier count), or (None, None, count)."""
+    """Return goal, score, cluster count, raw frontier count, and diagnostics."""
     center = voxels.key(robot_xyz)[:2]
     grid = voxels.project(robot_xyz[:2])
     radius = math.ceil(settings.local_search_radius / settings.resolution)
@@ -122,6 +179,10 @@ def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacl
                         blocked.add((cx + dx, cy + dy))
 
     def inside(cell):
+        if settings.global_search:
+            x, y = voxels.cell_center(cell)
+            return (settings.exploration_min_x <= x <= settings.exploration_max_x
+                    and settings.exploration_min_y <= y <= settings.exploration_max_y)
         return abs(cell[0] - center[0]) <= radius and abs(cell[1] - center[1]) <= radius
 
     # Exploration frontier: genuinely unknown cell adjacent to observed free.
@@ -134,6 +195,7 @@ def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacl
             if inside(cell) and cell not in grid and cell not in blocked:
                 frontier.add(cell)
 
+    frontier_cells = len(frontier)
     clusters = []
     while frontier:
         seed = frontier.pop()
@@ -150,8 +212,17 @@ def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacl
         if len(cluster) >= settings.min_frontier_cells:
             clusters.append(cluster)
 
+    diagnostics = {'reachable_frontier_cells': 0, 'candidate_goals': 0,
+                   'suppressed_goals': 0, 'open_start_neighbors': 0}
+    if not clusters or not inside(center):
+        return None, None, len(clusters), frontier_cells, diagnostics
+    diagnostics['open_start_neighbors'] = sum(
+        inside((center[0] + dx, center[1] + dy)) and
+        (center[0] + dx, center[1] + dy) not in blocked for dx, dy in NEIGHBORS8)
+
     # One Dijkstra search serves all clusters. Unknown is allowed by policy.
     costs = {center: 0.0}
+    parents = {}
     heap = [(0.0, center)]
     while heap:
         cost, cell = heapq.heappop(heap)
@@ -170,11 +241,13 @@ def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacl
             new_cost = cost + step
             if new_cost < costs.get(nxt, math.inf):
                 costs[nxt] = new_cost
+                parents[nxt] = cell
                 heapq.heappush(heap, (new_cost, nxt))
 
     best = None
     best_score = -math.inf
     for cluster in clusters:
+        diagnostics['reachable_frontier_cells'] += sum(cell in costs for cell in cluster)
         mx = sum(c[0] for c in cluster) / len(cluster)
         my = sum(c[1] for c in cluster) / len(cluster)
         # The geometric centroid can lie inside an obstacle. Use a real cell.
@@ -184,10 +257,27 @@ def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacl
                 continue
             x, y = voxels.cell_center(cell)
             distance = math.hypot(x - robot_xyz[0], y - robot_xyz[1])
-            if not settings.min_goal_distance <= distance <= settings.max_goal_distance:
+            if distance < settings.min_goal_distance:
                 continue
+            if distance > settings.max_goal_distance:
+                # Stage on observed free space within the local planning horizon.
+                stage = cell
+                stage_goal = None
+                while stage != center and stage in parents:
+                    if grid.get(stage) == 0 and stage not in blocked:
+                        candidate = voxels.cell_center(stage)
+                        stage_distance = math.dist(candidate, robot_xyz[:2])
+                        if settings.min_goal_distance <= stage_distance <= settings.max_goal_distance:
+                            stage_goal = candidate
+                            break
+                    stage = parents[stage]
+                if stage_goal is None:
+                    continue
+                x, y = stage_goal
+            diagnostics['candidate_goals'] += 1
             if any(math.hypot(x - sx, y - sy) < settings.robot_radius * 2
                    for sx, sy in suppressed):
+                diagnostics['suppressed_goals'] += 1
                 continue
             score = (settings.frontier_gain_weight * math.log1p(len(cluster))
                      - settings.path_cost_weight * costs[cell])
@@ -195,4 +285,4 @@ def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacl
                 best = (x, y)
                 best_score = score
             break
-    return best, (best_score if best is not None else None), len(clusters)
+    return best, (best_score if best is not None else None), len(clusters), frontier_cells, diagnostics

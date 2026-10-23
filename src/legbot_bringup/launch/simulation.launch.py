@@ -14,6 +14,7 @@ from launch_ros.actions import Node
 def setup(context):
     cfg = lambda key: LaunchConfiguration(key).perform(context)
     use_ground_truth = cfg('navigation_source') == 'ground_truth'
+    global_interface = cfg('navigation_interface') == 'global'
     publish_ground_truth = cfg('publish_ground_truth') == 'true'
     diagnose_fastlio = cfg('diagnose_fastlio') == 'true'
     if use_ground_truth and not publish_ground_truth:
@@ -114,8 +115,10 @@ def setup(context):
           if use_ground_truth else []),
         Node(package='legbot_bringup', executable='go2_command_adapter', parameters=[{
             'use_sim_time': True,
-            'odom_topic': '/Odometry_gazebo' if use_ground_truth else '/fast_lio/odometry_base',
-            'cloud_topic': '/livox/points_world' if use_ground_truth else '/fast_lio/cloud_registered',
+            'odom_topic': '/slam/global_odometry_base' if global_interface else (
+                '/Odometry_gazebo' if use_ground_truth else '/fast_lio/odometry_base'),
+            'cloud_topic': '/slam/global_cloud_registered' if global_interface else (
+                '/livox/points_world' if use_ground_truth else '/fast_lio/cloud_registered'),
             # Gazebo is intentionally slower than wall time while FAST-LIO and
             # RViz are active. Avoid chopping a valid locomotion command between
             # simulated sensor frames.
@@ -123,6 +126,9 @@ def setup(context):
             'navigation_timeout': 2.0,
             'require_navigation_data': cfg('require_navigation_data') == 'true',
         }]),
+        *([Node(package='legbot_bringup', executable='global_navigation_adapter',
+                parameters=[{'use_sim_time': True, 'source': 'gazebo'}])]
+          if use_ground_truth and global_interface else []),
         *([Node(package='legbot_bringup', executable='stair_cloud_sim', output='screen',
                parameters=[{'use_sim_time': True, 'odom_topic': '/Odometry_gazebo',
                             'scene_type': cfg('synthetic_scene'),
@@ -142,6 +148,8 @@ def generate_launch_description():
         # published independently for evaluation without entering control.
         DeclareLaunchArgument('navigation_source', default_value='fastlio',
                               choices=['fastlio', 'ground_truth']),
+        DeclareLaunchArgument('navigation_interface', default_value='legacy',
+                              choices=['legacy', 'global']),
         DeclareLaunchArgument('publish_ground_truth', default_value='false', choices=['true','false']),
         DeclareLaunchArgument('diagnose_fastlio', default_value='false', choices=['true','false']),
         DeclareLaunchArgument('gui', default_value='false', choices=['true', 'false']),

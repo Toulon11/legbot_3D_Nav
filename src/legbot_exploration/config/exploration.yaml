@@ -1,9 +1,9 @@
 /**:
   ros__parameters:
-    frame_id: odom
-    cloud_topic: /fast_lio/cloud_registered
-    sensor_odom_topic: /fast_lio/odometry_lidar
-    base_odom_topic: /fast_lio/odometry_base
+    frame_id: map
+    cloud_topic: /slam/global_cloud_registered
+    sensor_odom_topic: /slam/odometry_lidar
+    base_odom_topic: /slam/global_odometry_base
     planner_occupancy_topic: /local_planner/grid_map/occupancy_inflate
     waypoint_topic: /scan/waypoint_input
     scan_goal_topic: /scan/goal
@@ -21,6 +21,12 @@
     free_min_relative_z: -0.45
     robot_radius: 0.35
     local_search_radius: 10.0
+    global_search: false
+    bounds_relative_to_start: false
+    exploration_min_x: -31.5
+    exploration_max_x: -0.5
+    exploration_min_y: -15.5
+    exploration_max_y: 15.5
     min_goal_distance: 1.0
     max_goal_distance: 8.0
     min_frontier_cells: 3
@@ -34,6 +40,7 @@
     goal_forward_timeout: 3.0
     failed_frontier_cooldown: 45.0
     no_frontier_hold: 8.0
+    recovery_min_new_cells: 8
     planner_occupancy_timeout: 2.0
     planner_occupancy_height_tolerance: 0.5
     near_goal_dwell: 1.5

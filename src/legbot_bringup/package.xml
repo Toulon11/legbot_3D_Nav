@@ -2,6 +2,7 @@
 <package format="3">
 <name>legbot_bringup</name><version>0.2.0</version><description>Launch, simulation, visualization and hardware bringup for Legbot GO2 navigation.</description><maintainer email="biao876990970@hotmail.com">Robot-Nav</maintainer><license>Apache-2.0</license><buildtool_depend>ament_cmake</buildtool_depend>
 <depend>rclcpp</depend>
+<depend>builtin_interfaces</depend>
 <depend>std_msgs</depend>
 <depend>std_srvs</depend>
 <depend>geometry_msgs</depend>

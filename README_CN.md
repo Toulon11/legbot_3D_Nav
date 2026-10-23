@@ -148,9 +148,11 @@ ros2 launch legbot_bringup scan_waypoints.launch.py
 
 等待 FAST-LIO 输出 `IMU Initial Done`，并等待状态机输出 `FAST-LIO ready: enabling SCAN waypoint mission`，随后在 RViz 中使用 **2D Goal Pose**。默认 `direct` 模式会用新目标替换旧目标；需要连续执行多个点时切换为 `queue`。
 
-默认唯一世界为 `Building.sdf`：机器人从西侧平地的 30 个圆柱和 3 道拱门障碍区出发，
+默认世界为 `Building.sdf`：机器人从西侧平地的 30 个圆柱和 3 道拱门障碍区出发，
 再连续进入东侧 Building 多楼层楼梯区。无界面运行、关键点录制、PCT、EGO、真值对比和
 停止顺序见[完整运行指南](运行指南.md)。
+
+单层自主探索可使用独立的 `ExplorationFlat.sdf` 世界：它保留西侧平地障碍与边界墙，不包含 Building；启动命令为 `ros2 launch legbot_exploration exploration_flat_demo.launch.py`。定位来源及分终端启动方法见[自主探索启动指南](自主探索启动指南.md)。
 
 要自动执行“当前位置 → 平地避障 → Building 入口 → PCT 跨层全局路径 → 顶层终点”，
 不要再启动上面的六个独立终端，直接运行：

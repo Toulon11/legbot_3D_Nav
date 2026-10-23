@@ -108,6 +108,7 @@ public:
   double res_mean_last = 0.05;
   // ===== 噪声参数 =====
   double gyr_cov = 0, acc_cov = 0, inv_expo_cov = 0;  // 陀螺仪/加计/逆曝光时间的过程噪声
+  double init_acc_min_norm = 1e-6, init_acc_max_norm = 1e9;
   double blind_rgb_points = 0.0;
   double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0, last_timestamp_img = -1.0;
   double filter_size_surf_min = 0;

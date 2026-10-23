@@ -66,6 +66,9 @@
     imu:
       imu_en: true
       imu_int_frame: 30
+      # Ignore Gazebo's free-fall and impact samples before the dog settles.
+      init_acc_min_norm: 7.0
+      init_acc_max_norm: 12.0
       acc_cov: 0.1
       gyr_cov: 0.1
       b_acc_cov: 0.0001
@@ -92,12 +95,12 @@
       navigation_cloud_on_lio: true
     output_topics:
       # Navigation-compatible outputs; all other names follow upstream.
-      cloud_registered: /fast_lio/cloud_registered
+      cloud_registered: /fast_livo/cloud_registered
       visualization_marker: /visualization_marker
       cloud_visual_sub_map_before: /cloud_visual_sub_map_before
       cloud_effected: /cloud_effected
       laser_map: /Laser_map
-      odometry: /fast_lio/odometry_sensor
+      odometry: /fast_livo/odometry_sensor
       path: /path
       planner_normal: /planner_normal
       voxels: /voxels
@@ -115,7 +118,8 @@
       seq_name: "CBD_Building_01"
       pose_output_en: false
     pcd_save:
-      pcd_save_en: false
+      # pcd_save_en: false
+      pcd_save_en: true
       type: 0  # 0: World Frame, 1: Body Frame.
       colmap_output_en: false
       filter_size_pcd: 0.15

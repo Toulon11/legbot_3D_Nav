@@ -60,6 +60,7 @@ public:
   void set_acc_bias_cov(const V3D &b_a);  // 设置加计偏置随机游走协方差
   void set_inv_expo_cov(const double &inv_expo);  // 设置逆曝光时间协方差
   void set_imu_init_frame_num(const int &num);  // 设置IMU初始化所需帧数
+  void set_init_acc_norm_range(double min_norm, double max_norm);  // 初始化时允许的平均加速度模长
   void disable_imu();  // 禁用IMU (切换为匀速模型)
   void disable_gravity_est();  // 禁用重力估计
   void disable_bias_est();  // 禁用偏置估计
@@ -100,6 +101,7 @@ private:
   double last_prop_end_time;  // 上次传播结束时间
   double time_last_scan;  // 上次LiDAR扫描时间
   int init_iter_num = 1, MAX_INI_COUNT = 20;  // 初始化参数
+  double init_acc_min_norm = 1e-6, init_acc_max_norm = 1e9;
   bool b_first_frame = true;  // 是否第一帧
   bool imu_en = true;  // 是否启用IMU
   bool gravity_est_en = true;  // 是否估计重力

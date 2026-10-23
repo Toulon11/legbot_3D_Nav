@@ -125,6 +125,8 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   this->node->declare_parameter<double>("imu.gyr_cov", 1.0);
   this->node->declare_parameter<double>("imu.acc_cov", 1.0);
   this->node->declare_parameter<int>("imu.imu_int_frame", 30);
+  this->node->declare_parameter<double>("imu.init_acc_min_norm", 1e-6);
+  this->node->declare_parameter<double>("imu.init_acc_max_norm", 1e9);
   this->node->declare_parameter<bool>("imu.imu_en", true);
   this->node->declare_parameter<bool>("imu.gravity_est_en", true);
   this->node->declare_parameter<bool>("imu.ba_bg_est_en", true);
@@ -210,6 +212,8 @@ void LIVMapper::readParameters(rclcpp::Node::SharedPtr &node)
   this->node->get_parameter("imu.gyr_cov", gyr_cov);
   this->node->get_parameter("imu.acc_cov", acc_cov);
   this->node->get_parameter("imu.imu_int_frame", imu_int_frame);
+  this->node->get_parameter("imu.init_acc_min_norm", init_acc_min_norm);
+  this->node->get_parameter("imu.init_acc_max_norm", init_acc_max_norm);
   this->node->get_parameter("imu.imu_en", imu_en);
   this->node->get_parameter("imu.gravity_est_en", gravity_est_en);
   this->node->get_parameter("imu.ba_bg_est_en", ba_bg_est_en);
@@ -305,6 +309,7 @@ void LIVMapper::initializeComponents(rclcpp::Node::SharedPtr &node)
   p_imu->set_gyr_bias_cov(V3D(0.0001, 0.0001, 0.0001));
   p_imu->set_acc_bias_cov(V3D(0.0001, 0.0001, 0.0001));
   p_imu->set_imu_init_frame_num(imu_int_frame);
+  p_imu->set_init_acc_norm_range(init_acc_min_norm, init_acc_max_norm);
 
   if (!imu_en) p_imu->disable_imu();
   if (!gravity_est_en) p_imu->disable_gravity_est();

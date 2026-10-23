@@ -42,16 +42,16 @@ def main():
     coordinator = launch_process([
         sys.executable, coordinator_script, '--mode', 'direct',
         '--input-topic', '/scan/waypoint_input', '--ready-topic', '/go2/demo_ready',
-        '--odom-topic', '/fast_lio/odometry_base', '--output',
+        '--odom-topic', '/slam/global_odometry_base', '--frame-id', 'map', '--output',
         '/tmp/legbot_exploration_handoff_mission.json', '--dwell-seconds', '0.1'])
     explorer = launch_process([
         sys.argv[1], '--ros-args', '--params-file', config,
         '-p', 'use_sim_time:=false', '-p', 'observation_only:=false'])
     rclpy.init()
     node = rclpy.create_node('exploration_handoff_test')
-    sensor_pub = node.create_publisher(Odometry, '/fast_lio/odometry_lidar', qos_profile_sensor_data)
-    base_pub = node.create_publisher(Odometry, '/fast_lio/odometry_base', qos_profile_sensor_data)
-    cloud_pub = node.create_publisher(PointCloud2, '/fast_lio/cloud_registered', qos_profile_sensor_data)
+    sensor_pub = node.create_publisher(Odometry, '/slam/odometry_lidar', qos_profile_sensor_data)
+    base_pub = node.create_publisher(Odometry, '/slam/global_odometry_base', qos_profile_sensor_data)
+    cloud_pub = node.create_publisher(PointCloud2, '/slam/global_cloud_registered', qos_profile_sensor_data)
     ack_pub = node.create_publisher(PoseStamped, '/scan/goal_stop_ack', 10)
     state_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                            durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -72,14 +72,14 @@ def main():
                 break
             stamp = node.get_clock().now().to_msg()
             sensor = Odometry()
-            sensor.header = Header(stamp=stamp, frame_id='odom')
+            sensor.header = Header(stamp=stamp, frame_id='map')
             sensor.pose.pose.position.z = -0.01
             sensor.pose.pose.orientation.w = 1.0
             base = Odometry()
-            base.header = Header(stamp=stamp, frame_id='odom')
+            base.header = Header(stamp=stamp, frame_id='map')
             base.pose.pose.position.z = -0.11
             base.pose.pose.orientation.w = 1.0
-            cloud = point_cloud2.create_cloud_xyz32(Header(stamp=stamp, frame_id='odom'), points)
+            cloud = point_cloud2.create_cloud_xyz32(Header(stamp=stamp, frame_id='map'), points)
             ready_pub.publish(Bool(data=True))
             sensor_pub.publish(sensor)
             base_pub.publish(base)

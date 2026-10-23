@@ -30,9 +30,9 @@ def main():
     rclpy.init()
     node = rclpy.create_node('exploration_smoke_test')
     status = []
-    sensor_pub = node.create_publisher(Odometry, '/fast_lio/odometry_lidar', qos_profile_sensor_data)
-    base_pub = node.create_publisher(Odometry, '/fast_lio/odometry_base', qos_profile_sensor_data)
-    cloud_pub = node.create_publisher(PointCloud2, '/fast_lio/cloud_registered', qos_profile_sensor_data)
+    sensor_pub = node.create_publisher(Odometry, '/slam/odometry_lidar', qos_profile_sensor_data)
+    base_pub = node.create_publisher(Odometry, '/slam/global_odometry_base', qos_profile_sensor_data)
+    cloud_pub = node.create_publisher(PointCloud2, '/slam/global_cloud_registered', qos_profile_sensor_data)
     state_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                            durability=DurabilityPolicy.TRANSIENT_LOCAL)
     node.create_subscription(String, '/exploration/status',
@@ -48,16 +48,16 @@ def main():
                 break
             stamp = node.get_clock().now().to_msg()
             sensor = Odometry()
-            sensor.header.frame_id = 'odom'
+            sensor.header.frame_id = 'map'
             sensor.header.stamp = stamp
             sensor.pose.pose.position.z = 0.4
             sensor.pose.pose.orientation.w = 1.0
             base = Odometry()
-            base.header.frame_id = 'odom'
+            base.header.frame_id = 'map'
             base.header.stamp = stamp
             base.pose.pose.position.z = 0.3
             base.pose.pose.orientation.w = 1.0
-            cloud = point_cloud2.create_cloud_xyz32(Header(stamp=stamp, frame_id='odom'), points)
+            cloud = point_cloud2.create_cloud_xyz32(Header(stamp=stamp, frame_id='map'), points)
             # Deliberately allow transport to reorder these three topics.
             cloud_pub.publish(cloud)
             sensor_pub.publish(sensor)

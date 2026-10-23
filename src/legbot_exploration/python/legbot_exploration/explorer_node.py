@@ -1,12 +1,13 @@
 """ROS2 orchestration for the Python frontier implementation."""
 from collections import deque
+from dataclasses import replace
 import json
 import math
 import signal
 import time
 
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -16,7 +17,7 @@ from std_msgs.msg import Bool, String
 from std_srvs.srv import SetBool, Trigger
 from visualization_msgs.msg import Marker, MarkerArray
 
-from .exploration_core import Settings, VoxelMap, select_frontier
+from .exploration_core import GoalProgressGate, RecoveryGate, Settings, VoxelMap, select_frontier
 
 
 def stamp_ns(stamp):
@@ -32,9 +33,9 @@ class Explorer(Node):
         self.cfg = cfg
         self.map = VoxelMap(cfg)
         for name, default in (
-            ('frame_id', 'odom'), ('cloud_topic', '/fast_lio/cloud_registered'),
-            ('sensor_odom_topic', '/fast_lio/odometry_lidar'),
-            ('base_odom_topic', '/fast_lio/odometry_base'),
+            ('frame_id', 'map'), ('cloud_topic', '/slam/global_cloud_registered'),
+            ('sensor_odom_topic', '/slam/odometry_lidar'),
+            ('base_odom_topic', '/slam/global_odometry_base'),
             ('planner_occupancy_topic', '/local_planner/grid_map/occupancy_inflate'),
             ('waypoint_topic', '/scan/waypoint_input'), ('scan_goal_topic', '/scan/goal'),
             ('ready_topic', '/go2/demo_ready'), ('point_stride', 8),
@@ -43,14 +44,20 @@ class Explorer(Node):
             ('goal_reach_xy', 0.55), ('progress_distance', 0.35),
             ('progress_timeout', 12.0), ('goal_timeout', 90.0),
             ('goal_forward_timeout', 3.0), ('failed_frontier_cooldown', 45.0),
-            ('no_frontier_hold', 8.0), ('planner_occupancy_timeout', 2.0),
+            ('no_frontier_hold', 8.0), ('recovery_min_new_cells', 8),
+            ('planner_occupancy_timeout', 2.0),
             ('planner_occupancy_height_tolerance', 0.5),
+            ('require_planner_occupancy', False),
             ('near_goal_dwell', 1.5), ('blocked_goal_dwell', 2.0),
-            ('observation_only', True)):
+            ('observation_only', True), ('bounds_relative_to_start', False)):
             setattr(self, name, self.declare_parameter(name, default).value)
         if (cfg.resolution <= 0 or cfg.local_search_radius <= 0 or self.point_stride < 1
-                or self.max_points_per_cloud < 1 or cfg.max_voxels < 1):
-            raise ValueError('resolution, search radius, stride, max points and max voxels must be positive')
+                or self.max_points_per_cloud < 1 or cfg.max_voxels < 1 or
+                self.recovery_min_new_cells < 1):
+            raise ValueError('resolution, search radius, stride, max points, max voxels and recovery gain must be positive')
+        if (cfg.global_search and (cfg.exploration_min_x >= cfg.exploration_max_x or
+                                   cfg.exploration_min_y >= cfg.exploration_max_y)):
+            raise ValueError('global exploration bounds must have positive area')
         self.sensor_poses = deque(maxlen=100)
         self.base_poses = deque(maxlen=100)
         self.pending_clouds = deque(maxlen=5)
@@ -67,14 +74,24 @@ class Explorer(Node):
         self.last_clear_wall = 0.0
         self.clear_future = None
         self.suppressed = []
+        self.recovery_gate = RecoveryGate(self.recovery_min_new_cells)
+        self.goal_progress_gate = GoalProgressGate(self.recovery_min_new_cells)
         self.empty_since = None
+        self.residual_since = None
         self.last_status = ''
         self.last_marker_version = -1
+        self.last_frontier_cells = 0
+        self.last_frontier_clusters = 0
+        self.last_selection_diagnostics = {}
+        self.bounds_initialized = False
+        self.trajectory = Path()
+        self.trajectory.header.frame_id = self.frame_id
         state_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                                durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.waypoint_pub = self.create_publisher(PoseStamped, self.waypoint_topic, 10)
         self.marker_pub = self.create_publisher(MarkerArray, '/exploration/frontiers', state_qos)
         self.status_pub = self.create_publisher(String, '/exploration/status', state_qos)
+        self.trajectory_pub = self.create_publisher(Path, '/exploration/trajectory', state_qos)
         self.create_subscription(PointCloud2, self.cloud_topic, self.on_cloud, qos_profile_sensor_data)
         self.create_subscription(Odometry, self.sensor_odom_topic, self.on_sensor, qos_profile_sensor_data)
         self.create_subscription(Odometry, self.base_odom_topic, self.on_base, qos_profile_sensor_data)
@@ -94,7 +111,11 @@ class Explorer(Node):
     def report(self, state, **extra):
         data = {'state': state, 'implementation': 'python', 'map_version': self.map.version,
                 'voxel_count': len(self.map.voxels), 'paused': self.paused,
-                'observation_only': self.observation_only}
+                'observation_only': self.observation_only,
+                'global_search': self.cfg.global_search,
+                'frontier_cells': self.last_frontier_cells,
+                'frontier_clusters': self.last_frontier_clusters}
+        data.update(self.last_selection_diagnostics)
         data.update(extra)
         encoded = json.dumps(data, sort_keys=True)
         if encoded != self.last_status:
@@ -114,9 +135,25 @@ class Explorer(Node):
             return
         p = msg.pose.pose.position
         if all(math.isfinite(v) for v in (p.x, p.y, p.z)):
+            if self.cfg.global_search and self.bounds_relative_to_start and not self.bounds_initialized:
+                self.cfg.exploration_min_x += p.x
+                self.cfg.exploration_max_x += p.x
+                self.cfg.exploration_min_y += p.y
+                self.cfg.exploration_max_y += p.y
+                self.bounds_initialized = True
             self.base = (p.x, p.y, p.z)
             self.base_poses.append((stamp_ns(msg.header.stamp), self.base))
             self.base_wall = time.monotonic()
+            if (not self.trajectory.poses or
+                    math.dist(self.base[:2], (
+                        self.trajectory.poses[-1].pose.position.x,
+                        self.trajectory.poses[-1].pose.position.y)) >= 0.1):
+                pose = PoseStamped()
+                pose.header = msg.header
+                pose.pose = msg.pose.pose
+                self.trajectory.poses.append(pose)
+                if len(self.trajectory.poses) > 20000:
+                    self.trajectory.poses.pop(0)
             self.process_clouds()
 
     def on_occupancy(self, msg):
@@ -237,6 +274,7 @@ class Explorer(Node):
     def finish_if_complete(self):
         if self.active and self.active['ack'] and self.active['complete']:
             self.get_logger().info('Frontier goal reached: %s' % (self.active['xy'],))
+            self.finish_active_goal()
             self.active = None
             self.empty_since = None
             self.report('goal_reached')
@@ -278,6 +316,7 @@ class Explorer(Node):
             if response and response.success:
                 self.clearing = False
                 self.last_clear_wall = time.monotonic()
+                self.finish_active_goal()
                 self.active = None
                 if self.clearing_reason == 'proximity_reached':
                     self.empty_since = None
@@ -287,7 +326,7 @@ class Explorer(Node):
                 self.clearing_reason = ''
         return True
 
-    def publish_target(self, xy):
+    def publish_target(self, xy, detail=None):
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.frame_id
@@ -301,9 +340,39 @@ class Explorer(Node):
                        'stamp': None, 'forwarded': None,
                        'best_distance': distance, 'progress_wall': now,
                        'ack': False, 'armed': False, 'complete': False,
-                       'near_since': None, 'blocked_since': None}
+                       'near_since': None, 'blocked_since': None,
+                       'recovery': detail == 'recovery_backtrack',
+                       'observed_cells_at_send': len(self.map.project(self.base[:2]))}
+        if self.active['recovery']:
+            self.recovery_gate.start(self.active['observed_cells_at_send'])
         self.waypoint_pub.publish(msg)
-        self.report('goal_sent', goal=xy)
+        self.report('goal_sent', goal=xy, **({'detail': detail} if detail else {}))
+
+    def finish_active_goal(self):
+        if not self.active or self.base is None:
+            return
+        observed = len(self.map.project(self.base[:2]))
+        if self.active['recovery']:
+            self.recovery_gate.finish(observed)
+        elif self.clearing_reason in ('', 'proximity_reached'):
+            self.goal_progress_gate.finish(self.active['xy'],
+                                           self.active['observed_cells_at_send'], observed)
+
+    def backtrack_goal(self):
+        if self.base is None or not self.trajectory.poses:
+            return None
+        grid = self.map.project(self.base[:2])
+        for pose in reversed(self.trajectory.poses):
+            xy = (pose.pose.position.x, pose.pose.position.y)
+            distance = math.dist(xy, self.base[:2])
+            if not max(2.0, self.cfg.min_goal_distance) <= distance <= self.cfg.max_goal_distance:
+                continue
+            cell = (math.floor(xy[0] / self.cfg.resolution),
+                    math.floor(xy[1] / self.cfg.resolution))
+            if grid.get(cell) != 0 or self.planner_blocks(xy):
+                continue
+            return xy
+        return None
 
     def publish_marker(self, xy, clusters):
         array = MarkerArray()
@@ -325,6 +394,9 @@ class Explorer(Node):
 
     def tick(self):
         now = time.monotonic()
+        if self.trajectory.poses:
+            self.trajectory.header.stamp = self.get_clock().now().to_msg()
+            self.trajectory_pub.publish(self.trajectory)
         if self.tick_clear():
             return
         if (self.base is None or now - self.base_wall > self.odom_timeout or
@@ -337,6 +409,8 @@ class Explorer(Node):
             target = self.active
             if target['stamp'] is None:
                 if now - target['sent'] > self.goal_forward_timeout:
+                    if target['recovery']:
+                        self.recovery_gate.finish(len(self.map.project(self.base[:2])))
                     self.active = None
                     self.report('goal_not_forwarded')
                 return
@@ -369,22 +443,59 @@ class Explorer(Node):
         if len(self.map.voxels) >= self.cfg.max_voxels:
             self.report('map_capacity_reached')
             return
-        if not any(value == 0 for value in self.map.project(self.base[:2]).values()):
+        projected = self.map.project(self.base[:2])
+        if not any(value == 0 for value in projected.values()):
             self.report('waiting_for_free_space')
             return
+        if self.require_planner_occupancy and not self.occupancy_fresh(now):
+            self.report('waiting_for_planner_occupancy')
+            return
         suppressed_xy = [xy for xy, _ in self.suppressed]
+        suppressed_xy.extend(self.goal_progress_gate.blocked(len(projected)))
         obstacles = self.external_obstacles if self.occupancy_fresh(now) else ()
-        goal, score, clusters = select_frontier(
+        goal, score, clusters, frontier_cells, diagnostics = select_frontier(
             self.map, self.base, self.cfg, suppressed_xy, obstacles)
+        residual_goal = False
+        if self.cfg.global_search and frontier_cells > 0 and clusters == 0:
+            if self.residual_since is None:
+                self.residual_since = now
+            if now - self.residual_since >= self.no_frontier_hold:
+                residual_cfg = replace(self.cfg, min_frontier_cells=1)
+                residual, residual_score, _, _, _ = select_frontier(
+                    self.map, self.base, residual_cfg, suppressed_xy, obstacles)
+                if residual is not None:
+                    goal, score = residual, residual_score
+                    residual_goal = True
+        else:
+            self.residual_since = None
+        self.last_frontier_cells = frontier_cells
+        self.last_frontier_clusters = clusters
+        self.last_selection_diagnostics = diagnostics
         self.publish_marker(goal, clusters)
         if goal is None:
-            if clusters > 0:
+            if (self.cfg.global_search and self.recovery_gate.eligible(
+                    clusters, diagnostics['reachable_frontier_cells'],
+                    diagnostics['candidate_goals'], len(projected)) and
+                    not self.observation_only and
+                    not self.paused and self.ready and
+                    self.waypoint_pub.get_subscription_count() > 0):
+                recovery = self.backtrack_goal()
+                if recovery is not None:
+                    self.suppressed.append((self.base[:2], now + self.failed_frontier_cooldown))
+                    self.publish_target(recovery, detail='recovery_backtrack')
+                    return
+            if frontier_cells > 0:
                 self.empty_since = None
-                self.report('frontiers_unreachable_or_suppressed', clusters=clusters)
+                self.report('frontiers_unreachable_or_suppressed' if clusters > 0 else
+                            'frontiers_below_cluster_threshold',
+                            **({'detail': 'recovery_waiting_for_new_observations'}
+                               if clusters > 0 and self.recovery_gate.waiting_for_new_cells(
+                                   len(projected)) else {}))
             else:
                 if self.empty_since is None:
                     self.empty_since = now
-                state = ('current_region_complete' if now - self.empty_since >= self.no_frontier_hold
+                state = (('exploration_complete' if self.cfg.global_search else
+                          'current_region_complete') if now - self.empty_since >= self.no_frontier_hold
                          else 'waiting_for_frontier')
                 self.report(state, clusters=0)
             return
@@ -396,7 +507,7 @@ class Explorer(Node):
         elif not self.ready or self.waypoint_pub.get_subscription_count() == 0:
             self.report('waiting_for_waypoint_coordinator', goal=goal)
         else:
-            self.publish_target(goal)
+            self.publish_target(goal, detail='residual_frontier' if residual_goal else None)
 
 
 def main():

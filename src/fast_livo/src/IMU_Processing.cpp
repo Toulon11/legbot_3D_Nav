@@ -24,6 +24,8 @@ which is included as part of this source code package.
  */
 #include "IMU_Processing.h"
 #include <rcpputils/asserts.hpp>
+#include <algorithm>
+#include <cmath>
 
 const bool time_list(PointType &x, PointType &y) { return (x.curvature < y.curvature); }
 
@@ -54,6 +56,7 @@ void ImuProcess::Reset()
   mean_acc = V3D(0, 0, -1.0);
   mean_gyr = V3D(0, 0, 0);
   angvel_last = Zero3d;
+  b_first_frame = true;
   imu_need_init = true;
   init_iter_num = 1;
   IMUpose.clear();
@@ -116,6 +119,12 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a) { cov_bias_acc = b_a; }
 
 void ImuProcess::set_imu_init_frame_num(const int &num) { MAX_INI_COUNT = num; }
 
+void ImuProcess::set_init_acc_norm_range(double min_norm, double max_norm)
+{
+  init_acc_min_norm = std::max(1e-6, min_norm);
+  init_acc_max_norm = max_norm;
+}
+
 /**
  * @brief IMU初始化：通过平均加速度估计重力方向
  * 
@@ -165,7 +174,12 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
     N++;
   }
   IMU_mean_acc_norm = mean_acc.norm();
-  state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
+  // Gazebo may deliver IMU samples during the initial free fall.  An almost
+  // zero mean is not a gravity observation and must never be normalized.
+  if (std::isfinite(IMU_mean_acc_norm) &&
+      IMU_mean_acc_norm >= init_acc_min_norm &&
+      IMU_mean_acc_norm <= init_acc_max_norm)
+    state_inout.gravity = -mean_acc / IMU_mean_acc_norm * G_m_s2;
   state_inout.rot_end = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
   state_inout.bias_g = Zero3d; // mean_gyr;
 
@@ -613,6 +627,21 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
     if (meas.imu.empty()) { return; };
     /// The very first lidar frame
     IMU_init(meas, stat, init_iter_num);
+
+    // Wait for the robot to rest on the floor before estimating gravity.
+    // Otherwise the 9.81 / mean_acc.norm() scale in UndistortPcl can turn
+    // free-fall sensor noise into an unbounded position estimate.
+    if (!std::isfinite(IMU_mean_acc_norm) ||
+        IMU_mean_acc_norm < init_acc_min_norm ||
+        IMU_mean_acc_norm > init_acc_max_norm)
+    {
+      static rclcpp::Clock log_clock(RCL_STEADY_TIME);
+      RCLCPP_WARN_THROTTLE(rclcpp::get_logger(""), log_clock, 2000,
+          "Waiting for settled IMU data; mean acceleration norm %.4f m/s^2",
+          IMU_mean_acc_norm);
+      Reset();
+      return;
+    }
 
     imu_need_init = true;
 
