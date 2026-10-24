@@ -1,48 +1,50 @@
+# ROS 2 参数文件：/** 表示这些参数可供本包中任意节点读取。
 /**:
+  # 固定键名；下面缩进四格的项目才是真正的参数。
   ros__parameters:
-    frame_id: map
-    cloud_topic: /slam/global_cloud_registered
-    sensor_odom_topic: /slam/odometry_lidar
-    base_odom_topic: /slam/global_odometry_base
-    planner_occupancy_topic: /local_planner/grid_map/occupancy_inflate
-    waypoint_topic: /scan/waypoint_input
-    scan_goal_topic: /scan/goal
-    ready_topic: /go2/demo_ready
-    resolution: 0.25
-    max_ray_range: 9.0
-    point_stride: 8
-    max_points_per_cloud: 1000
-    max_voxels: 900000
-    sensor_sync_tolerance: 0.03
-    odom_timeout: 1.0
-    cloud_timeout: 2.0
-    obstacle_min_relative_z: -0.15
-    obstacle_max_relative_z: 0.85
-    free_min_relative_z: -0.45
-    robot_radius: 0.35
-    local_search_radius: 10.0
-    global_search: false
-    bounds_relative_to_start: false
-    exploration_min_x: -31.5
-    exploration_max_x: -0.5
-    exploration_min_y: -15.5
-    exploration_max_y: 15.5
-    min_goal_distance: 1.0
-    max_goal_distance: 8.0
-    min_frontier_cells: 3
-    frontier_gain_weight: 1.0
-    path_cost_weight: 1.0
-    unknown_path_multiplier: 1.5
-    goal_reach_xy: 0.55
-    progress_distance: 0.35
-    progress_timeout: 12.0
-    goal_timeout: 90.0
-    goal_forward_timeout: 3.0
-    failed_frontier_cooldown: 45.0
-    no_frontier_hold: 8.0
-    recovery_min_new_cells: 8
-    planner_occupancy_timeout: 2.0
-    planner_occupancy_height_tolerance: 0.5
-    near_goal_dwell: 1.5
-    blocked_goal_dwell: 2.0
-    observation_only: true
+    frame_id: map                         # 统一地图坐标系；里程计和点云必须与它一致。
+    cloud_topic: /slam/global_cloud_registered # 每帧已配准到地图坐标系的点云；本包负责长期累计。
+    sensor_odom_topic: /slam/odometry_lidar # 雷达位姿输入，用于确定每条射线从哪里发出。
+    base_odom_topic: /slam/global_odometry_base # 机体位姿输入，用于确定机器人所在位置和高度。
+    planner_occupancy_topic: /local_planner/grid_map/occupancy_inflate # SCAN 膨胀后的障碍点云。
+    waypoint_topic: /scan/waypoint_input   # 探索器把新目标发到这里。
+    scan_goal_topic: /scan/goal            # SCAN 转发目标后，探索器从这里确认。
+    ready_topic: /go2/demo_ready           # GO2 控制器就绪信号。
+    resolution: 0.25                       # 每个体素边长，单位米；越小越精细、越占内存。
+    max_ray_range: 9.0                     # 超过此距离的雷达点不纳入地图，单位米。
+    point_stride: 8                        # 每 8 个点取 1 个，降低处理量。
+    max_points_per_cloud: 1000             # 每帧最多使用 1000 个抽样点。
+    max_voxels: 900000                     # 稀疏地图最多保存的体素数量。
+    sensor_sync_tolerance: 0.03            # 点云和里程计允许相差的最大时间，单位秒。
+    odom_timeout: 1.0                      # 机体位姿超过 1 秒未更新时停止选新目标。
+    cloud_timeout: 2.0                     # 地图点云超过 2 秒未更新时停止选新目标。
+    obstacle_min_relative_z: -0.15        # 相对机体高度的障碍判定下界，单位米。
+    obstacle_max_relative_z: 0.85         # 相对机体高度的障碍判定上界，单位米。
+    free_min_relative_z: -0.45            # 二维投影纳入的最低高度，单位米。
+    robot_radius: 0.35                    # 机器人避障膨胀半径，单位米。
+    local_search_radius: 10.0             # 局部搜索时的半径，单位米。
+    global_search: false                  # true 时在下方矩形边界内做全图搜索。
+    bounds_relative_to_start: false       # true 时把边界坐标加到起始机体位置上。
+    exploration_min_x: -31.5              # 全图搜索区域的最小 X，单位米。
+    exploration_max_x: -0.5               # 全图搜索区域的最大 X，单位米。
+    exploration_min_y: -15.5              # 全图搜索区域的最小 Y，单位米。
+    exploration_max_y: 15.5               # 全图搜索区域的最大 Y，单位米。
+    min_goal_distance: 1.0                # 候选目标离机器人至少 1 米。
+    max_goal_distance: 8.0                # 单次下发目标的最大距离，单位米。
+    min_frontier_cells: 3                 # 至少 3 个相连前沿格才算一个有效簇。
+    frontier_gain_weight: 1.0             # 簇规模收益在评分中的权重。
+    path_cost_weight: 1.0                 # 路径代价在评分中的权重。
+    unknown_path_multiplier: 1.5         # 经过未知格的路径成本倍率。
+    goal_reach_xy: 0.55                   # 水平距离小于此值视为接近目标，单位米。
+    progress_distance: 0.35              # 距离目标至少缩短这么多才算有进度，单位米。
+    progress_timeout: 12.0               # 连续无进度达到此秒数后清除目标。
+    goal_timeout: 90.0                   # 单个目标执行的总超时，单位秒。
+    goal_forward_timeout: 3.0            # 下发后等待 SCAN 确认转发的超时，单位秒。
+    failed_frontier_cooldown: 45.0       # 失败目标附近暂不重选的时长，单位秒。
+    no_frontier_hold: 8.0                # 连续 8 秒找不到前沿，才判定区域探索完成。
+    recovery_min_new_cells: 8            # 回退或目标成功后，至少新观察 8 格才算有效收益。
+    planner_occupancy_timeout: 2.0       # SCAN 障碍点云的有效时长，单位秒。
+    planner_occupancy_height_tolerance: 0.5 # 只考虑与机体高度差不超过此值的障碍。
+    near_goal_dwell: 1.5                 # 持续接近目标后触发到达兜底的时间，单位秒。
+    blocked_goal_dwell: 2.0              # 目标持续落在障碍内后触发清除的时间，单位秒。
+    observation_only: true               # true 只计算和显示，不发送运动目标。

@@ -1,1 +1,1 @@
-"""Python implementation of the Legbot frontier explorer."""
+"""Legbot 前沿探索功能包的 Python 模块入口。"""

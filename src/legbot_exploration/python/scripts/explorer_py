@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 导入 legbot_exploration.explorer_node 提供的类型或函数。
 from legbot_exploration.explorer_node import main
 
 

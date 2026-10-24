@@ -1,25 +1,35 @@
-"""Start the simulation exploration workflow in guide order."""
+"""按启动指南中的顺序启动仿真、自主探索相关节点。"""
 
+# 导入 数学函数，如开方、向下取整和距离计算。
 import math
+# 导入 拼接安装后的启动文件路径。
 import os
 
+# 导入 ament_index_python.packages 提供的类型或函数。
 from ament_index_python.packages import get_package_share_directory as share
+# 导入 launch 提供的类型或函数。
 from launch import LaunchDescription
+# 导入 launch.actions 提供的类型或函数。
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, TimerAction
+# 导入 launch.launch_description_sources 提供的类型或函数。
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+# 导入 launch.substitutions 提供的类型或函数。
 from launch.substitutions import LaunchConfiguration
 
 
 def include(package, filename, arguments=None):
+    # 返回本函数计算得到的结果。
     return IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(share(package), 'launch', filename)),
         launch_arguments=(arguments or {}).items(),
     )
 
 
+# 根据启动参数安排本次要启动的节点。
 def setup(context):
     source = LaunchConfiguration('localization_source').perform(context)
     delay = float(LaunchConfiguration('control_start_delay').perform(context))
+    # 延迟时间不能是 NaN、无穷大或负数，否则定时启动顺序失去意义。
     if not math.isfinite(delay) or delay < 0.0:
         raise RuntimeError('control_start_delay must be a finite, nonnegative number')
 
@@ -38,9 +48,8 @@ def setup(context):
     flat_world = os.path.basename(
         world) == 'ExplorationFlat.sdf'
 
-    # Terminal 1: Gazebo, sensors, controller manager and the robot.  In global
-    # interface mode the non-truth branch does not select a SLAM algorithm; it
-    # only disables Gazebo's odom -> base TF so the estimator owns that frame.
+    # 第一阶段：启动 Gazebo、传感器、控制器管理器和机器人。
+    # 估计定位模式会关闭 Gazebo 的 odom→base TF，由定位器负责发布该坐标关系。
     actions = [include('legbot_bringup', 'simulation.launch.py', {
         'gui': 'true',
         'world': world,
@@ -49,8 +58,7 @@ def setup(context):
         'publish_ground_truth': 'true',
     })]
 
-    # Terminal 2: one localization/registered-cloud source.  Gazebo truth is
-    # already provided by simulation.launch.py and needs no second process.
+    # 第二阶段：只选一种定位和已配准点云来源；Gazebo 真值已由 simulation 启动。
     if source == 'fastlio':
         actions.append(include('legbot_bringup', 'fastlio.launch.py', {
             'use_sim_time': 'true',
@@ -65,8 +73,8 @@ def setup(context):
             'config': os.path.join(share('fast_livo'), 'config', 'legbot_sim.yaml'),
         }))
 
-    # Terminals 3-6.  The fixed spacing keeps launch order readable; the GO2
-    # sequencer and explorer still wait for live data and /go2/demo_ready.
+    # 后续阶段：依次启动 GO2 控制、SCAN、RViz、探索节点。
+    # 固定间隔仅用于排列顺序；控制与探索仍会等实时数据和就绪信号。
     actions.extend([
         TimerAction(period=delay, actions=[include(
             'legbot_bringup', 'go2_demo_control.launch.py', {
@@ -100,17 +108,23 @@ def setup(context):
                 'flat_safety': 'true' if flat_world else 'false',
             })]),
     ])
+    # 返回本函数计算得到的结果。
     return actions
 
 
+# 声明 ros2 launch 可传入的参数与启动动作。
 def generate_launch_description():
+    # 返回本启动文件的参数及启动动作。
     return LaunchDescription([
+        # 声明一个可由 ros2 launch 命令覆盖的启动参数。
         DeclareLaunchArgument(
             'localization_source', default_value='gazebo',
             choices=['gazebo', 'fastlio', 'fastlivo'],
             description='Gazebo truth, FAST-LIO2, or FAST-LIVO2.'),
+        # 声明一个可由 ros2 launch 命令覆盖的启动参数。
         DeclareLaunchArgument(
             'control_start_delay', default_value='12.0',
             description='Seconds from launch start until GO2 high-level control starts.'),
+        # 等参数解析后才运行 setup，选择要启动的节点。
         OpaqueFunction(function=setup),
     ])

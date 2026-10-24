@@ -1,12 +1,20 @@
 <?xml version="1.0"?>
+<!-- ROS 2 功能包的清单文件：告诉 colcon 包叫什么、需要哪些依赖。 -->
 <package format="3">
+  <!-- 包名，也是 ros2 launch 与 ros2 run 使用的名称。 -->
   <name>legbot_exploration</name>
+  <!-- 当前功能包版本；不是 ROS 2 的版本。 -->
   <version>0.1.0</version>
+  <!-- 向软件仓库和包管理器说明本包用途。 -->
   <description>Cumulative point cloud frontier exploration for the existing SCAN waypoint interface.</description>
+  <!-- 维护者和许可证是 ROS 包清单要求的元数据。 -->
   <maintainer email="biao876990970@hotmail.com">Robot-Nav</maintainer>
   <license>Apache-2.0</license>
+  <!-- ament_cmake 负责本包的 CMake 构建。 -->
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <!-- 构建 Python 模块时需要 ament_cmake_python。 -->
   <build_depend>ament_cmake_python</build_depend>
+  <!-- 以下 depend 表示编译和运行时都需要的 ROS 2 消息与节点库。 -->
   <depend>rclcpp</depend>
   <depend>rclpy</depend>
   <depend>geometry_msgs</depend>
@@ -15,8 +23,12 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>visualization_msgs</depend>
+  <!-- Python 点云读取库只需在运行 Python 节点时存在。 -->
   <exec_depend>sensor_msgs_py</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <!-- 启动文件需要引用 bringup 的启动配置与 launch_ros。 -->
   <exec_depend>legbot_bringup</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <!-- 向 colcon 声明这个包采用 ament_cmake 构建。 -->
   <export><build_type>ament_cmake</build_type></export>
 </package>
