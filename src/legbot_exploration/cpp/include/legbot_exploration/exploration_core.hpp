@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -21,7 +22,7 @@ struct Settings {
   double free_min_relative_z = -0.45;   // 投影二维空闲格的最低高度。
   double robot_radius = 0.35;           // 避障时使用的机器人半径。
   double local_search_radius = 10.0;    // 局部前沿搜索半径，单位米。
-  bool global_search = false;           // true 时改用下方矩形边界全图搜索。
+  bool global_search = false;           // true 时先在矩形内选点，再查完整累计地图。
   double exploration_min_x = -31.5;     // 全图边界：X 最小值。
   double exploration_max_x = -0.5;      // 全图边界：X 最大值。
   double exploration_min_y = -15.5;     // 全图边界：Y 最小值。
@@ -64,11 +65,14 @@ class VoxelMap {
   std::size_t integrate(const Point &origin, const std::vector<Point> &points, double base_z); // 融合一帧射线。
   // 高度证据相对“采集该帧时”的机体高度保存。
   std::unordered_map<Cell, int, CellHash> project(const XY &center_xy) const; // 三维证据压成二维格子。
+  std::unordered_map<Cell, int, CellHash> project_all() const; // 不按预设矩形裁剪累计地图。
   void set_exploration_bounds(double min_x, double max_x, double min_y, double max_y); // 更新全局搜索边界。
   std::size_t size() const { return voxels_.size(); } // 已保存的体素数。
   std::size_t version() const { return version_; } // 地图更新次数。
 
  private:
+  std::unordered_map<Cell, int, CellHash> project_impl(const XY &center_xy,
+                                                       bool all_observed) const;
   void mark(const Voxel &voxel, bool hit); // hit 表示射线末端命中障碍。
   Settings cfg_; // 当前参数副本。
   std::unordered_map<Voxel, int, VoxelHash> voxels_; // 三维格号到证据值。
@@ -112,6 +116,18 @@ Coverage assess_coverage(const std::unordered_map<Cell, int, CellHash> &grid,
 Coverage assess_reachable_coverage(const std::unordered_map<Cell, int, CellHash> &grid,
                                    const Settings &cfg, const XY &robot_xy);
 
+// 从机器人附近的已知空闲格出发，只沿四邻接的已知空闲格搜索。
+// 未知邻格是未经选点门槛过滤的原始前沿；invalid 时禁止宣布完成。
+struct GlobalFrontiers {
+  bool valid = false;
+  std::size_t reachable_free_cells = 0;
+  std::size_t frontier_cells = 0;
+  std::unordered_set<Cell, CellHash> cells; // 仅机器人连通空闲区边上的未知格。
+};
+GlobalFrontiers assess_global_frontiers(
+    const std::unordered_map<Cell, int, CellHash> &grid,
+    const Settings &cfg, const XY &robot_xy);
+
 // 普通前沿耗尽而仍有未知格时，从已观察且连通的空闲格找补充观测位置。
 std::optional<XY> select_observation_goal(const VoxelMap &map, const Point &robot,
                                           const Settings &cfg,
@@ -151,6 +167,8 @@ class GoalProgressGate {
 
 Selection select_frontier(const VoxelMap &map, const Point &robot, const Settings &cfg,
                           const std::vector<XY> &suppressed,
-                          const std::vector<XY> &external_obstacles = {});
+                          const std::vector<XY> &external_obstacles = {},
+                          bool all_observed = false,
+                          const std::unordered_set<Cell, CellHash> *allowed_frontiers = nullptr);
 
 }  // namespace legbot_exploration

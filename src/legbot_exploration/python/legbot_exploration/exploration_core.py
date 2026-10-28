@@ -34,7 +34,7 @@ class Settings:
     robot_radius: float = 0.35
     # 参数 local_search_radius：局部探索半径；等号右边是默认值。
     local_search_radius: float = 10.0
-    # 参数 global_search：是否启用全图搜索；等号右边是默认值。
+    # 参数 global_search：先在矩形内选点，再检查完整累计地图；等号右边是默认值。
     global_search: bool = False
     # 参数 exploration_min_x：全图边界的 X 最小值；等号右边是默认值。
     exploration_min_x: float = -31.5
@@ -222,7 +222,7 @@ class VoxelMap:
         return inserted
 
     # 把三维体素投影到机体附近的二维平面。
-    def project(self, center_xy):
+    def project(self, center_xy, all_observed=False):
         """把机体相对高度范围内的三维证据投影为二维占用/空闲格。"""
         # 将计算结果保存为 xy（地图坐标系下的目标水平坐标）。
         xy = {}
@@ -243,14 +243,15 @@ class VoxelMap:
                 # 跳过本次循环，检查下一个元素。
                 continue
             # 条件检查：当前启用全图搜索；成立才进入下面的分支。
-            if self.cfg.global_search:
+            if not all_observed and self.cfg.global_search:
                 # 全图模式也只接纳配置矩形边界内的体素。
                 if not (self.cfg.exploration_min_x <= wx <= self.cfg.exploration_max_x
                         and self.cfg.exploration_min_y <= wy <= self.cfg.exploration_max_y):
                     # 跳过本次循环，检查下一个元素。
                     continue
             # 上一条件不满足时，再检查这个分支。
-            elif abs(wx - center_xy[0]) > r or abs(wy - center_xy[1]) > r:
+            elif (not all_observed and not self.cfg.global_search and
+                  (abs(wx - center_xy[0]) > r or abs(wy - center_xy[1]) > r)):
                 # 跳过本次循环，检查下一个元素。
                 continue
             # 丢掉高度编号，得到水平二维格号。
@@ -372,6 +373,58 @@ def assess_reachable_coverage(grid, settings, robot_xy):
     return result
 
 
+def assess_global_frontiers(grid, settings, robot_xy):
+    """只从机器人所在的已知空闲连通区域寻找未经选点过滤的原始前沿。"""
+    invalid = {'valid': False, 'reachable_free_cells': 0, 'frontier_cells': 0}
+    r, radius = settings.resolution, settings.robot_radius
+    if (not grid or not math.isfinite(r) or r <= 0 or
+            not math.isfinite(radius) or radius < 0 or
+            not all(map(math.isfinite, robot_xy))):
+        return invalid
+
+    # 验收只使用累计障碍，不能让瞬时 SCAN 障碍抹掉待探索边界。
+    blocked = set()
+    inflation = math.ceil(radius / r)
+    for (x, y), state in grid.items():
+        if state != 1:
+            continue
+        for dx in range(-inflation, inflation + 1):
+            for dy in range(-inflation, inflation + 1):
+                if math.hypot(dx, dy) * r <= radius:
+                    blocked.add((x + dx, y + dy))
+
+    robot = (math.floor(robot_xy[0] / r), math.floor(robot_xy[1] / r))
+    search = math.ceil((radius + r) / r)
+    candidates = ((math.hypot((robot[0] + dx + .5) * r - robot_xy[0],
+                              (robot[1] + dy + .5) * r - robot_xy[1]),
+                   (robot[0] + dx, robot[1] + dy))
+                  for dx in range(-search, search + 1)
+                  for dy in range(-search, search + 1))
+    seed = min(((distance, cell) for distance, cell in candidates
+                if distance <= radius + r and cell not in blocked and
+                grid.get(cell) == 0), default=None)
+    if seed is None:
+        return invalid
+
+    queue = deque([seed[1]])
+    seen = {seed[1]}
+    frontiers = set()
+    while queue:
+        x, y = queue.popleft()
+        for dx, dy in NEIGHBORS4:
+            neighbor = (x + dx, y + dy)
+            if neighbor in blocked:
+                continue
+            state = grid.get(neighbor)
+            if state is None:
+                frontiers.add(neighbor)
+            elif state == 0 and neighbor not in seen:
+                seen.add(neighbor)
+                queue.append(neighbor)
+    return {'valid': True, 'reachable_free_cells': len(seen),
+            'frontier_cells': len(frontiers), 'cells': frontiers}
+
+
 def select_observation_goal(voxels, robot_xyz, settings, grid, suppressed=(),
                             external_obstacles=()):
     """无普通前沿时，从已知空闲连通区找可观测未知格的位置。"""
@@ -440,13 +493,22 @@ def select_observation_goal(voxels, robot_xyz, settings, grid, suppressed=(),
 
 
 # 聚类未知边界、计算路径代价并选出目标。
-def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacles=()):
+def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacles=(),
+                    all_observed=False, allowed_frontiers=None):
     """返回目标、评分、簇数、原始前沿格数及诊断计数。"""
     # 流程与 C++ 版相同：三维地图投影 → 障碍膨胀 → 未知边界聚类 → Dijkstra → 评分。
     # 将计算结果保存为 center（机器人所在的网格或待查询区域中心）。
     center = voxels.key(robot_xyz)[:2]
     # 将计算结果保存为 grid（高度切片后的二维占用表）。
-    grid = voxels.project(robot_xyz[:2])
+    grid = voxels.project(robot_xyz[:2], all_observed=all_observed)
+    min_x = min((cell[0] for cell in grid), default=center[0])
+    max_x = max((cell[0] for cell in grid), default=center[0])
+    min_y = min((cell[1] for cell in grid), default=center[1])
+    max_y = max((cell[1] for cell in grid), default=center[1])
+    min_x, max_x = min(min_x, center[0]), max(max_x, center[0])
+    min_y, max_y = min(min_y, center[1]), max(max_y, center[1])
+    search_limited = (all_observed and
+                      (max_x - min_x + 3) * (max_y - min_y + 3) > 2_000_000)
     # 将计算结果保存为 radius（搜索半径或膨胀格数）。
     radius = math.ceil(settings.local_search_radius / settings.resolution)
     # 将计算结果保存为 occupied（二维图中已观察到的障碍格）。
@@ -483,6 +545,9 @@ def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacl
 
     # 判断一个格子是否处在局部窗口或全局矩形范围内。
     def inside(cell):
+        if all_observed:
+            return (min_x - 1 <= cell[0] <= max_x + 1 and
+                    min_y - 1 <= cell[1] <= max_y + 1)
         # 条件检查：当前启用全图搜索；成立才进入下面的分支。
         if settings.global_search:
             # 把候选前沿格转成可以发布的米制目标坐标。
@@ -507,7 +572,8 @@ def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacl
             # 沿当前方向找到旁边的一个候选格。
             cell = (x + dx, y + dy)
             # 条件检查：候选格位于允许的搜索范围内；成立才进入下面的分支。
-            if inside(cell) and cell not in grid and cell not in blocked:
+            if (inside(cell) and cell not in grid and cell not in blocked and
+                    (allowed_frontiers is None or cell in allowed_frontiers)):
                 # 这个邻格尚未被观察且不在障碍膨胀区，因此加入前沿。
                 frontier.add(cell)
 
@@ -549,7 +615,7 @@ def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacl
     diagnostics = {'reachable_frontier_cells': 0, 'candidate_goals': 0,
                    'suppressed_goals': 0, 'open_start_neighbors': 0}
     # 条件检查：候选格超出允许的搜索范围；成立才进入下面的分支。
-    if not clusters or not inside(center):
+    if not clusters or not inside(center) or search_limited:
         # 返回本函数计算得到的结果。
         return None, None, len(clusters), frontier_cells, diagnostics
     # 统计机器人起点周围未被膨胀障碍堵住的方向数。

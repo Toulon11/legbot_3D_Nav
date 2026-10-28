@@ -35,7 +35,8 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 # 导入 .exploration_core 提供的类型或函数。
 from .exploration_core import (GoalProgressGate, RecoveryGate, Settings, VoxelMap,
-                               assess_reachable_coverage, select_frontier, select_observation_goal)
+                               assess_reachable_coverage, assess_global_frontiers,
+                               select_frontier, select_observation_goal)
 
 
 # 把 ROS 秒和纳秒组合成一个整数时间戳。
@@ -143,6 +144,8 @@ class Explorer(Node):
         # 更新节点状态 last_selection_diagnostics，供后续回调或主循环读取。
         self.last_selection_diagnostics = {}
         self.coverage = None
+        self.global_frontiers = {'valid': False, 'reachable_free_cells': 0,
+                                 'frontier_cells': 0}
         self.unresolved_unknown_cells = 0
         # 更新节点状态 bounds_initialized，供后续回调或主循环读取。
         self.bounds_initialized = False
@@ -200,6 +203,9 @@ class Explorer(Node):
                 'voxel_count': len(self.map.voxels), 'paused': self.paused,
                 'observation_only': self.observation_only,
                 'global_search': self.cfg.global_search,
+                'global_frontier_valid': self.global_frontiers['valid'],
+                'global_frontier_cells': self.global_frontiers['frontier_cells'],
+                'global_reachable_free_cells': self.global_frontiers['reachable_free_cells'],
                 'frontier_cells': self.last_frontier_cells,
                 'frontier_clusters': self.last_frontier_clusters}
         # 把最近一次选点的诊断计数并入状态字典。
@@ -763,6 +769,10 @@ class Explorer(Node):
         projected = self.map.project(self.base[:2])
         self.coverage = assess_reachable_coverage(projected, self.cfg, self.base[:2])
         self.publish_coverage_grid(projected)
+        if self.cfg.global_search:
+            self.global_frontiers = assess_global_frontiers(
+                self.map.project(self.base[:2], all_observed=True),
+                self.cfg, self.base[:2])
         # 只有存在正在执行的目标才处理这条消息。
         if self.active:
             self.empty_since = None
@@ -841,14 +851,11 @@ class Explorer(Node):
             # 结束当前函数，不再执行后面的语句。
             return
         # 将计算结果保存为 projected（以当前机体高度投影的二维地图）。
-        if self.cfg.global_search and (self.coverage is None or
-                (self.bounds_relative_to_start and not self.bounds_initialized)):
-            self.empty_since = None
-            self.report('invalid_exploration_bounds')
-            return
+        # 矩形覆盖率仅用于显示；不以它作为全局完成的范围边界。
         self.unresolved_unknown_cells = 0
         # 没有一个已观察空闲格时，暂时无法从机器人位置找前沿。
-        if not any(value == 0 for value in projected.values()):
+        if not (self.global_frontiers['valid'] if self.cfg.global_search else
+                any(value == 0 for value in projected.values())):
             self.empty_since = None
             # 状态中提示正在等待形成可搜索的空闲地图。
             self.report('waiting_for_free_space')
@@ -861,11 +868,11 @@ class Explorer(Node):
             self.report('waiting_for_planner_occupancy')
             # 结束当前函数，不再执行后面的语句。
             return
-        if self.cfg.global_search and not self.coverage['reachability_valid']:
+        if self.cfg.global_search and not self.global_frontiers['valid']:
             self.empty_since = None
             self.report('waiting_for_reachability_seed')
             return
-        if self.cfg.global_search and self.coverage['reachable_unknown_cells'] == 0:
+        if self.cfg.global_search and self.global_frontiers['frontier_cells'] == 0:
             self.unresolved_unknown_cells = 0
             self.last_frontier_cells = 0
             self.last_frontier_clusters = 0
@@ -888,10 +895,20 @@ class Explorer(Node):
         # 将计算结果保存为 diagnostics（供状态话题输出的选点计数）。
         goal, score, clusters, frontier_cells, diagnostics = select_frontier(
             self.map, self.base, self.cfg, suppressed_xy, obstacles)
+        search_all_observed = False
+        if self.cfg.global_search and goal is None and self.global_frontiers['frontier_cells'] > 0:
+            outside = select_frontier(self.map, self.base, self.cfg,
+                                      suppressed_xy, obstacles, all_observed=True,
+                                      allowed_frontiers=self.global_frontiers['cells'])
+            if outside[0] is not None or outside[3] > frontier_cells:
+                goal, score, clusters, frontier_cells, diagnostics = outside
+                search_all_observed = True
         # 将计算结果保存为 residual_goal（本轮是否选中了零散前沿）。
         residual_goal = False
         # 条件检查：当前启用全图搜索；成立才进入下面的分支。
-        if self.cfg.global_search and frontier_cells > 0 and clusters == 0:
+        if (self.cfg.global_search and
+                (frontier_cells > 0 or self.global_frontiers['frontier_cells'] > 0) and
+                clusters == 0):
             # 条件检查：对应数据还没有取得或初始化；成立才进入下面的分支。
             if self.residual_since is None:
                 # 更新节点状态 residual_since，供后续回调或主循环读取。
@@ -902,7 +919,14 @@ class Explorer(Node):
                 residual_cfg = replace(self.cfg, min_frontier_cells=1)
                 # 以单格最小簇规模重新搜索剩余零散前沿。
                 residual, residual_score, _, _, _ = select_frontier(
-                    self.map, self.base, residual_cfg, suppressed_xy, obstacles)
+                    self.map, self.base, residual_cfg, suppressed_xy, obstacles,
+                    all_observed=search_all_observed,
+                    allowed_frontiers=(self.global_frontiers['cells']
+                                       if search_all_observed else None))
+                if residual is None and not search_all_observed and self.global_frontiers['frontier_cells']:
+                    residual, residual_score, _, _, _ = select_frontier(
+                        self.map, self.base, residual_cfg, suppressed_xy, obstacles,
+                        all_observed=True, allowed_frontiers=self.global_frontiers['cells'])
                 # 零散前沿确实找到目标，才覆盖普通选点结果。
                 if residual is not None:
                     # 将计算结果保存为 score（目标收益减去路径代价后的评分）。
@@ -921,6 +945,7 @@ class Explorer(Node):
         self.last_selection_diagnostics = diagnostics
         observation_goal = False
         if (self.cfg.global_search and goal is None and frontier_cells == 0 and
+                self.global_frontiers['frontier_cells'] > 0 and
                 self.coverage['reachable_unknown_cells'] > 0):
             goal = select_observation_goal(self.map, self.base, self.cfg, projected,
                                            suppressed_xy, obstacles)
@@ -951,11 +976,13 @@ class Explorer(Node):
             if self.cfg.global_search:
                 self.unresolved_unknown_cells = self.coverage['reachable_unknown_cells']
             # 条件检查：当前仍然存在原始未知边界格；成立才进入下面的分支。
-            if frontier_cells > 0:
+            if (self.global_frontiers['frontier_cells'] > 0 if self.cfg.global_search
+                    else frontier_cells > 0):
                 # 更新节点状态 empty_since，供后续回调或主循环读取。
                 self.empty_since = None
                 # 仍有前沿时按诊断结果说明不可达、被屏蔽或簇过小。
-                self.report('frontiers_unreachable_or_suppressed' if clusters > 0 else
+                self.report('global_frontiers_unresolved' if frontier_cells == 0 else
+                            'frontiers_unreachable_or_suppressed' if clusters > 0 else
                             'frontiers_below_cluster_threshold',
                             **({'detail': 'recovery_waiting_for_new_observations'}
                                # 条件检查：仍然存在达到规模门槛的前沿簇；成立才进入下面的分支。
@@ -963,7 +990,7 @@ class Explorer(Node):
                                    len(projected)) else {}))
             # 上述条件不成立时，改走这个分支。
             else:
-                if self.cfg.global_search and self.coverage['reachable_unknown_cells'] > 0:
+                if self.cfg.global_search and self.global_frontiers['frontier_cells'] > 0:
                     self.empty_since = None
                     self.report('unknown_regions_unobservable_or_unreachable', clusters=0)
                 else:

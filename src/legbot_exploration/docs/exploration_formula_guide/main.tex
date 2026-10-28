@@ -1,0 +1,107 @@
+% !LW recipe = latexmk (xelatex)
+\documentclass[UTF8,12pt,a4paper]{ctexart}
+\usepackage{amsmath,amssymb,mathtools}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\geometry{left=2.6cm,right=2.6cm,top=2.7cm,bottom=2.7cm}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.35em}
+\setlist[itemize]{leftmargin=2.5em,itemsep=0.15em}
+\hypersetup{colorlinks=true,linkcolor=blue}
+\title{自主探索开题报告公式讲解\\\large 零基础阅读版}
+\author{legbot\_exploration}
+\date{\today}
+\begin{document}
+\maketitle
+
+\section*{阅读前先认识地图}
+本说明按照当前开题报告第~2.2~节的公式顺序，解释地图更新、前沿选点、全图完成验收、矩形覆盖统计和目标到达反馈。算法把三维空间划分为边长 $0.25\,\mathrm m$ 的小方块，称为\textbf{体素}；从上方看同层空间时，再使用二维\textbf{网格}。格子的状态包括已观察空闲、已观察障碍和未被观察的未知。这里的“未知”表示缺少观测证据，不能仅凭一个分数等于零来判断。
+
+\section{公式一：点云证据如何累积}
+\begin{equation}\label{eq:evidence}
+E_t(v)=\operatorname{clip}\!\left(E_{t-1}(v)+\delta_t(v),-3,6\right),
+\qquad \delta_t(v)\in\{+3,-1\}.
+\end{equation}
+可以把它理解成给体素 $v$ 记分。$t$ 表示当前更新时刻；$E_{t-1}(v)$ 是更新前的累计分数，$E_t(v)$ 是更新后的分数。激光测得的点落在该体素中，表示这里可能有物体，本次加 $3$；射线从该体素穿过，表示这条射线在此处没有碰到物体，本次减 $1$。符号 $\delta_t(v)$ 表示这一次的分数变化，$\in\{+3,-1\}$ 表示它取这两个值之一。
+
+$\operatorname{clip}(x,-3,6)$ 是“截断”：若 $x$ 小于 $-3$，结果取 $-3$；若大于 $6$，结果取 $6$；其余情况保持 $x$ 不变。例如原来为 $2$ 分，本次命中后为 $2+3=5$ 分；之后连续四次穿过，分数依次成为 $4,3,2,1$。采用累计值，是为了让地图结合多次观测，而不由单次测量直接决定结果。\textbf{从未进入地图的体素仍是未知；“分数暂时为零”不等同于未知。}
+
+\section{公式二：什么是前沿}
+\begin{equation}\label{eq:frontier}
+F_t=\{u\in U_t:\exists n\in\mathcal N_4(u),\
+M_t(n)=\mathrm{free},\ u\notin O_t^{+}\}.
+\end{equation}
+这个公式是在筛选“值得继续观察的未知格”。$U_t$ 是当前所有未知格的集合；$u$ 是其中一个未知格；$F_t$ 是筛选出来的前沿格集合。$\mathcal N_4(u)$ 表示 $u$ 的上、下、左、右四个邻格，$n$ 表示其中一个邻格。$M_t(n)=\mathrm{free}$ 表示该邻格已经被观察为空闲。$\exists$ 读作“存在至少一个”，因此只需要四邻格中有一个已知空闲格即可。
+
+$O_t^{+}$ 是已知障碍经过膨胀后的区域：算法在障碍周围留出机器人身体所需的余量。$u\notin O_t^{+}$ 表示候选未知格不能落在这个区域中。花括号后的冒号可以读作“满足以下条件”。所以整句话是：\textbf{未知格 $u$ 若挨着至少一个已知空闲格，且不在膨胀障碍中，就把它加入前沿集合 $F_t$。}
+
+可以把已观察区域想成手电筒照亮的地面：亮区边缘紧挨着暗区的未知格就是前沿。相邻的前沿格还会聚成“前沿簇”，供后续选点。
+
+\section{公式三：为什么选择某个前沿簇}
+\begin{equation}\label{eq:score}
+\begin{aligned}
+J_0(C)&=w_g\ln(1+|C|)-w_dD(f_C),\\
+D(g)&=\min_{\pi:s\leadsto g}
+\sum_{e\in\pi}\ell(e)
+\bigl[1+(\lambda_u-1)\mathbb I_U(e)\bigr].
+\end{aligned}
+\end{equation}
+第一行给前沿簇 $C$ 打分，$J_0(C)$ 越大，优先级越高。$|C|$ 是簇内前沿格数量；$f_C$ 是从这个簇选出的候选前沿格；$D(f_C)$ 是从机器人当前位置走到它的路径代价。$w_g$ 和 $w_d$ 是权重，分别控制簇规模收益和路径代价在评分中的影响。$\ln(1+|C|)$ 是自然对数：簇越大，收益越高，但增长会逐渐放慢；加 $1$ 使表达式在簇很小时也便于计算。公式前面是“收益”，后面减去“代价”，所以大簇、低代价的候选更容易得高分。
+
+第二行规定如何计算任意目标格 $g$ 的路径代价 $D(g)$。$s$ 是机器人当前格；$\pi:s\leadsto g$ 是一条从 $s$ 到 $g$ 的路径；$e$ 是路径的一小段；$\ell(e)$ 是这一段的长度。$\sum_{e\in\pi}$ 表示把路径中各段的代价加起来，$\min$ 表示在可选路径中取总代价最小者。
+
+$\mathbb I_U(e)$ 是一个只取 $0$ 或 $1$ 的标记：该段进入未知格时为 $1$，否则为 $0$。报告取 $\lambda_u=1.5$。当 $\mathbb I_U(e)=0$ 时，方括号为 $1$，这段代价就是 $\ell(e)$；当 $\mathbb I_U(e)=1$ 时，方括号为 $1.5$，这段代价为 $1.5\ell(e)$。例如一段长 $2\,\mathrm m$，若进入未知格就记为 $3$ 的代价。这样未知格仍可参与路径搜索，但经过未知格会“加价”。
+
+前沿格过远时，实际发送给导航模块的目标可以是路径上的已知空闲中途点 $g_C$；报告中评分仍使用原前沿格的 $D(f_C)$。抵达中途点以后，机器人再用新地图重新选点。
+
+\section{公式四：完整累计地图怎样验收原始前沿}
+\begin{equation}\label{eq:raw_global_frontier}
+F_t^{\mathrm{raw}}=\{u\notin M_t\cup B_t^{\mathrm{map}}:
+\exists q\in R_t^{\mathrm{free}},\ u\in\mathcal N_4(q)\}.
+\end{equation}
+这一式与公式~\eqref{eq:frontier} 的普通目标筛选用途不同。$M_t$ 是截至时刻 $t$ 的\textbf{完整累计二维投影}中已有观测证据的格子集合，不受预设探索矩形裁剪；$B_t^{\mathrm{map}}$ 是将累计地图中的已知障碍按机器人半径膨胀后的格子集合。这里不加入 SCAN 的瞬时障碍。
+
+先在机器人附近找一个\textbf{已知空闲且未被膨胀障碍覆盖}的格子作为起点，只沿上下左右四邻接的已知空闲格扩展，得到 $R_t^{\mathrm{free}}$。若找不到这个起点，验收结果无效，程序报告 \texttt{waiting\_for\_reachability\_seed}，不会宣布完成。$R_t^{\mathrm{free}}$ 不包含未知格，因为它代表\textbf{已证实为空闲的连通区域}。
+
+接着检查 $R_t^{\mathrm{free}}$ 中每个格子的四个邻格。若邻格 $u$ 没有任何观测证据，即 $u\notin M_t$，也不属于膨胀障碍 $B_t^{\mathrm{map}}$，它就是一个全图原始前沿，记入 $F_t^{\mathrm{raw}}$。$\exists q\in R_t^{\mathrm{free}}$ 表示只需找到一个与 $u$ 相邻的连通空闲格。算法只检查有限个已知空闲格及其邻格，不必预先列出无限大的未知世界。
+
+\textbf{“原始”}表示完成验收不采用选点时的最小簇规模、路径距离、目标冷却或 SCAN 瞬时障碍过滤。如果 $|F_t^{\mathrm{raw}}|>0$，即使此刻没有目标可发，也只能报告前沿尚未解决，不能报告完成。只有起点有效、$|F_t^{\mathrm{raw}}|=0$ 持续达到 \texttt{no\_frontier\_hold}，并且点云和位姿新鲜、地图未满、没有活动目标以及按配置要求的规划器障碍图新鲜时，节点才报告 \texttt{exploration\_complete}。新前沿出现后会重新验收。
+
+在 \texttt{/exploration/status} 中，可以分别查看：
+\begin{itemize}
+\item \texttt{global\_frontier\_valid}：起点是否有效；
+\item \texttt{global\_reachable\_free\_cells}：$|R_t^{\mathrm{free}}|$；
+\item \texttt{global\_frontier\_cells}：$|F_t^{\mathrm{raw}}|$。
+\end{itemize}
+它们描述的是机器人当前已知空闲连通区域及其未知外缘，并不声称每一个未观测格都已变成已知格。
+
+\section{公式五：矩形内还剩多少潜在可达未知格}
+\begin{equation}\label{eq:coverage}
+U_t^{\mathrm{reach}}=U_t\cap R_t,\qquad
+U_t^{\mathrm{excluded}}=U_t\setminus R_t,\qquad
+\rho_t^{\mathrm{reach}}
+=1-\frac{|U_t^{\mathrm{reach}}|}{|R_t|}.
+\end{equation}
+$U_t$ 是\textbf{配置矩形内}的全部未知格；$R_t$ 是从机器人附近出发，在矩形内避开已知膨胀障碍后得到的\textbf{潜在连通区域}。这里允许搜索经过未知格，因此 $R_t$ 与只走已知空闲格的 $R_t^{\mathrm{free}}$ 不是同一个集合。符号 $\cap$ 表示“同时属于”：$U_t^{\mathrm{reach}}$ 是既未知、又在 $R_t$ 内的格子。符号 $\setminus$ 表示“从左边集合去掉右边集合”：$U_t^{\mathrm{excluded}}$ 是不在 $R_t$ 内的未知格。竖线 $|A|$ 表示集合 $A$ 中的格子数量。
+
+$\rho_t^{\mathrm{reach}}$ 表示该连通区域的已观察比例，计算时要求 $|R_t|>0$。例如 $R_t$ 有 $100$ 格，其中 $5$ 格未知，则
+\[
+\rho_t^{\mathrm{reach}}=1-\frac{5}{100}=0.95=95\%.
+\]
+这里“可达”仅表示\textbf{当前地图下的潜在连通}：搜索不穿过已知障碍，但把未知格当作潜在通路；它不等于已证实的空闲地面。$\rho_t^{\mathrm{reach}}$ 是矩形内的进度统计，\textbf{不单独决定完成}。例如状态中 $|R_t^{\mathrm{free}}|=13315$、$|F_t^{\mathrm{raw}}|=0$，而矩形内仍有 $115$ 个未知格，且 $|U_t^{\mathrm{reach}}|=0$、$|U_t^{\mathrm{excluded}}|=115$：这表示机器人当前连通空闲区域外缘没有原始前沿，同时矩形中还有不属于潜在连通区域的未知格。未知格被排除可能与障碍膨胀或地图连通关系有关，不能仅凭计数断定每格的物理成因。程序的完成判定仍以公式~\eqref{eq:raw_global_frontier} 和上述运行条件为准。
+
+\section{公式六：怎样确认一个目标已经到达}
+\begin{equation}\label{eq:arrival}
+\mathrm{Arrive}(g)=
+\mathrm{StampMatch}(g)\land
+\mathrm{StopAck}(g)\land
+\mathrm{MissionComplete}(g).
+\end{equation}
+$\land$ 读作“并且”，表示三个条件\textbf{同时成立}。$\mathrm{StampMatch}(g)$ 确认反馈对应当前转发的目标 $g$，而不是旧目标；$\mathrm{StopAck}(g)$ 表示收到 SCAN 的停止应答；$\mathrm{MissionComplete}(g)$ 表示任务完成信号成立。只有三者同时为真，$\mathrm{Arrive}(g)$ 才按严格的正常到达路径判定为真。
+
+机器人若已到目标附近并持续停留，系统也可能清除旧路点，并将这次结果单独记录为近目标停车状态。该状态名为 \texttt{proximity\_fallback}，与上式中的严格到达分开记录。
+
+\section*{把六个公式连起来}
+公式~\eqref{eq:evidence} 记录“哪里被看过”，公式~\eqref{eq:frontier} 提取普通候选前沿，公式~\eqref{eq:score} 比较目标，公式~\eqref{eq:raw_global_frontier} 独立检查完整累计地图中机器人连通空闲区域的原始前沿，公式~\eqref{eq:coverage} 显示配置矩形内的覆盖进度，公式~\eqref{eq:arrival} 判断当前目标是否到达。\textbf{完成验收看公式~\eqref{eq:raw_global_frontier}，矩形覆盖公式~\eqref{eq:coverage} 只提供辅助统计。}
+\end{document}

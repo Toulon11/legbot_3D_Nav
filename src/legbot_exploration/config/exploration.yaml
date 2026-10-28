@@ -23,7 +23,7 @@
     free_min_relative_z: -0.45            # 二维投影纳入的最低高度，单位米。
     robot_radius: 0.35                    # 机器人避障膨胀半径，单位米。
     local_search_radius: 10.0             # 局部搜索时的半径，单位米。
-    global_search: false                  # true 时在下方矩形边界内做全图搜索。
+    global_search: false                  # true 时先在矩形内选点，再查完整累计地图的前沿。
     bounds_relative_to_start: false       # true 时把边界坐标加到起始机体位置上。
     exploration_min_x: -31.5              # 全图搜索区域的最小 X，单位米。
     exploration_max_x: -0.5               # 全图搜索区域的最大 X，单位米。

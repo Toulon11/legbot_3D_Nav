@@ -25,6 +25,9 @@ which is included as part of this source code package.
  */
 #include "vio.h"
 
+#include <memory>
+#include <utility>
+
 using namespace Eigen;
 VIOManager::VIOManager()
 {
@@ -712,13 +715,13 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
           for (auto it = pt->obs_.begin(), ite = pt->obs_.end(); it != ite; ++it)
           {
             Feature *ref_patch_temp = *it;
-            float *patch_temp = ref_patch_temp->patch_;
+            const std::unique_ptr<float[]> &patch_temp = ref_patch_temp->patch_;
             float phtometric_errors = 0.0;
             int count = 0;
             for (auto itm = pt->obs_.begin(), itme = pt->obs_.end(); itm != itme; ++itm)
             {
               if ((*itm)->id_ == ref_patch_temp->id_) continue;
-              float *patch_cache = (*itm)->patch_;
+              const std::unique_ptr<float[]> &patch_cache = (*itm)->patch_;
 
               for (int ind = 0; ind < patch_size_total; ind++)
               {
@@ -931,13 +934,13 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
       // if(std::fabs(cos_theta)<0.34) continue; // 70 degree
       V2D pc(new_frame_->w2c(pt));
 
-      float *patch = new float[patch_size_total];
-      getImagePatch(img, pc, patch, 0);
+      auto patch = std::make_unique<float[]>(patch_size_total);
+      getImagePatch(img, pc, patch.get(), 0);
 
       VisualPoint *pt_new = new VisualPoint(pt);
 
       Vector3d f = cam->cam2world(pc);
-      Feature *ftr_new = new Feature(pt_new, patch, pc, f, new_frame_->T_f_w_, 0);
+      Feature *ftr_new = new Feature(pt_new, std::move(patch), pc, f, new_frame_->T_f_w_, 0);
       ftr_new->img_ = img;
       ftr_new->id_ = new_frame_->id_;
       ftr_new->inv_expo_time_ = state->inv_expo_time;
@@ -989,8 +992,6 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
     V2D pc(new_frame_->w2c(pt->pos_));
     bool add_flag = false;
     
-    float *patch_temp = new float[patch_size_total];
-    getImagePatch(img, pc, patch_temp, 0);
     // TODO: condition: distance and view_angle
     // Step 1: time
     Feature *last_feature = pt->obs_.back();
@@ -1021,7 +1022,9 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
       update_num += 1;
       update_flag[i] = 1;
       Vector3d f = cam->cam2world(pc);
-      Feature *ftr_new = new Feature(pt, patch_temp, pc, f, new_frame_->T_f_w_, visual_submap->search_levels[i]);
+      auto patch_temp = std::make_unique<float[]>(patch_size_total);
+      getImagePatch(img, pc, patch_temp.get(), 0);
+      Feature *ftr_new = new Feature(pt, std::move(patch_temp), pc, f, new_frame_->T_f_w_, visual_submap->search_levels[i]);
       ftr_new->img_ = img;
       ftr_new->id_ = new_frame_->id_;
       ftr_new->inv_expo_time_ = state->inv_expo_time;
@@ -1107,7 +1110,7 @@ void VIOManager::updateReferencePatch(const unordered_map<VOXEL_LOCATION, VoxelO
     for (auto it = pt->obs_.begin(), ite = pt->obs_.end(); it != ite; ++it)
     {
       Feature *ref_patch_temp = *it;
-      float *patch_temp = ref_patch_temp->patch_;
+      const std::unique_ptr<float[]> &patch_temp = ref_patch_temp->patch_;
       float NCC_up = 0.0;
       float NCC_down1 = 0.0;
       float NCC_down2 = 0.0;
@@ -1124,7 +1127,7 @@ void VIOManager::updateReferencePatch(const unordered_map<VOXEL_LOCATION, VoxelO
       float ref_mean;
       if (abs(ref_patch_temp->mean_) < 1e-6)
       {
-        float ref_sum = std::accumulate(patch_temp, patch_temp + patch_size_total, 0.0);
+        float ref_sum = std::accumulate(patch_temp.get(), patch_temp.get() + patch_size_total, 0.0);
         ref_mean = ref_sum / patch_size_total;
         ref_patch_temp->mean_ = ref_mean;
       }
@@ -1132,12 +1135,12 @@ void VIOManager::updateReferencePatch(const unordered_map<VOXEL_LOCATION, VoxelO
       for (auto itm = pt->obs_.begin(), itme = pt->obs_.end(); itm != itme; ++itm)
       {
         if ((*itm)->id_ == ref_patch_temp->id_) continue;
-        float *patch_cache = (*itm)->patch_;
+        const std::unique_ptr<float[]> &patch_cache = (*itm)->patch_;
 
         float other_mean;
         if (abs((*itm)->mean_) < 1e-6)
         {
-          float other_sum = std::accumulate(patch_cache, patch_cache + patch_size_total, 0.0);
+          float other_sum = std::accumulate(patch_cache.get(), patch_cache.get() + patch_size_total, 0.0);
           other_mean = other_sum / patch_size_total;
           (*itm)->mean_ = other_mean;
         }

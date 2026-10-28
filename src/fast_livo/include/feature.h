@@ -23,6 +23,9 @@ which is included as part of this source code package.
 #ifndef LIVO_FEATURE_H_
 #define LIVO_FEATURE_H_
 
+#include <memory>
+#include <utility>
+
 #include "visual_point.h"
 
 // A salient image region that is tracked across frames.
@@ -53,8 +56,8 @@ struct Feature
   Vector2d grad_;        //!< Dominant gradient direction for edglets, normalized.
   // 采集时的相机位姿
   SE3<double> T_f_w_;            //!< Pose of the frame where the patch feature was extracted.
-  // 图像patch数据指针 (patch_size x patch_size)
-  float *patch_;         //!< Pointer to the image patch data.
+  // 独占图像patch数据 (patch_size x patch_size)，Feature销毁时自动释放
+  std::unique_ptr<float[]> patch_; //!< Owned image patch data.
   // NCC评分 (跟踪质量指标)
   float score_;          //!< Score of the patch feature.
   // patch平均亮度 (用于归一化)
@@ -63,18 +66,16 @@ struct Feature
   double inv_expo_time_; //!< Inverse exposure time of the image where the patch feature was extracted.
   
   // 构造函数：关联3D点、patch、像素坐标、射线方向和位姿
-  Feature(VisualPoint *_point, float *_patch, const Vector2d &_px, const Vector3d &_f, const SE3<double> &_T_f_w, int _level)
-      : type_(CORNER), px_(_px), f_(_f), T_f_w_(_T_f_w), mean_(0), score_(0), level_(_level), patch_(_patch), point_(_point)
+  Feature(VisualPoint *_point, std::unique_ptr<float[]> _patch, const Vector2d &_px, const Vector3d &_f,
+          const SE3<double> &_T_f_w, int _level)
+      : type_(CORNER), px_(_px), f_(_f), level_(_level), point_(_point), T_f_w_(_T_f_w),
+        patch_(std::move(_patch)), score_(0), mean_(0)
   {
   }
 
   inline Vector3d pos() const { return T_f_w_.inverse().translation(); }  // 获取采集时的相机位置
-  
-  ~Feature()
-  {
-    // ROS_WARN("The feature %d has been destructed.", id_);
-    delete[] patch_;  // 释放patch内存
-  }
+
+  ~Feature() = default;  // patch_由unique_ptr自动释放
 };
 
 #endif // LIVO_FEATURE_H_

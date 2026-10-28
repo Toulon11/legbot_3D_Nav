@@ -104,6 +104,8 @@ def main():
         assert child.poll() is None, 'explorer exited during test'
         assert max(traveled, default=0.0) >= 2.0, 'historical path was not built'
         assert residual, 'no residual-frontier state; latest status: %r' % status[-3:]
+        assert not any(s.get('state') == 'exploration_complete' for s in status), (
+            'filtered frontiers must not be treated as completed exploration')
         assert not any(s.get('detail') == 'recovery_backtrack' for s in status), status[-3:]
         if expect_residual_goal:
             assert targets, 'single-cell residual fallback did not select a goal'

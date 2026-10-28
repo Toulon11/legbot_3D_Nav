@@ -12,6 +12,23 @@
 int main() {
   // 使用本包命名空间，以便直接写 Settings、VoxelMap 等类名。
   using namespace legbot_exploration;
+  Settings audit_cfg;
+  audit_cfg.global_search = true;
+  audit_cfg.resolution = 1.0;
+  audit_cfg.robot_radius = 0.0;
+  audit_cfg.exploration_min_x = 0.0;
+  audit_cfg.exploration_max_x = 1.0;
+  audit_cfg.exploration_min_y = 0.0;
+  audit_cfg.exploration_max_y = 1.0;
+  auto open_audit = assess_global_frontiers({{{0, 0}, 0}, {{1, 0}, 0}},
+                                            audit_cfg, {0.5, 0.5});
+  assert(open_audit.valid && open_audit.cells.count({2, 0}) > 0);
+  auto closed_audit = assess_global_frontiers(
+      {{{0, 0}, 0}, {{1, 0}, 1}, {{-1, 0}, 1},
+       {{0, 1}, 1}, {{0, -1}, 1}, {{10, 10}, 0}}, audit_cfg, {0.5, 0.5});
+  assert(closed_audit.valid && closed_audit.frontier_cells == 0 &&
+         closed_audit.reachable_free_cells == 1);
+  assert(!assess_global_frontiers({{{0, 0}, 0}}, audit_cfg, {5.5, 5.5}).valid);
   // 场景一：空地图还没有空闲和未知边界，不会选出前沿簇。
   Settings cfg;
   VoxelMap map(cfg);
@@ -74,6 +91,20 @@ int main() {
   assert(global_selection.goal);
   assert(std::hypot((*global_selection.goal)[0], (*global_selection.goal)[1]) <=
          global_cfg.max_goal_distance);
+  Settings narrow_cfg = global_cfg;
+  narrow_cfg.exploration_min_x = 0.0;
+  narrow_cfg.exploration_max_x = 0.25;
+  narrow_cfg.exploration_min_y = 0.0;
+  narrow_cfg.exploration_max_y = 0.25;
+  VoxelMap narrow_map(narrow_cfg);
+  narrow_map.integrate({0.0, 0.0, 0.4}, ring, robot[2]);
+  assert(select_frontier(narrow_map, robot, narrow_cfg, {}).frontier_cells == 0);
+  auto narrow_audit = assess_global_frontiers(narrow_map.project_all(), narrow_cfg,
+                                               {robot[0], robot[1]});
+  assert(narrow_audit.valid && narrow_audit.frontier_cells > 0);
+  auto outside_selection = select_frontier(narrow_map, robot, narrow_cfg, {}, {}, true,
+                                          &narrow_audit.cells);
+  assert(outside_selection.goal);
   // 场景五：额外规划器障碍盖住原目标时，不应继续选择该目标。
   // 将右侧计算值存入 blocked（避障膨胀后的禁行格）。
   auto blocked = select_frontier(map, robot, cfg, {}, {*selection.goal});

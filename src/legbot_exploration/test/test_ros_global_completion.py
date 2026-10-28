@@ -1,4 +1,4 @@
-"""ROS 集成回归：可达未知格阻止完成，已覆盖的区域可以完成。"""
+"""ROS 集成回归：矩形外前沿阻止完成，封闭区域可以完成。"""
 
 import json
 import os
@@ -18,13 +18,14 @@ from std_msgs.msg import Header, String
 def main():
     executable = sys.argv[1]
     complete_case = len(sys.argv) > 2 and sys.argv[2] == 'complete'
+    outside_case = len(sys.argv) > 2 and sys.argv[2] == 'outside'
     config = os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
                                           'config', 'exploration.yaml'))
     overrides = ([
         '-p', 'exploration_min_x:=0.0', '-p', 'exploration_max_x:=0.25',
         '-p', 'exploration_min_y:=0.0', '-p', 'exploration_max_y:=0.25',
         '-p', 'robot_radius:=0.0',
-    ] if complete_case else [
+    ] if complete_case or outside_case else [
         '-p', 'exploration_min_x:=-1.0', '-p', 'exploration_max_x:=3.0',
         '-p', 'exploration_min_y:=-1.0', '-p', 'exploration_max_y:=3.0',
         '-p', 'robot_radius:=0.0',
@@ -50,7 +51,8 @@ def main():
     base_pub = node.create_publisher(Odometry, '/slam/global_odometry_base', state_qos)
     cloud_pub = node.create_publisher(PointCloud2,
                                       '/slam/global_cloud_registered', state_qos)
-    deadline = time.monotonic() + 8.0
+    start = time.monotonic()
+    deadline = start + 8.0
     passed = False
     try:
         while time.monotonic() < deadline:
@@ -67,23 +69,30 @@ def main():
             base.header.stamp = stamp
             base.pose.pose.position.z = .3
             base.pose.pose.orientation.w = 1.
+            points = ([(0.25, 0., .4), (-0.25, 0., .4),
+                       (0., 0.25, .4), (0., -0.25, .4)] if complete_case else
+                      [(2., 0., -.2), (0., 2., -.2), (1., 1., .4)])
             cloud = point_cloud2.create_cloud_xyz32(
-                Header(stamp=stamp, frame_id='map'),
-                [(2., 0., -.2), (0., 2., -.2), (1., 1., .4)])
+                Header(stamp=stamp, frame_id='map'), points)
             sensor_pub.publish(sensor)
             base_pub.publish(base)
             cloud_pub.publish(cloud)
             rclpy.spin_once(node, timeout_sec=.1)
             if statuses and ((complete_case and statuses[-1].get('state') ==
                               'exploration_complete') or
+                             (outside_case and time.monotonic() - start > 2.5 and
+                              statuses[-1].get('global_frontier_cells', 0) > 0) or
                              (not complete_case and statuses[-1].get('reachability_valid') and
+                              not outside_case and
                               statuses[-1].get('reachable_unknown_cells', 0) > 0)):
                 if not grids:
                     raise AssertionError('coverage grid missing')
                 if complete_case and statuses[-1]['unknown_cells'] != 0:
                     raise AssertionError('completed with unknown cells')
-                if not complete_case and statuses[-1]['unknown_cells'] <= 0:
+                if not complete_case and not outside_case and statuses[-1]['unknown_cells'] <= 0:
                     raise AssertionError('unknown count missing')
+                if outside_case and statuses[-1]['unknown_cells'] != 0:
+                    raise AssertionError('outside case should already cover configured rectangle')
                 if not complete_case and statuses[-1]['state'] == 'exploration_complete':
                     raise AssertionError('completed with reachable unknown cells')
                 if (statuses[-1]['reachable_unknown_cells'] +

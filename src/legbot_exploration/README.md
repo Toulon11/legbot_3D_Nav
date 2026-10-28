@@ -79,6 +79,10 @@ $$
 其中 $m=$ `min_frontier_cells`。簇中心仅用于**给簇内真实前沿格排序**，
 不会把几何中心直接下发为目标。距离过近的候选会被跳过；近期失败、
 刚到达但没有带来足够新观测的目标也会被暂时抑制。
+全图模式先在配置矩形内选点；若没有可用目标，则从完整累计地图中寻找矩形外的
+候选前沿。矩形外候选必须属于机器人所在的已知空闲连通区域的原始前沿。
+完整地图的选点搜索只扩展到已观察网格的外缘一格；动态包围盒超过二百万格时
+不执行该轮路径搜索，并保留“前沿未解决”状态，不宣布完成。
 
 ### 3. 路径代价、评分与远距离分段
 
@@ -111,7 +115,8 @@ $$
 
 ### 4. 无普通前沿与目标失败时的策略
 
-若全图仍有可达未知格，却暂时没有普通前沿，节点沿已知空闲格寻找补充观测点。
+若完整地图仍有原始前沿，但受瞬时 SCAN 障碍等影响暂时没有可选前沿，
+且矩形覆盖统计仍有可达未知格，节点沿已知空闲格寻找补充观测点。
 它约每 $1\,\mathrm m$ 采样一个候选 $g$，在 `max_ray_range` 内统计从 $g$ 朝未知格
 发射的、不被已知障碍截断的射线数 $V(g)$，最多计 $16$ 条，并使用启发式评分：
 
@@ -130,13 +135,33 @@ SCAN 障碍图、长时间无有效前进或超过目标总时限时，先请求
 失败目标按 `failed_frontier_cooldown` 暂时屏蔽。已接近目标且持续停留时，
 使用 `near_goal_dwell` 的近距离到达兜底。手动目标会暂停自动探索。
 
-### 5. 可达区域覆盖与完成判定
+### 5. 全局原始前沿与完成判定
 
-全图模式先在配置矩形内统计原始未知格 $U$。完成验收另取**累计地图中的已知障碍**
-膨胀集 $B_{\mathrm{map}}$，从机体附近的已知空闲格出发，在非障碍格上搜索连通区域
-$R$；未知格在这一步仍视为潜在通路。暂时出现的 SCAN 障碍不参与验收，
-以免一处瞬时障碍错误缩小完成范围。验收时仅在斜边两侧的正交格**都**被障碍
-挡住时禁止斜向连通；这种判断比实际选点的路径检查更保守，优先避免漏算未知区域。
+配置矩形内的覆盖率网格继续用于显示和独立仿真验收，不再单独决定探索完成。
+完成检查使用未按矩形裁剪的完整累计地图。只将累计点云中的已知障碍按
+`robot_radius` 膨胀为 $B_{\mathrm{map}}$；瞬时 SCAN 障碍不参与完成检查。
+从机器人附近的已知空闲格出发，仅沿四邻接、已知空闲且不在 $B_{\mathrm{map}}$
+内的格子搜索，得到当前连通区域 $R_{\mathrm{free}}$。其外缘的未知格就是
+**全局原始前沿**：
+
+$$
+F_{\mathrm{raw}}=\{u\notin M\cup B_{\mathrm{map}}\mid
+\exists q\in R_{\mathrm{free}},\ u\in\mathcal N_4(q)\}.
+$$
+
+这里 $M$ 表示累计二维投影中已经有观测证据的格子集合。只需检查有限的
+已知空闲格及其四个邻格，不需要预先枚举无限大的未知区域。原始前沿不受
+最小簇规模、路径距离、目标冷却及瞬时 SCAN 障碍筛选影响。
+
+`global_frontier_valid` 表示机器人附近找到了已知空闲起点；
+`global_reachable_free_cells` 是 $|R_{\mathrm{free}}|$；
+`global_frontier_cells` 是 $|F_{\mathrm{raw}}|$。
+只有起点有效、原始前沿数持续为零、点云与位姿新鲜、地图未满、没有活动目标，
+且配置要求的 SCAN 障碍图新鲜，持续 `no_frontier_hold` 秒后，才报告
+`exploration_complete`。出现新前沿时立即取消完成计时。
+
+作为辅助诊断，原有矩形统计仍计算 $U$、累计障碍膨胀后的潜在连通区域 $R$
+及其未知格数量；此处未知格仍可作为潜在通路：
 
 $$
 U_{\mathrm{reach}}=U\cap R,\qquad
@@ -146,11 +171,13 @@ $$
 
 `reachable_unknown_cells`、`excluded_unknown_cells`、`reachable_coverage_ratio`
 分别对应 $|U_{\mathrm{reach}}|$、$|U_{\mathrm{excluded}}|$、$\rho_{\mathrm{reach}}$。
-例如原始未知格还有 $114$ 个，但它们全在障碍内部或被已知障碍隔开时，
-可达未知格为 $0$，这些格子不再阻止同层探索完成。只有全图边界有效、
-起点可确定、点云和位姿新鲜、地图未满、没有活动目标、配置所需的 SCAN 障碍图新鲜，
-且 $|U_{\mathrm{reach}}|=0$ 连续保持 `no_frontier_hold` 秒，才报告
-`exploration_complete`。只要可达未知格再次出现，完成状态就在下一轮复核时撤销。
+这些矩形统计量用于观察覆盖进度，不能代替 $F_{\mathrm{raw}}$ 的完成检查。
+例如，`global_frontier_valid=true`、`global_reachable_free_cells=13315`、
+`global_frontier_cells=0`，同时矩形内 `unknown_cells=115`、
+`excluded_unknown_cells=115`，表示机器人当前连通的已知空闲区域外缘没有
+原始前沿；矩形内仍有 115 个未观察格，但它们不在矩形统计所用的潜在连通区域内。
+这两个连通搜索不同：完成检查的 $R_{\mathrm{free}}$ 只经过已知空闲格，
+矩形覆盖统计的 $R$ 允许未知格作为潜在通路。计数会随新点云和位姿继续复核。
 Gazebo 场景几何只供 `verify_flat_coverage.py` 独立验收，不参与在线地图和选点。
 
 ## 运行
@@ -225,25 +252,31 @@ ros2 launch legbot_exploration exploration.launch.py observation_only:=false
 楼层子图及楼层切换逻辑，不能直接把此模式用于跨层完成判定。若 SCAN 占据话题
 不可用，节点仍可依靠自身地图选点，但会失去与 SCAN 障碍的一致性检查。
 
-`exploration_complete` 仅在启用全图搜索、从机器人当前位置可连通的二维格均已有证据、
-没有活动目标且点云/位姿及所需 SCAN 障碍图新鲜、地图未达容量上限，并持续复核
-`no_frontier_hold` 秒后发布。连通计算使用累计点云形成的障碍并按机体半径膨胀；
-未知格视为潜在通路，因此仅被已知障碍隔离或处于障碍膨胀范围内的未知格不阻止完成。
+`exploration_complete` 仅在全图模式下，完整累计地图的机器人连通空闲区域
+连续 `no_frontier_hold` 秒没有原始前沿，并满足数据新鲜、地图容量和活动目标检查时发布。
+矩形覆盖率为 $100\%$ 但矩形外仍有原始前沿时，继续向矩形外选点。
 若起点附近找不到已观察的空闲格，则报告 `waiting_for_reachability_seed`，不宣布完成。
-可达未知格刚清零时先报告 `waiting_for_coverage_confirmation`，持续满足复核时间后才报告完成。
-全图逐格原始结果发布在 `/exploration/coverage_grid`
+原始前沿刚清零时先报告 `waiting_for_coverage_confirmation`，持续满足复核时间后才报告完成。
+配置矩形内的逐格覆盖结果发布在 `/exploration/coverage_grid`
 （`nav_msgs/OccupancyGrid`：`-1` 未知、`0` 已知空闲、`100` 已知障碍）。
+它不是完整累计地图的逐格话题；完整累计地图的连通域验收结果应查看
+`/exploration/status` 中的 `global_frontier_valid`、
+`global_reachable_free_cells` 和 `global_frontier_cells`。
 状态同时给出 `total_cells`、`known_free_cells`、`known_occupied_cells`、
 `unknown_cells`、`coverage_ratio` 和 `coverage_valid`；另有 `reachability_valid`、
 `reachable_cells`、`reachable_unknown_cells`、`excluded_unknown_cells` 和
 `reachable_coverage_ratio`。原始未知格满足
 `unknown_cells = reachable_unknown_cells + excluded_unknown_cells`。
-可达范围出现新的未知格或数据过期时，完成状态会在下一轮复核中撤销。
+完整累计地图出现新原始前沿或数据过期时，完成状态会在下一轮复核中撤销。
 `current_region_complete` 只用于局部搜索模式，说明当前高度和搜索半径内持续没有 Frontier。
 `frontiers_below_cluster_threshold` 表示仍有零散前沿，但尚未达到簇规模门槛；
 单层全图模式持续这种状态 8 秒后，会按单格前沿再次尝试选点，目标仍须通过路径、距离和障碍筛选。
 `frontiers_unreachable_or_suppressed` 表示仍有前沿簇，但暂时无法选用。
-状态中的 `frontier_cells` 和 `frontier_clusters` 分别给出原始前沿格数和通过规模门槛的簇数。
+`global_frontiers_unresolved` 表示全局原始前沿仍存在，但本轮选点经过
+SCAN 障碍等筛选后没有可选前沿格；此状态不会宣布完成。
+状态中的 `frontier_cells` 和 `frontier_clusters` 分别给出本轮普通选点搜索中的
+候选前沿格数和通过规模门槛的簇数；它们与完成验收用的
+`global_frontier_cells` 不是同一个计数。
 `reachable_frontier_cells`、`candidate_goals`、`suppressed_goals`、`open_start_neighbors`
 用于区分地图断连、目标冷却与起点周围被障碍膨胀包围。只有存在合格前沿簇、
 却没有可达前沿格和候选目标时，全图模式才会从本次实际行驶轨迹里选择约 2–4 m
@@ -255,13 +288,15 @@ ros2 launch legbot_exploration exploration.launch.py observation_only:=false
 发送时状态的 `detail=supplemental_observation`。若当前找不到可用观测位置，状态为
 `unknown_regions_unobservable_or_unreachable`，`unresolved_unknown_cells` 给出本轮
 没有可用目标时尚未覆盖的可达未知格数；它不等于永久不可达格数，也不会触发误报完成。
-障碍物内部或已知障碍完全封闭区域的未知格单独计入 `excluded_unknown_cells`。
+`excluded_unknown_cells` 是配置矩形内、不属于当前潜在连通区域的未知格数量；
+其中可能包含障碍膨胀覆盖或已知障碍隔开的格子，不能仅凭这一计数逐格判定
+未知格的物理成因。
 `map_capacity_reached` 表示体素上限已到，需增大容量或重启探索。
 
 当前版本适用于同层、平坦场景的首次联调。未知区按未占据处理，不具备悬崖或
 无地面支撑自动停车能力。普通入口仍按 `local_search_radius` 做局部搜索；
-平层入口启用有边界的全图搜索。验收边界应与实际单层场地吻合；过大的边界会
-包含无法观测的场地外格，导致任务始终保持未完成。
+平层入口先在配置矩形内选点，必要时扩展到完整累计地图。矩形覆盖网格用于
+显示和仿真验收；它的边界不再决定探索完成。
 
 可用 Gazebo 平面场景做独立验收。仿真运行时，在另一个终端执行：
 

@@ -253,6 +253,9 @@ class Explorer : public rclcpp::Node {
      stream << ",\"paused\":" << (paused_ ? "true" : "false");
      stream << ",\"observation_only\":" << (observation_only_ ? "true" : "false");
      stream << ",\"global_search\":" << (cfg_.global_search ? "true" : "false");
+     stream << ",\"global_frontier_valid\":" << (global_frontiers_.valid ? "true" : "false");
+     stream << ",\"global_frontier_cells\":" << global_frontiers_.frontier_cells;
+     stream << ",\"global_reachable_free_cells\":" << global_frontiers_.reachable_free_cells;
      stream << ",\"frontier_cells\":" << last_frontier_cells_;
      stream << ",\"frontier_clusters\":" << last_frontier_clusters_;
      stream << ",\"reachable_frontier_cells\":" << last_reachable_frontier_cells_;
@@ -776,6 +779,9 @@ class Explorer : public rclcpp::Node {
      coverage_ = le::assess_reachable_coverage(projected, cfg_,
                                                {(*base_)[0], (*base_)[1]});
      publish_coverage_grid(projected);
+     if (cfg_.global_search)
+       global_frontiers_ = le::assess_global_frontiers(
+           map_.project_all(), cfg_, {(*base_)[0], (*base_)[1]});
 
      // ------------------- 已有活动目标的情况 -------------------
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
@@ -851,15 +857,11 @@ class Explorer : public rclcpp::Node {
        return;
      }
      // 投影到水平面，检查是否还有 free（未占据）空间
-     if (cfg_.global_search &&
-         (!coverage_.valid || (bounds_relative_to_start_ && !bounds_initialized_))) {
-       empty_since_.reset();
-       report("invalid_exploration_bounds");
-       return;
-     }
+     // 矩形覆盖率只供显示；全局完成不依赖预设矩形是否覆盖整片场地。
      unresolved_unknown_cells_ = 0;
-     bool has_free = std::any_of(projected.begin(), projected.end(),
-                                 [](const auto &item) { return item.second == 0; });
+     bool has_free = cfg_.global_search ? global_frontiers_.valid :
+         std::any_of(projected.begin(), projected.end(),
+                     [](const auto &item) { return item.second == 0; });
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
      if (!has_free) {
        empty_since_.reset();
@@ -874,12 +876,12 @@ class Explorer : public rclcpp::Node {
        // 结束当前函数，不再执行后面的语句。
        return;
      }
-     if (cfg_.global_search && !coverage_.reachability_valid) {
+     if (cfg_.global_search && !global_frontiers_.valid) {
        empty_since_.reset();
        report("waiting_for_reachability_seed");
        return;
      }
-     if (cfg_.global_search && coverage_.reachable_unknown_cells == 0) {
+     if (cfg_.global_search && global_frontiers_.frontier_cells == 0) {
        unresolved_unknown_cells_ = 0;
        last_frontier_cells_ = last_frontier_clusters_ = 0;
        last_reachable_frontier_cells_ = last_candidate_goals_ = 0;
@@ -901,16 +903,33 @@ class Explorer : public rclcpp::Node {
          external_obstacles_ : no_external_obstacles;
      // 将右侧计算值存入 selection（前沿搜索结果）。
      auto selection = le::select_frontier(map_, *base_, cfg_, failed, obstacles);
+     bool search_all_observed = false;
+     if (cfg_.global_search && !selection.goal && global_frontiers_.frontier_cells > 0) {
+       auto beyond_bounds = le::select_frontier(map_, *base_, cfg_, failed,
+                                                obstacles, true, &global_frontiers_.cells);
+       if (beyond_bounds.goal || beyond_bounds.frontier_cells > selection.frontier_cells) {
+         selection = std::move(beyond_bounds);
+         search_all_observed = true;
+       }
+     }
      bool residual_goal = false;
      // 检查未知边界是否仍存在或是否满足簇规模。
-     if (cfg_.global_search && selection.frontier_cells > 0 && selection.clusters == 0) {
+     if (cfg_.global_search &&
+         (selection.frontier_cells > 0 || global_frontiers_.frontier_cells > 0) &&
+         selection.clusters == 0) {
        // 只有表达式为真，才执行下面缩进或花括号内的代码。
        if (!residual_since_) residual_since_ = current;
        // 检查未知边界是否仍存在或是否满足簇规模。
        if (current - *residual_since_ >= no_frontier_hold_) {
          auto residual_cfg = cfg_;
          residual_cfg.min_frontier_cells = 1;
-         auto residual = le::select_frontier(map_, *base_, residual_cfg, failed, obstacles);
+         auto residual = le::select_frontier(
+             map_, *base_, residual_cfg, failed, obstacles, search_all_observed,
+             search_all_observed ? &global_frontiers_.cells : nullptr);
+         if (!residual.goal && !search_all_observed &&
+             global_frontiers_.frontier_cells > 0)
+           residual = le::select_frontier(map_, *base_, residual_cfg, failed,
+                                          obstacles, true, &global_frontiers_.cells);
          // 根据当前目标是否存在或是否完成来决定下一步。
          if (residual.goal) {
            selection.goal = residual.goal;
@@ -930,7 +949,7 @@ class Explorer : public rclcpp::Node {
      last_open_start_neighbors_ = selection.open_start_neighbors;
      bool observation_goal = false;
      if (cfg_.global_search && !selection.goal && selection.frontier_cells == 0 &&
-         coverage_.reachable_unknown_cells > 0) {
+         global_frontiers_.frontier_cells > 0 && coverage_.reachable_unknown_cells > 0) {
        selection.goal = le::select_observation_goal(map_, *base_, cfg_, projected,
                                                      failed, obstacles);
        observation_goal = selection.goal.has_value();
@@ -956,16 +975,18 @@ class Explorer : public rclcpp::Node {
        }
        if (cfg_.global_search) unresolved_unknown_cells_ = coverage_.reachable_unknown_cells;
        // 检查未知边界是否仍存在或是否满足簇规模。
-       if (selection.frontier_cells > 0) {
+       if (cfg_.global_search ? global_frontiers_.frontier_cells > 0 :
+           selection.frontier_cells > 0) {
          // 清空临时状态，准备下一轮处理。
          empty_since_.reset();
-         report(selection.clusters > 0 ? "frontiers_unreachable_or_suppressed" :
+         report(selection.frontier_cells == 0 ? "global_frontiers_unresolved" :
+                selection.clusters > 0 ? "frontiers_unreachable_or_suppressed" :
                 "frontiers_below_cluster_threshold",
                 selection.clusters > 0 &&
                         recovery_gate_.waiting_for_new_cells(projected.size()) ?
                     "recovery_waiting_for_new_observations" : "");
        } else {
-         if (cfg_.global_search && coverage_.reachable_unknown_cells > 0) {
+         if (cfg_.global_search && global_frontiers_.frontier_cells > 0) {
            empty_since_.reset();
            report("unknown_regions_unobservable_or_unreachable");
          } else {
@@ -1021,6 +1042,7 @@ class Explorer : public rclcpp::Node {
    std::size_t last_reachable_frontier_cells_ = 0, last_candidate_goals_ = 0; // 上轮可达格与候选目标数
    std::size_t last_suppressed_goals_ = 0, last_open_start_neighbors_ = 0; // 上轮被屏蔽目标与起点开放邻格数
    le::Coverage coverage_; // 全局边界内逐格验收统计
+   le::GlobalFrontiers global_frontiers_; // 完整累计地图的原始前沿验收
    std::size_t unresolved_unknown_cells_ = 0; // 当前没有可用目标时尚未覆盖的格数
    nav_msgs::msg::Path trajectory_; // 积累的机体行走轨迹，发布到 RViz
    std::deque<std::pair<int64_t, le::Point>> sensor_poses_; // 里程计姿态缓存

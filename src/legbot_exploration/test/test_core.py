@@ -5,12 +5,47 @@ import unittest
 
 # 导入 legbot_exploration.exploration_core 提供的类型或函数。
 from legbot_exploration.exploration_core import (GoalProgressGate, RecoveryGate, Settings,
-    VoxelMap, assess_coverage, assess_reachable_coverage, select_frontier,
+    VoxelMap, assess_coverage, assess_reachable_coverage, assess_global_frontiers, select_frontier,
     select_observation_goal)
 
 
 # 这些测试只调用核心算法，不需要启动 Gazebo 或 ROS 节点。
 class CoreTest(unittest.TestCase):
+    def test_global_frontier_audit_ignores_rectangle_and_disconnected_island(self):
+        cfg = Settings(global_search=True, resolution=1., robot_radius=0.,
+                       exploration_min_x=0., exploration_max_x=1.,
+                       exploration_min_y=0., exploration_max_y=1.)
+        grid = {(0, 0): 0, (1, 0): 0}
+        audit = assess_global_frontiers(grid, cfg, (.5, .5))
+        self.assertTrue(audit['valid'])
+        self.assertIn((2, 0), audit['cells'])  # 预设矩形外仍有待探索出口。
+        self.assertGreater(audit['frontier_cells'], 0)
+        sealed = {(0, 0): 0, (1, 0): 1, (-1, 0): 1,
+                  (0, 1): 1, (0, -1): 1, (10, 10): 0}
+        audit = assess_global_frontiers(sealed, cfg, (.5, .5))
+        self.assertTrue(audit['valid'])
+        self.assertEqual(audit['frontier_cells'], 0)
+        self.assertEqual(audit['reachable_free_cells'], 1)
+        self.assertFalse(assess_global_frontiers(sealed, cfg, (5.5, 5.5))['valid'])
+
+    def test_global_fallback_can_choose_frontier_outside_rectangle(self):
+        cfg = Settings(global_search=True, resolution=.25, robot_radius=0.,
+                       exploration_min_x=0., exploration_max_x=.25,
+                       exploration_min_y=0., exploration_max_y=.25)
+        voxel_map = VoxelMap(cfg)
+        robot = (0., 0., .3)
+        rays = [(3. * math.cos(i * 2 * math.pi / 72),
+                 3. * math.sin(i * 2 * math.pi / 72), -.2) for i in range(72)]
+        voxel_map.integrate((0., 0., .4), rays, robot[2])
+        self.assertEqual(select_frontier(voxel_map, robot, cfg)[3], 0)
+        audit = assess_global_frontiers(voxel_map.project(robot[:2], all_observed=True),
+                                        cfg, robot[:2])
+        self.assertGreater(audit['frontier_cells'], 0)
+        goal = select_frontier(voxel_map, robot, cfg, all_observed=True,
+                               allowed_frontiers=audit['cells'])[0]
+        self.assertIsNotNone(goal)
+        self.assertFalse(0. <= goal[0] <= .25 and 0. <= goal[1] <= .25)
+
     def test_global_coverage_counts_unknown_even_without_frontier(self):
         cfg = Settings(global_search=True, resolution=1., exploration_min_x=0.,
                        exploration_max_x=3., exploration_min_y=0., exploration_max_y=3.)

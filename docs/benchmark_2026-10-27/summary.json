@@ -1,0 +1,204 @@
+[
+  {
+    "path": "go2-quant-current2.jsonl",
+    "ready_wall_s": 23.255,
+    "ready_sim_s": 14.54,
+    "reachable_ground_cells": 13884,
+    "last": {
+      "actual_s": 336.011,
+      "coverage": 0.742725,
+      "unobserved_cells": 3572,
+      "path_m": 67.799,
+      "state": "goal_sent"
+    },
+    "wall_budget": {
+      "60": {
+        "actual_s": 58.996,
+        "coverage": 0.244526,
+        "unobserved_cells": 10489,
+        "path_m": 12.026,
+        "state": "goal_sent"
+      },
+      "120": {
+        "actual_s": 119.998,
+        "coverage": 0.413354,
+        "unobserved_cells": 8145,
+        "path_m": 27.437,
+        "state": "goal_sent"
+      },
+      "180": {
+        "actual_s": 179.999,
+        "coverage": 0.475872,
+        "unobserved_cells": 7277,
+        "path_m": 38.34,
+        "state": "goal_sent"
+      },
+      "240": {
+        "actual_s": 239.009,
+        "coverage": 0.53983,
+        "unobserved_cells": 6389,
+        "path_m": 46.794,
+        "state": "goal_sent"
+      },
+      "300": {
+        "actual_s": 299.003,
+        "coverage": 0.679559,
+        "unobserved_cells": 4449,
+        "path_m": 59.847,
+        "state": "goal_sent"
+      }
+    },
+    "sim_budget": {
+      "60": {
+        "actual_s": 59.66,
+        "coverage": 0.298329,
+        "unobserved_cells": 9742,
+        "path_m": 16.823,
+        "state": "goal_sent"
+      },
+      "120": {
+        "actual_s": 119.777,
+        "coverage": 0.431864,
+        "unobserved_cells": 7888,
+        "path_m": 32.621,
+        "state": "goal_sent"
+      },
+      "180": {
+        "actual_s": 179.562,
+        "coverage": 0.524849,
+        "unobserved_cells": 6597,
+        "path_m": 45.984,
+        "state": "goal_sent"
+      },
+      "240": {
+        "actual_s": 239.815,
+        "coverage": 0.711106,
+        "unobserved_cells": 4011,
+        "path_m": 62.599,
+        "state": "goal_sent"
+      },
+      "300": {
+        "actual_s": 260.16,
+        "coverage": 0.742725,
+        "unobserved_cells": 3572,
+        "path_m": 67.799,
+        "state": "goal_sent"
+      }
+    },
+    "thresholds": {
+      "0.25": {
+        "wall_s": 60.996,
+        "sim_s": 46.519,
+        "path_m": 12.639
+      },
+      "0.5": {
+        "wall_s": 193.009,
+        "sim_s": 150.76,
+        "path_m": 40.075
+      },
+      "0.7": {
+        "wall_s": 307.002,
+        "sim_s": 237.66,
+        "path_m": 62.194
+      },
+      "0.8": null,
+      "0.9": null,
+      "0.95": null
+    }
+  },
+  {
+    "path": "go2-quant-local.jsonl",
+    "ready_wall_s": 24.249,
+    "ready_sim_s": 15.374,
+    "reachable_ground_cells": 13884,
+    "last": {
+      "actual_s": 335.004,
+      "coverage": 0.217805,
+      "unobserved_cells": 10860,
+      "path_m": 15.602,
+      "state": "frontiers_unreachable_or_suppressed"
+    },
+    "wall_budget": {
+      "60": {
+        "actual_s": 59.998,
+        "coverage": 0.197061,
+        "unobserved_cells": 11148,
+        "path_m": 12.863,
+        "state": "goal_sent"
+      },
+      "120": {
+        "actual_s": 119.998,
+        "coverage": 0.217661,
+        "unobserved_cells": 10862,
+        "path_m": 15.602,
+        "state": "frontiers_unreachable_or_suppressed"
+      },
+      "180": {
+        "actual_s": 179.003,
+        "coverage": 0.217661,
+        "unobserved_cells": 10862,
+        "path_m": 15.602,
+        "state": "frontiers_unreachable_or_suppressed"
+      },
+      "240": {
+        "actual_s": 239.003,
+        "coverage": 0.217805,
+        "unobserved_cells": 10860,
+        "path_m": 15.602,
+        "state": "frontiers_unreachable_or_suppressed"
+      },
+      "300": {
+        "actual_s": 299.998,
+        "coverage": 0.217805,
+        "unobserved_cells": 10860,
+        "path_m": 15.602,
+        "state": "frontiers_unreachable_or_suppressed"
+      }
+    },
+    "sim_budget": {
+      "60": {
+        "actual_s": 59.734,
+        "coverage": 0.217661,
+        "unobserved_cells": 10862,
+        "path_m": 15.602,
+        "state": "frontiers_unreachable_or_suppressed"
+      },
+      "120": {
+        "actual_s": 119.876,
+        "coverage": 0.217661,
+        "unobserved_cells": 10862,
+        "path_m": 15.602,
+        "state": "frontiers_unreachable_or_suppressed"
+      },
+      "180": {
+        "actual_s": 179.878,
+        "coverage": 0.217805,
+        "unobserved_cells": 10860,
+        "path_m": 15.602,
+        "state": "frontiers_unreachable_or_suppressed"
+      },
+      "240": {
+        "actual_s": 236.526,
+        "coverage": 0.217805,
+        "unobserved_cells": 10860,
+        "path_m": 15.602,
+        "state": "frontiers_unreachable_or_suppressed"
+      },
+      "300": {
+        "actual_s": 236.526,
+        "coverage": 0.217805,
+        "unobserved_cells": 10860,
+        "path_m": 15.602,
+        "state": "frontiers_unreachable_or_suppressed"
+      }
+    },
+    "thresholds": {
+      "0.25": null,
+      "0.5": null,
+      "0.7": null,
+      "0.8": null,
+      "0.9": null,
+      "0.95": null
+    }
+  }
+]
