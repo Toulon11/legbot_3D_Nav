@@ -370,18 +370,19 @@ std::optional<XY> select_observation_goal(const VoxelMap &map, const Point &robo
   if (!assess_coverage(grid, cfg).valid) return std::nullopt;
   Cell origin{map.key(robot).x, map.key(robot).y};
   std::unordered_set<Cell, CellHash> blocked;
-  const int inflation = static_cast<int>(std::ceil(cfg.robot_radius / cfg.resolution));
-  auto inflate = [&](Cell center) {
+  auto inflate = [&](Cell center, double radius) {
+    const int inflation = static_cast<int>(std::ceil(radius / cfg.resolution));
     for (int dx = -inflation; dx <= inflation; ++dx)
       for (int dy = -inflation; dy <= inflation; ++dy)
-        if (std::hypot(dx, dy) * cfg.resolution <= cfg.robot_radius)
+        if (std::hypot(dx, dy) * cfg.resolution <= radius)
           blocked.insert({center.x + dx, center.y + dy});
   };
-  for (const auto &[cell, state] : grid) if (state == 1) inflate(cell);
+  for (const auto &[cell, state] : grid) if (state == 1) inflate(cell, cfg.robot_radius);
+  const double extra_radius = std::max(0.0, cfg.robot_radius - cfg.planner_occupancy_radius);
   for (const auto &xy : external_obstacles)
     if (std::isfinite(xy[0]) && std::isfinite(xy[1]))
       inflate({static_cast<int>(std::floor(xy[0] / cfg.resolution)),
-               static_cast<int>(std::floor(xy[1] / cfg.resolution))});
+               static_cast<int>(std::floor(xy[1] / cfg.resolution))}, extra_radius);
   auto free = [&](Cell cell) {
     auto it = grid.find(cell);
     return it != grid.end() && it->second == 0 && !blocked.count(cell);
@@ -492,17 +493,18 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
           blocked.insert({cell.x + dx, cell.y + dy});
   }
   // 依次处理SCAN 提供的额外障碍点。
+  const double extra_radius = std::max(0.0, cfg.robot_radius - cfg.planner_occupancy_radius);
+  const int extra_inflation = static_cast<int>(std::ceil(extra_radius / cfg.resolution));
   for (const auto &obstacle : external_obstacles) {
     // 过滤包含无穷大或 NaN 的无效坐标。
     if (!std::isfinite(obstacle[0]) || !std::isfinite(obstacle[1])) continue;
     Cell center{static_cast<int>(std::floor(obstacle[0] / cfg.resolution)),
                 static_cast<int>(std::floor(obstacle[1] / cfg.resolution))};
-    // 依次处理按机器人半径向外扩张的格数。
-    for (int dx = -inflation; dx <= inflation; ++dx)
-      // 依次处理按机器人半径向外扩张的格数。
-      for (int dy = -inflation; dy <= inflation; ++dy)
+    // SCAN 已膨胀的部分不重复计算，只补足探索安全半径的差额。
+    for (int dx = -extra_inflation; dx <= extra_inflation; ++dx)
+      for (int dy = -extra_inflation; dy <= extra_inflation; ++dy)
         // 只有表达式为真，才执行下面缩进或花括号内的代码。
-        if (std::hypot(dx, dy) * cfg.resolution <= cfg.robot_radius)
+        if (std::hypot(dx, dy) * cfg.resolution <= extra_radius)
           blocked.insert({center.x + dx, center.y + dy});
   }
   // 第二步：从已观察空闲格向上下左右找未知格，这些未知格就是原始前沿。

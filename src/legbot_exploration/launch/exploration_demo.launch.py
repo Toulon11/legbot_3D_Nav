@@ -51,7 +51,7 @@ def setup(context):
     # 第一阶段：启动 Gazebo、传感器、控制器管理器和机器人。
     # 估计定位模式会关闭 Gazebo 的 odom→base TF，由定位器负责发布该坐标关系。
     actions = [include('legbot_bringup', 'simulation.launch.py', {
-        'gui': 'true',
+        'gui': LaunchConfiguration('gazebo_gui').perform(context),
         'world': world,
         'navigation_source': 'ground_truth' if truth else 'fastlio',
         'navigation_interface': 'global',
@@ -73,7 +73,7 @@ def setup(context):
             'config': os.path.join(share('fast_livo'), 'config', 'legbot_sim.yaml'),
         }))
 
-    # 后续阶段：依次启动 GO2 控制、SCAN、RViz、探索节点。
+    # 后续阶段：依次启动 GO2 控制、SCAN、可选 RViz、探索节点。
     # 固定间隔仅用于排列顺序；控制与探索仍会等实时数据和就绪信号。
     actions.extend([
         TimerAction(period=delay, actions=[include(
@@ -92,13 +92,16 @@ def setup(context):
                 'cloud_topic': cloud,
                 'sensor_pose_topic': sensor_pose,
                 'manual_goal_use_message_z': 'false',
+                'robot_radius': LaunchConfiguration('scan_robot_radius').perform(context),
             })]),
-        TimerAction(period=delay + 2.0, actions=[include(
+    ])
+    if LaunchConfiguration('start_rviz').perform(context) == 'true':
+        actions.append(TimerAction(period=delay + 2.0, actions=[include(
             'legbot_bringup', 'scan_rviz.launch.py', {
                 'use_sim_time': 'true',
                 'config': os.path.join(bringup, 'rviz', 'scan_exploration_global.rviz'),
-            })]),
-        TimerAction(period=delay + 3.0, actions=[include(
+            })]))
+    actions.append(TimerAction(period=delay + 3.0, actions=[include(
             'legbot_exploration', 'exploration.launch.py', {
                 'localization_source': source,
                 'impl': 'cpp',
@@ -106,8 +109,12 @@ def setup(context):
                 'observation_only': 'false',
                 'start_waypoint_coordinator': 'true',
                 'flat_safety': 'true' if flat_world else 'false',
-            })]),
-    ])
+                'planner_safety': LaunchConfiguration('planner_safety').perform(context),
+                'planner_occupancy_radius': (
+                    LaunchConfiguration('scan_robot_radius').perform(context)
+                    if flat_world or LaunchConfiguration('planner_safety').perform(context) == 'true'
+                    else '0.0'),
+            })]))
     # 返回本函数计算得到的结果。
     return actions
 
@@ -125,6 +132,17 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'control_start_delay', default_value='12.0',
             description='Seconds from launch start until GO2 high-level control starts.'),
+        DeclareLaunchArgument('start_rviz', default_value='true',
+                              choices=['true', 'false'],
+                              description='Start the original SCAN RViz window.'),
+        DeclareLaunchArgument('gazebo_gui', default_value='true',
+                              choices=['true', 'false'],
+                              description='Show the Gazebo GUI.'),
+        DeclareLaunchArgument('planner_safety', default_value='false',
+                              choices=['true', 'false'],
+                              description='Require current SCAN occupancy and use wider clearance for exploration goals.'),
+        DeclareLaunchArgument('scan_robot_radius', default_value='0.20',
+                              description='SCAN local obstacle inflation radius in metres.'),
         # 等参数解析后才运行 setup，选择要启动的节点。
         OpaqueFunction(function=setup),
     ])

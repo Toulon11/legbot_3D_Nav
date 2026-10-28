@@ -71,6 +71,14 @@ int main() {
   auto staged_key = stage_map.key({(*staged.goal)[0], (*staged.goal)[1], robot[2]});
   assert(stage_grid.at({staged_key.x, staged_key.y}) == 0);
   assert(std::hypot((*staged.goal)[0], (*staged.goal)[1]) <= staged_cfg.max_goal_distance);
+  // SCAN 的 occupancy_inflate 已包含 0.35 m 膨胀；探索只应补足到 0.50 m。
+  Settings inflated_cfg = cfg;
+  inflated_cfg.robot_radius = 0.50;
+  inflated_cfg.planner_occupancy_radius = 0.35;
+  auto adjusted = select_frontier(stage_map, robot, inflated_cfg, {}, {{0.625, 0.125}});
+  inflated_cfg.planner_occupancy_radius = 0.0;
+  auto doubled = select_frontier(stage_map, robot, inflated_cfg, {}, {{0.625, 0.125}});
+  assert(adjusted.open_start_neighbors > doubled.open_start_neighbors);
   // 场景四：1 米局部窗口没有前沿；全局矩形搜索则应找到同一片远处前沿。
   Settings local_cfg = cfg;
   local_cfg.local_search_radius = 1.0;

@@ -6,6 +6,86 @@
 `ament_cmake` 构建，并用 `ament_cmake_python` 安装 Python 模块；因此无需手写
 `setup.py`。两个可执行文件为 `explorer_cpp` 和 `explorer_py`，一次只运行一个。
 
+## 第一阶段：在线多层地形图（独立观察节点）
+
+新增的 `online_layer_map_cpp` 与原有单层探索节点并行工作。它读取同一套适配器话题：
+`/slam/global_cloud_registered`、`/slam/odometry_lidar` 和
+`/slam/global_odometry_base`，在 `map` 坐标系中按时间匹配点云与雷达位姿，
+沿射线累计三维占据证据。地图会随新点云更新；旧障碍被反复射线穿过后，
+其证据可下降并从障碍转为空闲。
+
+每个水平网格可以保存多个不同高度的候选表面。高度切片 `slice_height` 仅用来标记
+候选所在的高度带，不会把它们合并成一层，也不把候选高度强制取整；同一水平位置的
+上下两层可以同时存在。表面候选需要从上方观测到点云，避免将从下方看到的天花板
+误当作可站立地面。候选再按邻近支撑点数、相邻高度差和上方占据证据分类。
+`step_candidate` 仅表示有待后续验证的高度变化，不等于已经能够跨越。
+未观测到顶面的露天位置归为 `unobserved`，不会仅因上方没有回波就判为有障碍；
+它也没有被标记为“已验证净空”。完全没有点云证据的水平格不会凭空生成表面。
+每帧保留至多 `max_points_per_cloud` 个点作为表面命中证据，同时只对其中至多
+`max_rays_per_cloud` 个点执行射线追踪。这样既保留较密的地面观测，又限制每轮计算量；
+两项默认分别为 12000 和 1200。表面颜色表示地形分类，不表示相机拍摄的真实颜色。
+
+节点输出：
+
+- `/exploration/layers/surfaces`：可在 RViz 用 PointCloud2 显示。绿色为有观测净空的平坦表面，蓝色为上方尚未充分观测的平坦表面，橙色为台阶候选，紫色为坡度或连接条件不合格，灰色为支撑不足，红色为净空被障碍占用。点云还包含 `slice_index`、`surface_kind`、`clearance_kind`、`support_columns`、`ceiling_z`、`hit_observations` 和 `last_observed` 字段，供后续跨层模块读取。
+- `/exploration/layers/ceilings`：已观测到的上方障碍点，RViz 中可用 PointCloud2 显示。
+- `/exploration/layers/status`：JSON 统计，包括体素、水平格、候选表面数量、点云同步丢弃数、地图容量状态和每轮更新耗时。
+  `last_raw_cloud_points`、`last_sampled_points`、`last_rays_requested` 和
+  `integration_ms` 可用于检查点云抽样与射线追踪是否正常。
+  在线地图体素上限为 800 万；`map_full=true` 表示上限已满，后续新区域无法继续入图。
+  修改此上限后需重启地图节点，已运行节点不会自动读取新值。
+
+仅测试在线地图时，先关闭已单独运行的 Gazebo、定位适配器和旧地图节点，
+然后用一条命令启动 Gazebo、GUI、Gazebo 真值适配器、在线多层地图和 RViz：
+
+```bash
+cd /home/likai/legbot_3D_Nav
+source /opt/ros/jazzy/setup.bash
+source install/setup.sh
+ros2 launch legbot_exploration multi_layer_map.launch.py
+```
+
+默认开启 Gazebo GUI 和 RViz。无显示器时可加
+`gazebo_gui:=false start_rviz:=false`；这不会改变点云建图与话题发布。
+默认世界为 `Building.sdf`。需要平面场景时，可给同一命令加上
+`world:=/home/likai/legbot_3D_Nav/install/legbot_bringup/share/legbot_bringup/worlds/ExplorationFlat.sdf`。
+RViz 使用本包的 `rviz/multi_layer_map.rviz`，启动后自动订阅
+`/exploration/layers/surfaces` 和 `/exploration/layers/ceilings`，并显示 GO2 模型；
+固定坐标系为 `map`。表面按小方块显示，原点处的参考网格已隐藏，避免机器狗
+出生在远离原点的位置时将网格误认为地形边界。
+查看状态可运行 `ros2 topic echo /exploration/layers/status`。
+此入口不启动自动探索、SCAN 或 GO2 高层行走控制，因此机器狗不会自己去扫描整张地图。
+若要让机器狗边探索边累计多层图，先启动已有完整探索入口，再另开终端运行
+`ros2 launch legbot_exploration multi_layer_map.launch.py start_simulation:=false start_rviz:=false`。
+这样只添加地图节点，不会重复启动 Gazebo、定位适配器或第二个 RViz。
+
+也可以只用一条命令启动 Gazebo、定位、GO2 控制、SCAN、自主探索、在线多层地图
+和多层地图 RViz（只启动一份 Gazebo 与 RViz）：
+
+```bash
+ros2 launch legbot_exploration multi_layer_exploration_demo.launch.py
+```
+
+默认使用 Building 场景和 Gazebo 真值定位；可用
+`localization_source:=fastlio|fastlivo` 选择估计定位，或用 `world:=...` 指定场景。
+`control_start_delay:=12.0` 控制 GO2 高层控制的启动延时，
+`show_layer_rviz:=false` 可关闭默认打开的地图 RViz。此入口会自动发送探索目标，
+与上面的纯地图观察命令不同。启动前先关闭之前的仿真与探索进程，避免话题重复发布。
+组合入口在 Building 场景为探索选点额外启用 SCAN 障碍图就绪检查、0.50 m
+目标避障半径和 4 m 单次目标距离；同时将 SCAN 局部障碍膨胀半径设为
+0.35 m，减少贴着圆柱规划轨迹的情况；可用 `scan_robot_radius:=数值` 调整。
+探索节点读取的是 SCAN 已膨胀的障碍图，只再补足到自身 0.50 m 安全半径的差额，
+避免把同一障碍重复膨胀；调整 `scan_robot_radius` 时会同步更新这一差额。
+修改只影响新组合入口，
+`exploration_demo.launch.py` 的单独启动参数保持原有默认值。组合入口的
+`show_layer_rviz` 控制唯一的 RViz 窗口，`start_rviz` 不用于控制这个窗口。
+启动后可用 `ros2 topic info /exploration/status -v` 确认探索状态发布者存在，
+再用 `ros2 topic echo /exploration/status std_msgs/msg/String --once --qos-durability transient_local --full-length` 读取完整状态。
+
+在线多层地图节点本身只建立、更新和显示地图，不发布导航目标；一键组合入口中的
+导航目标仍由原有单层探索节点产生，SCAN 负责执行。原有单层探索入口不启动此地图节点，
+保持原来的行走策略。
+
 ## 输入和输出
 
 - 输入：统一适配器输出的 `/slam/global_cloud_registered`、

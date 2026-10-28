@@ -22,6 +22,7 @@
     obstacle_max_relative_z: 0.85         # 相对机体高度的障碍判定上界，单位米。
     free_min_relative_z: -0.45            # 二维投影纳入的最低高度，单位米。
     robot_radius: 0.35                    # 机器人避障膨胀半径，单位米。
+    planner_occupancy_radius: 0.0        # SCAN 输入障碍图已膨胀半径；0 保持独立启动时的旧行为。
     local_search_radius: 10.0             # 局部搜索时的半径，单位米。
     global_search: false                  # true 时先在矩形内选点，再查完整累计地图的前沿。
     bounds_relative_to_start: false       # true 时把边界坐标加到起始机体位置上。

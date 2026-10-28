@@ -21,6 +21,7 @@ struct Settings {
   double obstacle_max_relative_z = 0.85;  // 相对机体高度的障碍上界。
   double free_min_relative_z = -0.45;   // 投影二维空闲格的最低高度。
   double robot_radius = 0.35;           // 避障时使用的机器人半径。
+  double planner_occupancy_radius = 0.0; // SCAN 障碍图已膨胀的半径；外部障碍只补足差额。
   double local_search_radius = 10.0;    // 局部前沿搜索半径，单位米。
   bool global_search = false;           // true 时先在矩形内选点，再查完整累计地图。
   double exploration_min_x = -31.5;     // 全图边界：X 最小值。

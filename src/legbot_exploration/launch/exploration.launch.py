@@ -28,6 +28,7 @@ def setup(context):
     sensor_pose = '/slam/odometry_lidar'
     use_sim_time = LaunchConfiguration('use_sim_time')
     flat_safety = LaunchConfiguration('flat_safety').perform(context) == 'true'
+    planner_safety = LaunchConfiguration('planner_safety').perform(context) == 'true'
 
     # 将计算结果保存为 actions（启动文件返回的启动动作列表）。
     actions = []
@@ -60,6 +61,8 @@ def setup(context):
                 'sensor_odom_topic': sensor_pose,
                 'cloud_topic': cloud,
                 'frame_id': 'map',
+                'planner_occupancy_radius': float(
+                    LaunchConfiguration('planner_occupancy_radius').perform(context)),
                 **({'robot_radius': 0.50,
                     'max_goal_distance': 4.0,
                     'global_search': True,
@@ -69,6 +72,10 @@ def setup(context):
                     'exploration_min_y': -21.5,
                     'exploration_max_y': 9.5,
                     'require_planner_occupancy': True} if flat_safety else {}),
+                **({'robot_radius': 0.50,
+                    'max_goal_distance': 4.0,
+                    'require_planner_occupancy': True}
+                   if planner_safety and not flat_safety else {}),
             },
         ],
     ))
@@ -89,6 +96,9 @@ def generate_launch_description():
                               choices=['true', 'false']),
         DeclareLaunchArgument('flat_safety', default_value='false',
                               choices=['true', 'false']),
+        DeclareLaunchArgument('planner_safety', default_value='false',
+                              choices=['true', 'false']),
+        DeclareLaunchArgument('planner_occupancy_radius', default_value='0.0'),
         # 等参数解析后才运行 setup，选择要启动的节点。
         OpaqueFunction(function=setup),
     ])

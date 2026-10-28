@@ -28,7 +28,9 @@
   <exec_depend>ament_index_python</exec_depend>
   <!-- 启动文件需要引用 bringup 的启动配置与 launch_ros。 -->
   <exec_depend>legbot_bringup</exec_depend>
+  <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rviz2</exec_depend>
   <!-- 向 colcon 声明这个包采用 ament_cmake 构建。 -->
   <export><build_type>ament_cmake</build_type></export>
 </package>

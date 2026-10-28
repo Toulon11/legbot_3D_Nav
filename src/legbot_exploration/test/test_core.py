@@ -139,6 +139,13 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(stage_grid[staged_map.key((*staged_goal, robot[2]))[:2]], 0)
         # 测试断言：实际值必须符合这里给出的预期。
         self.assertLessEqual(math.dist(staged_goal, robot[:2]), staged_cfg.max_goal_distance)
+        adjusted = Settings(robot_radius=.5, planner_occupancy_radius=.35)
+        doubled = Settings(robot_radius=.5, planner_occupancy_radius=0.)
+        adjusted_neighbors = select_frontier(staged_map, robot, adjusted,
+                                             external_obstacles=[(.625, .125)])[4]['open_start_neighbors']
+        doubled_neighbors = select_frontier(staged_map, robot, doubled,
+                                            external_obstacles=[(.625, .125)])[4]['open_start_neighbors']
+        self.assertGreater(adjusted_neighbors, doubled_neighbors)
         blocked_goal, _, _, _, _ = select_frontier(voxel_map, robot, cfg,
                                               # 将计算结果保存为 external_obstacles（SCAN 提供的障碍点列表）。
                                               external_obstacles=[goal])

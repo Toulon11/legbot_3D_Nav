@@ -85,9 +85,11 @@ class Explorer(Node):
         # 条件检查：按间隔对点云抽样；成立才进入下面的分支。
         if (cfg.resolution <= 0 or cfg.local_search_radius <= 0 or self.point_stride < 1
                 or self.max_points_per_cloud < 1 or cfg.max_voxels < 1 or
-                self.recovery_min_new_cells < 1):
+                self.recovery_min_new_cells < 1 or
+                not math.isfinite(cfg.planner_occupancy_radius) or
+                cfg.planner_occupancy_radius < 0):
             # 关键数值若非正数，就在启动阶段报错，避免之后除零或空循环。
-            raise ValueError('resolution, search radius, stride, max points, max voxels and recovery gain must be positive')
+            raise ValueError('invalid exploration dimensions, recovery gain, or planner occupancy radius')
         # 条件检查：当前启用全图搜索；成立才进入下面的分支。
         if (cfg.global_search and (cfg.exploration_min_x >= cfg.exploration_max_x or
                                    cfg.exploration_min_y >= cfg.exploration_max_y)):
@@ -341,7 +343,8 @@ class Explorer(Node):
     # 判断给定目标附近是否存在规划器障碍。
     def planner_blocks(self, xy):
         # 返回目标是否被规划器障碍占据。
-        return any(math.dist(xy, p) <= self.cfg.robot_radius for p in self.external_obstacles)
+        extra_radius = max(0., self.cfg.robot_radius - self.cfg.planner_occupancy_radius)
+        return any(math.dist(xy, p) <= extra_radius for p in self.external_obstacles)
 
     # 接收一帧已配准点云并排队处理。
     def on_cloud(self, msg):

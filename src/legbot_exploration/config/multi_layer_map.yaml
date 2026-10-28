@@ -1,0 +1,29 @@
+/**:
+  ros__parameters:
+    use_sim_time: true
+    frame_id: map
+    cloud_topic: /slam/global_cloud_registered
+    sensor_odom_topic: /slam/odometry_lidar
+    base_odom_topic: /slam/global_odometry_base
+    sensor_sync_tolerance: 0.05
+    # PCT's horizontal grid and height slices are separate.  The surface
+    # height remains a measured value and is not rounded to slice_height.
+    xy_resolution: 0.10
+    z_resolution: 0.10
+    slice_height: 0.50
+    max_ray_range: 12.0
+    surface_merge_gap: 0.15
+    support_height_tolerance: 0.20
+    min_clearance: 0.55
+    max_slope_radians: 0.40
+    max_step_height: 0.16
+    support_radius_cells: 2
+    min_support_columns: 5
+    min_hit_observations: 2
+    max_surfaces_per_column: 8
+    max_voxels: 8000000
+    point_stride: 1
+    max_points_per_cloud: 12000
+    max_rays_per_cloud: 1200
+    publish_period: 1.0
+    max_display_surfaces: 120000

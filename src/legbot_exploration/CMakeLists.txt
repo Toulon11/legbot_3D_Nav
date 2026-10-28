@@ -33,13 +33,31 @@ ament_target_dependencies(explorer_cpp rclcpp geometry_msgs nav_msgs sensor_msgs
 # 安装为 ros2 run legbot_exploration explorer_cpp 能找到的位置。
 install(TARGETS explorer_cpp DESTINATION lib/${PROJECT_NAME})
 
+# A separate observational map for multi-level terrain.  It never sends goals
+# and does not alter the existing C++/Python single-floor explorers.
+add_executable(online_layer_map_cpp
+  cpp/src/multi_layer_map_node.cpp cpp/src/multi_layer_map.cpp)
+target_include_directories(online_layer_map_cpp PRIVATE cpp/include)
+target_compile_features(online_layer_map_cpp PRIVATE cxx_std_17)
+ament_target_dependencies(online_layer_map_cpp rclcpp nav_msgs sensor_msgs std_msgs)
+install(TARGETS online_layer_map_cpp DESTINATION lib/${PROJECT_NAME})
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(test_multi_layer_map
+    test/test_multi_layer_map.cpp cpp/src/multi_layer_map.cpp)
+  target_include_directories(test_multi_layer_map PRIVATE cpp/include)
+  target_compile_features(test_multi_layer_map PRIVATE cxx_std_17)
+  add_test(NAME online_multi_layer_map_geometry COMMAND test_multi_layer_map)
+endif()
+
 # 把 python/legbot_exploration/ 安装为可导入的 Python 模块。
 ament_python_install_package(${PROJECT_NAME} PACKAGE_DIR python/${PROJECT_NAME})
 # 安装 Python 可执行入口，供 ros2 run 或 launch 调用。
 install(PROGRAMS python/scripts/explorer_py DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS python/scripts/verify_flat_coverage.py DESTINATION lib/${PROJECT_NAME})
 # 安装参数 YAML 与 launch 文件；排除 Python 自动生成的缓存文件。
-install(DIRECTORY config launch DESTINATION share/${PROJECT_NAME}
+install(DIRECTORY config launch rviz DESTINATION share/${PROJECT_NAME}
   PATTERN "__pycache__" EXCLUDE
   PATTERN "*.pyc" EXCLUDE)
 # 完成 ament 包注册，让其他 ROS 2 包可以查找本包。

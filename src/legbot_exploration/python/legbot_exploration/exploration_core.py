@@ -32,6 +32,8 @@ class Settings:
     free_min_relative_z: float = -0.45
     # 参数 robot_radius：机器人避障半径；等号右边是默认值。
     robot_radius: float = 0.35
+    # SCAN 输入障碍图已经膨胀的半径；0 保持旧版行为。
+    planner_occupancy_radius: float = 0.0
     # 参数 local_search_radius：局部探索半径；等号右边是默认值。
     local_search_radius: float = 10.0
     # 参数 global_search：先在矩形内选点，再检查完整累计地图；等号右边是默认值。
@@ -431,16 +433,20 @@ def select_observation_goal(voxels, robot_xyz, settings, grid, suppressed=(),
     if assess_coverage(grid, settings) is None:
         return None
     r = settings.resolution
-    inflation = math.ceil(settings.robot_radius / r)
     blocked = set()
-    centers = [cell for cell, value in grid.items() if value == 1]
-    centers.extend((math.floor(x / r), math.floor(y / r))
-                   for x, y in external_obstacles if math.isfinite(x) and math.isfinite(y))
-    for x, y in centers:
+    def inflate(center, radius):
+        inflation = math.ceil(radius / r)
         for dx in range(-inflation, inflation + 1):
             for dy in range(-inflation, inflation + 1):
-                if math.hypot(dx, dy) * r <= settings.robot_radius:
-                    blocked.add((x + dx, y + dy))
+                if math.hypot(dx, dy) * r <= radius:
+                    blocked.add((center[0] + dx, center[1] + dy))
+    for cell, value in grid.items():
+        if value == 1:
+            inflate(cell, settings.robot_radius)
+    extra_radius = max(0., settings.robot_radius - settings.planner_occupancy_radius)
+    for x, y in external_obstacles:
+        if math.isfinite(x) and math.isfinite(y):
+            inflate((math.floor(x / r), math.floor(y / r)), extra_radius)
 
     def free(cell):
         return grid.get(cell) == 0 and cell not in blocked
@@ -516,6 +522,8 @@ def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacl
     occupied = {cell for cell, value in grid.items() if value == 1}
     # 将计算结果保存为 inflation（机器人半径折算的格数）。
     inflation = math.ceil(settings.robot_radius / settings.resolution)
+    extra_radius = max(0., settings.robot_radius - settings.planner_occupancy_radius)
+    extra_inflation = math.ceil(extra_radius / settings.resolution)
     # 将计算结果保存为 blocked（考虑机器人半径后的禁行格）。
     blocked = set()
     # 依次处理已知障碍格。
@@ -535,11 +543,11 @@ def select_frontier(voxels, robot_xyz, settings, suppressed=(), external_obstacl
             # 把 SCAN 障碍点的米制 XY 换算成二维格号。
             cx, cy = math.floor(x / settings.resolution), math.floor(y / settings.resolution)
             # 依次处理按机器人半径向外扩张的格数。
-            for dx in range(-inflation, inflation + 1):
+            for dx in range(-extra_inflation, extra_inflation + 1):
                 # 依次处理按机器人半径向外扩张的格数。
-                for dy in range(-inflation, inflation + 1):
+                for dy in range(-extra_inflation, extra_inflation + 1):
                     # 仅扩张到机器人半径以内，不把方形角落也算成障碍。
-                    if math.hypot(dx, dy) * settings.resolution <= settings.robot_radius:
+                    if math.hypot(dx, dy) * settings.resolution <= extra_radius:
                         # 把 SCAN 障碍周围的膨胀格也加入禁行集合。
                         blocked.add((cx + dx, cy + dy))
 

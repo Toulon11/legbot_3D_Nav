@@ -225,6 +225,10 @@ class Explorer : public rclcpp::Node {
      cfg.obstacle_max_relative_z = declare_parameter<double>("obstacle_max_relative_z", cfg.obstacle_max_relative_z);
      cfg.free_min_relative_z = declare_parameter<double>("free_min_relative_z", cfg.free_min_relative_z);
      cfg.robot_radius = declare_parameter<double>("robot_radius", cfg.robot_radius);
+     cfg.planner_occupancy_radius = declare_parameter<double>(
+         "planner_occupancy_radius", cfg.planner_occupancy_radius);
+     if (!std::isfinite(cfg.planner_occupancy_radius) || cfg.planner_occupancy_radius < 0.0)
+       throw std::invalid_argument("planner_occupancy_radius must be finite and nonnegative");
      cfg.local_search_radius = declare_parameter<double>("local_search_radius", cfg.local_search_radius);
      cfg.global_search = declare_parameter<bool>("global_search", cfg.global_search);
      cfg.exploration_min_x = declare_parameter<double>("exploration_min_x", cfg.exploration_min_x);
@@ -407,7 +411,8 @@ class Explorer : public rclcpp::Node {
      return std::any_of(external_obstacles_.begin(), external_obstacles_.end(),
          [this, &xy](const le::XY &obstacle) {
            // 把此函数算出的值交还给调用者。
-           return xy_distance(xy, obstacle) <= cfg_.robot_radius;
+           return xy_distance(xy, obstacle) <=
+               std::max(0.0, cfg_.robot_radius - cfg_.planner_occupancy_radius);
          });
    }
 
