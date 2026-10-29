@@ -24,6 +24,7 @@ legbot::Publisher goal_stop_ack_pub;
 legbot::Subscriber bspline_sub;
 legbot::Subscriber odom_sub;
 legbot::Subscriber goal_sub;
+legbot::Subscriber bootstrap_turn_sub;
 legbot::Timer cmd_timer;
 
 bool receive_traj = false;
@@ -74,6 +75,8 @@ geometry_msgs::msg::Twist last_motion_cmd;
 legbot::Time last_motion_cmd_time;
 bool rotate_only = false;
 int rotate_direction = 0;
+double bootstrap_yaw_rate = 0.0;
+legbot::Time last_bootstrap_turn;
 
 double normalizeAngle(double angle)
 {
@@ -226,6 +229,13 @@ void publishExecutionFrozen(bool frozen)
   execution_frozen_pub.publish(msg);
 }
 
+void bootstrapTurnCallback(const geometry_msgs::msg::Twist::ConstSharedPtr &msg)
+{
+  if (!msg || !std::isfinite(msg->angular.z)) return;
+  bootstrap_yaw_rate = clamp(msg->angular.z, -max_vyaw, max_vyaw);
+  last_bootstrap_turn = legbot::Time::now();
+}
+
 void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
 {
   if (!msg)
@@ -338,6 +348,19 @@ void cmdCallback(const legbot::TimerEvent &)
   {
     publishExecutionFrozen(false);
     publishStop();
+    return;
+  }
+
+  // SCAN remains the only /cmd_vel publisher. A short startup turn is
+  // accepted only before any navigation goal or trajectory exists; a stale
+  // request expires automatically and the normal zero-command branch resumes.
+  if (!have_goal_position && !receive_traj && !last_bootstrap_turn.isZero() &&
+      (legbot::Time::now() - last_bootstrap_turn).toSec() <= 0.25)
+  {
+    geometry_msgs::msg::Twist turn;
+    turn.angular.z = bootstrap_yaw_rate;
+    publishExecutionFrozen(true);
+    publishSmooth(turn);
     return;
   }
 
@@ -564,6 +587,9 @@ int main(int argc, char **argv)
                                legbot::TransportHints().tcpNoDelay());
   goal_sub = node.subscribe("/scan/goal", 10, goalCallback,
                             legbot::TransportHints().tcpNoDelay());
+  bootstrap_turn_sub = node.subscribe("/exploration/bootstrap_turn_cmd", 10,
+                                      bootstrapTurnCallback,
+                                      legbot::TransportHints().tcpNoDelay());
   odom_sub = node.subscribe(body_pose_topic, 20, odomCallback,
                             legbot::TransportHints().tcpNoDelay());
   cmd_vel_pub = node.advertise<geometry_msgs::msg::Twist>("/cmd_vel", 20);
@@ -579,6 +605,7 @@ int main(int argc, char **argv)
   cmd_timer.stop();
   bspline_sub.shutdown();
   goal_sub.shutdown();
+  bootstrap_turn_sub.shutdown();
   odom_sub.shutdown();
   cmd_vel_pub.shutdown();
   execution_frozen_pub.shutdown();

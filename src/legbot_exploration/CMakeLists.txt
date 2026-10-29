@@ -23,7 +23,8 @@ find_package(std_srvs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 
 # 将 ROS 节点与核心算法两个 .cpp 文件编成 explorer_cpp 可执行程序。
-add_executable(explorer_cpp cpp/src/explorer_node.cpp cpp/src/exploration_core.cpp)
+add_executable(explorer_cpp cpp/src/explorer_node.cpp cpp/src/exploration_core.cpp
+  cpp/src/route_planner.cpp)
 # 让编译器能找到 cpp/include/ 下的 exploration_core.hpp。
 target_include_directories(explorer_cpp PRIVATE cpp/include)
 # C++ 代码用到 C++17 的 optional 等特性。
@@ -33,28 +34,46 @@ ament_target_dependencies(explorer_cpp rclcpp geometry_msgs nav_msgs sensor_msgs
 # 安装为 ros2 run legbot_exploration explorer_cpp 能找到的位置。
 install(TARGETS explorer_cpp DESTINATION lib/${PROJECT_NAME})
 
-# A separate observational map for multi-level terrain.  It never sends goals
-# and does not alter the existing C++/Python single-floor explorers.
+# A separate observational map for multi-level terrain. It never sends goals
+# and does not alter the C++ single-floor explorer.
 add_executable(online_layer_map_cpp
-  cpp/src/multi_layer_map_node.cpp cpp/src/multi_layer_map.cpp)
+  cpp/src/multi_layer_map_node.cpp cpp/src/multi_layer_map.cpp
+  cpp/src/surface_graph.cpp)
 target_include_directories(online_layer_map_cpp PRIVATE cpp/include)
 target_compile_features(online_layer_map_cpp PRIVATE cxx_std_17)
-ament_target_dependencies(online_layer_map_cpp rclcpp nav_msgs sensor_msgs std_msgs)
+ament_target_dependencies(online_layer_map_cpp rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs visualization_msgs)
 install(TARGETS online_layer_map_cpp DESTINATION lib/${PROJECT_NAME})
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(test_exploration_core
+    test/test_core.cpp cpp/src/exploration_core.cpp)
+  target_include_directories(test_exploration_core PRIVATE cpp/include)
+  target_compile_features(test_exploration_core PRIVATE cxx_std_17)
+  target_compile_options(test_exploration_core PRIVATE -UNDEBUG)
+  add_test(NAME exploration_core_frontiers COMMAND test_exploration_core)
   add_executable(test_multi_layer_map
     test/test_multi_layer_map.cpp cpp/src/multi_layer_map.cpp)
   target_include_directories(test_multi_layer_map PRIVATE cpp/include)
   target_compile_features(test_multi_layer_map PRIVATE cxx_std_17)
+  target_compile_options(test_multi_layer_map PRIVATE -UNDEBUG)
   add_test(NAME online_multi_layer_map_geometry COMMAND test_multi_layer_map)
+  add_executable(test_surface_graph
+    test/test_surface_graph.cpp cpp/src/surface_graph.cpp)
+  target_include_directories(test_surface_graph PRIVATE cpp/include)
+  target_compile_features(test_surface_graph PRIVATE cxx_std_17)
+  target_compile_options(test_surface_graph PRIVATE -UNDEBUG)
+  add_test(NAME online_surface_graph_astar COMMAND test_surface_graph)
+  add_executable(test_route_planner
+    test/test_route_planner.cpp cpp/src/route_planner.cpp cpp/src/exploration_core.cpp)
+  target_include_directories(test_route_planner PRIVATE cpp/include)
+  target_compile_features(test_route_planner PRIVATE cxx_std_17)
+  target_compile_options(test_route_planner PRIVATE -UNDEBUG)
+  add_test(NAME exploration_route_safety COMMAND test_route_planner)
 endif()
 
 # 把 python/legbot_exploration/ 安装为可导入的 Python 模块。
 ament_python_install_package(${PROJECT_NAME} PACKAGE_DIR python/${PROJECT_NAME})
-# 安装 Python 可执行入口，供 ros2 run 或 launch 调用。
-install(PROGRAMS python/scripts/explorer_py DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS python/scripts/verify_flat_coverage.py DESTINATION lib/${PROJECT_NAME})
 # 安装参数 YAML 与 launch 文件；排除 Python 自动生成的缓存文件。
 install(DIRECTORY config launch rviz DESTINATION share/${PROJECT_NAME}

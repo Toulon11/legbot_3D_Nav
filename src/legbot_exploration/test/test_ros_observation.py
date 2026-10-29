@@ -20,7 +20,7 @@ import time
 
 # 导入 nav_msgs.msg 提供的类型或函数。
 from nav_msgs.msg import Odometry
-# 导入 Python 版 ROS 2 节点接口。
+# 导入测试客户端使用的 ROS 2 Python 接口。
 import rclpy
 # 导入 rclpy.qos 提供的类型或函数。
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data

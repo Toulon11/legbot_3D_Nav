@@ -169,8 +169,9 @@ bool RecoveryGate::waiting_for_new_cells(std::size_t observed_cells) const {
 
 bool RecoveryGate::eligible(const Selection &selection, std::size_t observed_cells) const {
   // 返回本轮前沿搜索的结果和诊断计数。
-  return selection.clusters > 0 && selection.reachable_frontier_cells == 0 &&
-         selection.candidate_goals == 0 && !waiting_for_new_cells(observed_cells);
+  return selection.clusters > 0 && !selection.goal &&
+         selection.candidate_goals == selection.suppressed_goals &&
+         !waiting_for_new_cells(observed_cells);
 }
 
 void RecoveryGate::start(std::size_t observed_cells) { started_at_ = observed_cells; }
@@ -522,6 +523,8 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
     }
   }
   result.frontier_cells = frontier.size();
+  // 未知格只允许作为前沿终点；执行路径不得从未知格继续向外穿行。
+  const auto frontier_terminals = frontier;
   // 第三步：用八邻接的队列搜索，把相连前沿格聚成一个簇。
   std::vector<std::vector<Cell>> clusters;
   // 反复处理已知空闲格与未知格的交界，直到循环条件不再成立。
@@ -562,8 +565,9 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
   // 依次处理集合中的每一项。
   for (const auto &d : kEight) {
     Cell next{origin.x + d.x, origin.y + d.y};
-    // 检查目标格是否落在避障膨胀后的禁行区。
-    if (inside(next) && !blocked.count(next)) ++result.open_start_neighbors;
+    const auto known = grid.find(next);
+    if (inside(next) && known != grid.end() && known->second == 0)
+      ++result.open_start_neighbors;
   }
 
   // 给较长的 C++ 类型起一个简短别名。
@@ -585,14 +589,23 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
     queue.pop();
     // 比较新路径和旧路径的累计代价，只保留更短者。
     if (cost > costs[cell]) continue;
+    if (!(cell == origin) && !grid.count(cell)) continue;
     // 依次处理集合中的每一项。
     for (const auto &d : kEight) {
       Cell next{cell.x + d.x, cell.y + d.y};
       // 检查目标格是否落在避障膨胀后的禁行区。
-      if (!inside(next) || blocked.count(next)) continue;
+      if (!inside(next)) continue;
+      const auto known = grid.find(next);
+      if (known == grid.end() && !frontier_terminals.count(next)) continue;
+      if (known != grid.end() && known->second != 0) continue;
       // 检查目标格是否落在避障膨胀后的禁行区。
-      if (d.x && d.y && (blocked.count({cell.x + d.x, cell.y}) ||
-                         blocked.count({cell.x, cell.y + d.y}))) continue;
+      if (d.x && d.y) {
+        const Cell side_x{cell.x + d.x, cell.y};
+        const Cell side_y{cell.x, cell.y + d.y};
+        const auto sx = grid.find(side_x), sy = grid.find(side_y);
+        if (sx == grid.end() || sy == grid.end() ||
+            sx->second != 0 || sy->second != 0) continue;
+      }
       // 将右侧计算值存入 step（本次步长或射线采样序号）。
       double step = cfg.resolution * std::hypot(d.x, d.y);
       // 检查当前二维格的已知空闲、障碍或未知状态。

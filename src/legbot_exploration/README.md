@@ -1,10 +1,11 @@
 # legbot_exploration
 
-第一次阅读源码可先看 [代码阅读指南](代码阅读指南.md)：它解释 ROS 话题、体素地图、前沿选点、状态机和 C++/Python 对应关系；关键语句与参数旁也已补上中文注释。
+第一次阅读源码可先看 [代码阅读指南](代码阅读指南.md)：它解释 ROS 话题、体素地图、前沿选点和状态机；关键语句与参数旁也已补上中文注释。
 
-独立 ROS 2 Jazzy 功能包：同一功能分别由 `cpp/` 和 `python/` 实现。统一通过
-`ament_cmake` 构建，并用 `ament_cmake_python` 安装 Python 模块；因此无需手写
-`setup.py`。两个可执行文件为 `explorer_cpp` 和 `explorer_py`，一次只运行一个。
+独立 ROS 2 Jazzy 功能包：探索节点使用 `explorer_cpp`。`python/` 仅保留独立的
+Gazebo 真值覆盖率验收工具，通过 `ament_cmake_python` 安装。
+旧 Python 探索器已移至项目根目录 `tmp/legacy_python_explorer_2026-10-29/`，
+不参与当前构建或运行。
 
 ## 第一阶段：在线多层地形图（独立观察节点）
 
@@ -82,9 +83,43 @@ ros2 launch legbot_exploration multi_layer_exploration_demo.launch.py
 启动后可用 `ros2 topic info /exploration/status -v` 确认探索状态发布者存在，
 再用 `ros2 topic echo /exploration/status std_msgs/msg/String --once --qos-durability transient_local --full-length` 读取完整状态。
 
+起步时如果机器人脚下仍有点云盲区，探索器进入“起步建图”状态。GO2 站稳且
+里程计、点云和 SCAN 障碍图就绪后，机器人以 0.35 rad/s 原地转一圈；完成后
+只发零角速度，不再重复发送模式 2，以免已站立的机器狗切换成趴下。等待运动
+停止后，从附近 0.65–2.0 m 的已观测空闲格里选一个机体膨胀范围也空闲的
+目标，交给现有 SCAN 航点接口。已知障碍不能穿过；起点至目标之间仍有未知
+部分时，由 SCAN 检查并规划实际短距离运动。目标点本身还须通过新鲜层析图
+的支撑和净空检查。若没有安全目标、转向超时或位姿失效，节点停车并在
+`/exploration/status` 报告 `bootstrap_failed`。参数 `startup_scan_enabled`、
+`startup_yaw_rate`、`startup_turn_timeout` 和起步目标距离范围见
+`config/exploration.yaml`。
+
 在线多层地图节点本身只建立、更新和显示地图，不发布导航目标；一键组合入口中的
 导航目标仍由原有单层探索节点产生，SCAN 负责执行。原有单层探索入口不启动此地图节点，
 保持原来的行走策略。
+
+## 第二阶段预览：表面图与跨层候选 A*
+
+在线多层地图节点现在还会根据已观测表面建立一张只读的局部表面图。图的每个节点是
+一个具体 `(x, y, 实测高度)` 表面；同一水平格的上下表面保持为不同节点。只有相邻
+水平格均有足够支撑、没有已知净空障碍，且高度差不超过坡度或单级台阶阈值时才连边。
+搜索以机体当前位置附近、与 `机体 z - graph_nominal_body_height` 相符的表面为起点，
+用 A* 寻找图上可达且高于起点的橙色台阶候选。搜索半径、节点数和高度阈值在
+`config/multi_layer_map.yaml` 中配置；地图每轮更新后都会重建预览，旧路径会被清除。
+
+RViz 中浅灰点是抽样显示的图节点，浅绿细线是抽样显示的相邻连接，黄色球是上升台阶
+候选，紫红粗线是 A* 找到的候选路线。路线的高度是地面表面高度，尚未换算成机体目标
+高度。`/exploration/layers/graph_preview` 发布这些 Marker；
+`/exploration/layers/candidate_path` 发布同一路径的 `nav_msgs/Path`，仅供检查，
+不会进入 `/scan/goal` 或 `/scan/waypoint_input`。
+
+`/exploration/layers/status` 新增 `graph_state`、`graph_nodes`、`graph_edges`、
+`graph_rising_candidates`、`graph_path_points` 等字段。`graph_nodes_truncated=true`
+表示局部候选表面超出本轮搜索节点上限，搜索结果只覆盖保留的节点。`preview_path_observed` 表示
+路径上表面的净空已有观测证据；`preview_path_clearance_unobserved` 表示路径上还有
+未确认净空。`rising_candidates_unreachable_in_window` 只表示当前局部搜索窗口内
+候选不可达，不能据此判定整张地图没有楼梯。表面图只检查局部高度、支撑和净空，
+尚未完成机体扫掠体积、足端落点及动态执行验证，因此路径不能直接用于跨层控制。
 
 ## 输入和输出
 
@@ -93,12 +128,14 @@ ros2 launch legbot_exploration multi_layer_exploration_demo.launch.py
   适配器可选择 Gazebo 真值、FAST-LIO2 或 FAST-LIVO2。若 SCAN 正在运行，还会读取
   `/local_planner/grid_map/occupancy_inflate` 过滤被规划器判为障碍的目标。
 - 输出：`/exploration/frontiers` (MarkerArray)、`/exploration/status` (JSON String)，
-  以及由机体里程计累计的 `/exploration/trajectory` (Path)。轨迹从探索节点启动时
+  `/exploration/planned_path` (Path) 以及由机体里程计累计的
+  `/exploration/trajectory` (Path)。轨迹从探索节点启动时
   开始记录，每移动约 0.1 m 增加一点，RViz 中显示为绿色线。平层 RViz 固定
   `map` 视角概览整块场地，三种定位来源使用同一个视图。
 - 自动导航时，目标发到 `/scan/waypoint_input`，由既有
   `scan_waypoint_mission` 以 `direct` 模式转发到 `/scan/goal`。节点根据转发目标的
-  时间戳、`/scan/goal_stop_ack` 和 `/scan/mission_complete` 判断本次目标完成。
+  时间戳、`/scan/goal_stop_ack` 和 `/scan/mission_complete` 判断本次路点完成；
+  探索节点随后复查并发送所选路径的下一路点。
   若机器人已在 `goal_reach_xy` 内停留 `near_goal_dwell` 秒而 SCAN 未回执，
   探索节点先请求清除旧路点，成功后以 `goal_reached`、
   `detail=proximity_fallback` 记录到达，避免反复记为 `no_progress`。
@@ -108,8 +145,8 @@ ros2 launch legbot_exploration multi_layer_exploration_demo.launch.py
 ## 探索方案、公式与策略
 
 本包按“配准点云与位姿 → 累计三维证据 → 同层二维投影 → 前沿聚类与选点 →
-SCAN 执行 → 根据新观测重新选点”的闭环运行。C++ 的 `exploration_core.cpp` 和
-Python 的 `exploration_core.py` 使用相同的核心规则；定位来源由上游适配器选择，
+同层层析图或二维占据图规划 → SCAN 逐段执行 → 根据新观测重新选点”的闭环运行。
+探索节点包含双路线选择和逐段执行；定位来源由上游适配器选择，
 本包只读取统一的 `/slam/*` 接口。以下公式描述的是**当前代码**，其中 $r$ 为网格分辨率，
 默认 $r=0.25\,\mathrm m$；位置与点云都处于统一的 `map` 坐标系。
 
@@ -179,8 +216,9 @@ D(f)=\min_{\pi:s\leadsto f}\;
 \end{cases}
 $$
 
-路径不穿过膨胀障碍；斜向移动时，只要相邻的一个正交格被挡住，就不走该斜边。
-未知格可以经过，但默认代价为已知空闲格的 $1.5$ 倍。对簇 $C$ 中按簇中心距离
+路径的中间格只使用已观察空闲格，未知格仅能作为前沿终点；斜向移动时，
+两个相邻正交格也必须是已观察空闲格。前沿终点的代价按默认倍率 $1.5$ 计入。
+对簇 $C$ 中按簇中心距离
 排序后第一个通过路径、距离和抑制检查的前沿格 $f_C$，代码计算：
 
 $$
@@ -189,9 +227,21 @@ $$
 
 其中 $w_g=$ `frontier_gain_weight`，$w_d=$ `path_cost_weight`。
 各簇比较 $J$，选择得分最高的候选。若 $f_C$ 超过 `max_goal_distance`，
-沿最短路径回溯，选择距离合适的**已观察空闲格** $g_C$ 作中途目标；
-机器人到达后重新建图、重新选点。此时评分中的 $D(f_C)$ 仍是原前沿格的路径代价，
-实际下发的是 $g_C$。
+沿最短路径回溯，选择距离合适的**已观察空闲格** $g_C$ 作候选观察目标；
+此时评分中的 $D(f_C)$ 仍是原前沿格的路径代价。C++ 执行器再为候选目标生成
+一条经过已观察空闲格的路线：优先尝试同层层析表面图 A*；若没有可用表面路径，
+则使用二维占据图 A*。两种路径只用于选择参考目标点，不替 SCAN 决定具体走法。
+按路径长度每约 `route_segment_length`（默认 3 m）选一个已知空闲且膨胀安全的目标点，
+整条路线最多选 3 个，通过 `/exploration/planned_path` 显示，并依次发送到
+`/scan/waypoint_input`。地图更新后只复查尚未发送的目标点及当前目标点；
+目标点失去安全余量时清除该目标并重新选点。两类规划共用同一个执行接口。
+两种路线共用下发前的机体占用圆盘检查：以 `robot_radius + waypoint_safety_margin`
+为半径，圆盘覆盖的每个二维格都必须已有空闲观测；未知格和已知障碍都拒绝该路点。
+还会复核新鲜 SCAN 膨胀障碍图；层析图新鲜时，检查路点的地面支撑和已知净空障碍。
+地图更新后，活动路点和下一个路点都会重新检查。机器人当前所在格不作为
+目标点安全门槛；路点之间的实际运动路线由 SCAN 根据实时障碍规划。
+对于未知前沿，执行终点还须能从已知空闲格直视该前沿，并比基本机体半径多留
+`0.15 m` 的已知障碍余量。
 
 ### 4. 无普通前沿与目标失败时的策略
 
@@ -296,7 +346,7 @@ RViz。默认 `localization_source:=gazebo`，使用由 Gazebo 真值转换到 `
 
 一键入口只开放 `localization_source` 和 `control_start_delay` 两个参数；默认
 从启动流程开始计时，12 秒后启动 GO2 高层控制，可用
-`control_start_delay:=20.0` 调整。需要观察模式或 Python 实现时，使用下方
+`control_start_delay:=20.0` 调整。需要观察模式时，使用下方
 `exploration.launch.py` 分终端启动。完整顺序见项目根目录的
 `自主探索启动指南.md`。
 
@@ -317,14 +367,13 @@ source install/setup.sh
 ros2 launch legbot_exploration exploration.launch.py observation_only:=false
 ```
 
-只想观察选点时，将 `observation_only:=false` 改为 `true`；需要 Python 实现时，
-在同一命令末尾添加 `impl:=python`。默认实现为 C++，两个实现不要同时运行。
+只想观察选点时，将 `observation_only:=false` 改为 `true`。
 
-两个实现共用 `config/exploration.yaml`。地图逐帧用已配准点云及同时间戳的
+探索节点读取 `config/exploration.yaml`。地图逐帧用已配准点云及同时间戳的
 雷达、机体位姿做射线更新：观察过的空闲体素、障碍体素和未观察体素分开保存。
 体素的 Z 以**观测时的机体高度**为原点，故同层行走时定位的整体高度漂移不会
-把早期观测从当前投影中排除。规划选点允许路径经过未知格，未知格不会因缺少
-支撑而被判成障碍，符合当前 SCAN 策略。候选目标是 Frontier 簇里的实际未知格，
+把早期观测从当前投影中排除。路径中间格限定为已观察空闲格；前沿未知格
+只用于选取观察方向，执行目标落在其附近的已观察空闲格。候选前沿仍是 Frontier 簇里的实际未知格，
 而非可能落在障碍内的几何质心。已观察的障碍和新近收到的 SCAN 膨胀障碍都会
 参与筛选；活动目标若持续落入 SCAN 障碍，会提前撤销并暂时抑制。
 
@@ -358,7 +407,7 @@ SCAN 障碍等筛选后没有可选前沿格；此状态不会宣布完成。
 候选前沿格数和通过规模门槛的簇数；它们与完成验收用的
 `global_frontier_cells` 不是同一个计数。
 `reachable_frontier_cells`、`candidate_goals`、`suppressed_goals`、`open_start_neighbors`
-用于区分地图断连、目标冷却与起点周围被障碍膨胀包围。只有存在合格前沿簇、
+用于区分地图断连、目标冷却与起点周围已观察空闲格的数量。只有存在合格前沿簇、
 却没有可达前沿格和候选目标时，全图模式才会从本次实际行驶轨迹里选择约 2–4 m
 的已观察空闲回退点；状态的 `detail=recovery_backtrack` 表示正在执行这一步。
 回退后若新增已观测 XY 格少于 `recovery_min_new_cells`，暂不重复回退；到达目标后
@@ -372,10 +421,15 @@ SCAN 障碍等筛选后没有可选前沿格；此状态不会宣布完成。
 其中可能包含障碍膨胀覆盖或已知障碍隔开的格子，不能仅凭这一计数逐格判定
 未知格的物理成因。
 `map_capacity_reached` 表示体素上限已到，需增大容量或重启探索。
+`route_source` 表示当前选用了 `layer` 或 `occupancy` 参考路线，`route_stages` 和
+`route_stage_index` 表示待发送目标点总数和当前序号。二维图即使在机器人当前
+位置附近尚未形成连通参考路径，也只按已知空闲及膨胀余量寻找安全观察目标；
+是否能到达该目标由 SCAN 的实时规划决定。
 
 当前版本适用于同层、平坦场景的首次联调。未知区按未占据处理，不具备悬崖或
-无地面支撑自动停车能力。普通入口仍按 `local_search_radius` 做局部搜索；
-平层入口先在配置矩形内选点，必要时扩展到完整累计地图。矩形覆盖网格用于
+无地面支撑自动停车能力。默认 `global_search: true`，先在配置矩形内选点，
+必要时扩展到完整累计地图；如需局部搜索，可在参数文件中显式设置 `false`。
+矩形覆盖网格用于
 显示和仿真验收；它的边界不再决定探索完成。
 
 可用 Gazebo 平面场景做独立验收。仿真运行时，在另一个终端执行：
@@ -395,7 +449,6 @@ ros2 run legbot_exploration verify_flat_coverage.py
 ## 核心测试
 
 ```bash
-PYTHONPATH=python python3 -m unittest discover -s test -p test_core.py
 g++ -std=c++17 -Icpp/include cpp/src/exploration_core.cpp test/test_core.cpp -o /tmp/legbot_exploration_core_test
 /tmp/legbot_exploration_core_test
 PYTHONPATH=python python3 -m unittest discover -s test -p test_truth_coverage.py

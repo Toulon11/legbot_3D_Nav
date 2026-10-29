@@ -103,8 +103,6 @@ def setup(context):
             })]))
     actions.append(TimerAction(period=delay + 3.0, actions=[include(
             'legbot_exploration', 'exploration.launch.py', {
-                'localization_source': source,
-                'impl': 'cpp',
                 'use_sim_time': 'true',
                 'observation_only': 'false',
                 'start_waypoint_coordinator': 'true',

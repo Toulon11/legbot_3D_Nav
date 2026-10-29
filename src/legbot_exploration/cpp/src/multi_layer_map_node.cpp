@@ -1,10 +1,13 @@
 #include "legbot_exploration/multi_layer_map.hpp"
+#include "legbot_exploration/surface_graph.hpp"
 
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -118,6 +121,34 @@ sensor_msgs::msg::PointCloud2 make_surface_cloud(
   }
   return msg;
 }
+
+geometry_msgs::msg::Point marker_point(const le::LayerPoint &point, double lift = 0.0) {
+  geometry_msgs::msg::Point result;
+  result.x = point.x;
+  result.y = point.y;
+  result.z = point.z + lift;
+  return result;
+}
+
+visualization_msgs::msg::Marker make_marker(
+    const std_msgs::msg::Header &header, int id, int type,
+    float red, float green, float blue, float alpha, double scale) {
+  visualization_msgs::msg::Marker marker;
+  marker.header = header;
+  marker.ns = "surface_graph_preview";
+  marker.id = id;
+  marker.type = type;
+  marker.action = visualization_msgs::msg::Marker::ADD;
+  marker.pose.orientation.w = 1.0;
+  marker.color.r = red;
+  marker.color.g = green;
+  marker.color.b = blue;
+  marker.color.a = alpha;
+  marker.scale.x = scale;
+  marker.scale.y = scale;
+  marker.scale.z = scale;
+  return marker;
+}
 }  // namespace
 
 class OnlineLayerMapNode : public rclcpp::Node {
@@ -138,6 +169,19 @@ class OnlineLayerMapNode : public rclcpp::Node {
     sync_tolerance_ = declare_parameter<double>("sensor_sync_tolerance", 0.05);
     publish_period_ = declare_parameter<double>("publish_period", 1.0);
     max_display_surfaces_ = declare_parameter<int>("max_display_surfaces", 120000);
+    graph_config_.xy_resolution = xy_resolution_;
+    graph_config_.max_step_height = get_parameter("max_step_height").as_double();
+    graph_config_.max_slope_radians = get_parameter("max_slope_radians").as_double();
+    graph_config_.min_support_columns = get_parameter("min_support_columns").as_int();
+    graph_config_.search_radius = declare_parameter<double>("graph_search_radius", 7.0);
+    graph_config_.min_height_gain = declare_parameter<double>("graph_min_height_gain", 0.07);
+    graph_config_.nominal_body_height = declare_parameter<double>("graph_nominal_body_height", 0.32);
+    graph_config_.start_xy_tolerance = declare_parameter<double>("graph_start_xy_tolerance", 0.45);
+    graph_config_.start_z_tolerance = declare_parameter<double>("graph_start_z_tolerance", 0.30);
+    graph_config_.max_nodes = declare_parameter<int>("graph_max_nodes", 25000);
+    graph_config_.max_preview_candidates = declare_parameter<int>("graph_max_preview_candidates", 128);
+    graph_config_.max_preview_nodes = declare_parameter<int>("graph_max_preview_nodes", 4000);
+    graph_config_.max_preview_edges = declare_parameter<int>("graph_max_preview_edges", 6000);
     if (point_stride_ < 1 || max_points_ < 1 || max_rays_ < 1 || sync_tolerance_ <= 0 ||
         publish_period_ <= 0 || max_display_surfaces_ < 1)
       throw std::invalid_argument("invalid layer map node configuration");
@@ -149,6 +193,10 @@ class OnlineLayerMapNode : public rclcpp::Node {
         "/exploration/layers/ceilings", map_qos);
     status_pub_ = create_publisher<std_msgs::msg::String>(
         "/exploration/layers/status", map_qos);
+    graph_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/exploration/layers/graph_preview", map_qos);
+    graph_path_pub_ = create_publisher<nav_msgs::msg::Path>(
+        "/exploration/layers/candidate_path", map_qos);
     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         cloud_topic, rclcpp::SensorDataQoS(),
         [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { on_cloud(*msg); });
@@ -283,6 +331,16 @@ class OnlineLayerMapNode : public rclcpp::Node {
     header.stamp = now();
     surface_pub_->publish(make_surface_cloud(all, stride, xy_resolution_, header));
     ceiling_pub_->publish(make_cloud(ceilings, ceiling_colors, header));
+    le::SurfaceGraphPreview graph;
+    if (base_history_.empty()) {
+      graph.state = "waiting_for_base_odometry";
+    } else if (seconds_apart(base_history_.back().header.stamp, header.stamp) > 2.0) {
+      graph.state = "base_odometry_stale";
+    } else {
+      const auto &p = base_history_.back().pose.pose.position;
+      graph = le::search_rising_surface(all, {p.x, p.y, p.z}, graph_config_);
+    }
+    publish_graph(graph, header);
     const le::LayerMapStats stats = map_.stats();
     ++publish_cycles_;
     if (stats.version == 0 && (publish_cycles_ == 1 || publish_cycles_ % 10 == 0)) {
@@ -312,13 +370,69 @@ class OnlineLayerMapNode : public rclcpp::Node {
          << ",\"last_sampled_points\":" << last_sampled_points_
          << ",\"last_rays_requested\":" << last_rays_requested_
          << ",\"integration_ms\":" << last_integration_ms_
-         << ",\"rebuilt_columns\":" << rebuilt << ",\"update_ms\":" << elapsed << '}';
+         << ",\"rebuilt_columns\":" << rebuilt << ",\"update_ms\":" << elapsed
+         << ",\"graph_state\":\"" << graph.state
+         << "\",\"graph_nodes\":" << graph.graph_nodes
+         << ",\"graph_edges\":" << graph.graph_edges
+         << ",\"graph_nodes_truncated\":"
+         << (graph.nodes_truncated ? "true" : "false")
+         << ",\"graph_rising_candidates\":" << graph.rising_candidates
+         << ",\"graph_expanded_nodes\":" << graph.expanded_nodes
+         << ",\"graph_path_points\":" << graph.path.size()
+         << ",\"graph_path_clearance_unobserved\":"
+         << (graph.contains_unobserved_clearance ? "true" : "false") << '}';
     std_msgs::msg::String status;
     status.data = json.str();
     status_pub_->publish(status);
   }
 
+  void publish_graph(const le::SurfaceGraphPreview &graph,
+                     const std_msgs::msg::Header &header) {
+    using Marker = visualization_msgs::msg::Marker;
+    visualization_msgs::msg::MarkerArray message;
+    // Replacing the complete preview also clears a stale path after a map edit.
+    Marker clear;
+    clear.header = header;
+    clear.action = Marker::DELETEALL;
+    message.markers.push_back(clear);
+    auto nodes = make_marker(header, 0, Marker::POINTS, 0.75f, 0.75f, 0.75f, 0.45f, 0.035);
+    for (const auto &point : graph.preview_nodes)
+      nodes.points.push_back(marker_point(point, 0.025));
+    message.markers.push_back(std::move(nodes));
+    auto edges = make_marker(header, 1, Marker::LINE_LIST, 0.15f, 0.8f, 0.35f, 0.45f, 0.015);
+    for (const auto &[from, to] : graph.preview_edges) {
+      edges.points.push_back(marker_point(from, 0.035));
+      edges.points.push_back(marker_point(to, 0.035));
+    }
+    message.markers.push_back(std::move(edges));
+    auto candidates = make_marker(header, 2, Marker::SPHERE_LIST,
+                                  1.0f, 0.65f, 0.0f, 0.9f, 0.11);
+    for (const auto &point : graph.preview_candidates)
+      candidates.points.push_back(marker_point(point, 0.075));
+    message.markers.push_back(std::move(candidates));
+    auto route = make_marker(header, 3, Marker::LINE_STRIP,
+                             1.0f, 0.1f, 0.9f, 1.0f, 0.075);
+    for (const auto &point : graph.path)
+      route.points.push_back(marker_point(point, 0.10));
+    message.markers.push_back(std::move(route));
+    graph_pub_->publish(message);
+
+    nav_msgs::msg::Path path;
+    path.header = header;
+    for (const auto &point : graph.path) {
+      geometry_msgs::msg::PoseStamped pose;
+      pose.header = header;
+      pose.pose.position.x = point.x;
+      pose.pose.position.y = point.y;
+      pose.pose.position.z = point.z + 0.10;
+      pose.pose.orientation.w = 1.0;
+      path.poses.push_back(std::move(pose));
+    }
+    graph_path_pub_->publish(path);
+  }
+
   le::OnlineLayerMap map_;
+  le::SurfaceGraphConfig graph_config_;
   double xy_resolution_ = 0.10;
   std::string frame_id_;
   int point_stride_ = 1, max_points_ = 12000, max_rays_ = 1200;
@@ -334,6 +448,8 @@ class OnlineLayerMapNode : public rclcpp::Node {
   rclcpp::Subscription<Odom>::SharedPtr sensor_sub_, base_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr surface_pub_, ceiling_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr graph_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr graph_path_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 

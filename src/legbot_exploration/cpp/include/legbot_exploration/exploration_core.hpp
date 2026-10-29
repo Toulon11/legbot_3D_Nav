@@ -12,7 +12,7 @@
 
 namespace legbot_exploration {  // 把本包的名字与其他 C++ 包隔开，避免重名。
 
-// 算法参数：默认值与 Python 版 Settings 对应，可由 ROS YAML 覆盖。
+// 算法参数：可由 ROS YAML 覆盖。
 struct Settings {
   double resolution = 0.25;             // 一个网格边长为 0.25 米。
   double max_ray_range = 9.0;           // 跳过超过 9 米的雷达点。
@@ -22,8 +22,10 @@ struct Settings {
   double free_min_relative_z = -0.45;   // 投影二维空闲格的最低高度。
   double robot_radius = 0.35;           // 避障时使用的机器人半径。
   double planner_occupancy_radius = 0.0; // SCAN 障碍图已膨胀的半径；外部障碍只补足差额。
+  double planner_occupancy_resolution = 0.10; // SCAN 障碍格边长，用于核对格子的实际范围。
+  double waypoint_safety_margin = 0.05; // 下发路点时在机体半径外再留出的余量。
   double local_search_radius = 10.0;    // 局部前沿搜索半径，单位米。
-  bool global_search = false;           // true 时先在矩形内选点，再查完整累计地图。
+  bool global_search = false;           // 由 ROS 配置决定是否进行全图搜索。
   double exploration_min_x = -31.5;     // 全图边界：X 最小值。
   double exploration_max_x = -0.5;      // 全图边界：X 最大值。
   double exploration_min_y = -15.5;     // 全图边界：Y 最小值。

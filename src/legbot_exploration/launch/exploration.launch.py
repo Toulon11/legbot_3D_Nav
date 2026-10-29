@@ -21,8 +21,6 @@ from launch_ros.parameter_descriptions import ParameterValue
 
 # 根据启动参数安排本次要启动的节点。
 def setup(context):
-    source = LaunchConfiguration('localization_source').perform(context)
-    impl = LaunchConfiguration('impl').perform(context)
     odom = '/slam/global_odometry_base'
     cloud = '/slam/global_cloud_registered'
     sensor_pose = '/slam/odometry_lidar'
@@ -48,7 +46,7 @@ def setup(context):
     # 把本次结果放入容器，供下一轮处理。
     actions.append(Node(
         package='legbot_exploration',
-        executable='explorer_cpp' if impl == 'cpp' else 'explorer_py',
+        executable='explorer_cpp',
         name='legbot_explorer',
         output='screen',
         parameters=[
@@ -87,9 +85,6 @@ def setup(context):
 def generate_launch_description():
     # 返回本启动文件的参数及启动动作。
     return LaunchDescription([
-        DeclareLaunchArgument('localization_source', default_value='fastlio',
-                              choices=['gazebo', 'fastlio', 'fastlivo']),
-        DeclareLaunchArgument('impl', default_value='cpp', choices=['cpp', 'python']),
         DeclareLaunchArgument('use_sim_time', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('observation_only', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('start_waypoint_coordinator', default_value='true',

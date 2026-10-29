@@ -23,8 +23,19 @@
     free_min_relative_z: -0.45            # 二维投影纳入的最低高度，单位米。
     robot_radius: 0.35                    # 机器人避障膨胀半径，单位米。
     planner_occupancy_radius: 0.0        # SCAN 输入障碍图已膨胀半径；0 保持独立启动时的旧行为。
+    planner_occupancy_resolution: 0.10   # SCAN 障碍格边长；须与 scan.yaml 一致。
+    waypoint_safety_margin: 0.05         # 下发路点时机体膨胀圆盘外额外留出的距离，单位米。
     local_search_radius: 10.0             # 局部搜索时的半径，单位米。
-    global_search: false                  # true 时先在矩形内选点，再查完整累计地图的前沿。
+    global_search: true                   # 默认全图搜索：先在矩形内选点，再查完整累计地图的前沿。
+    layer_surface_resolution: 0.10        # 在线层析图的水平栅格边长；同层路径优先由它规划。
+    layer_nominal_body_height: 0.32       # 机体到支撑面的名义高度，单位米。
+    layer_surface_timeout: 2.5           # 超过此时间未收到层析图，回退到二维占据路径。
+    route_segment_length: 3.0            # 参考路径每约 3 米选一个目标点，整条路线最多 3 个；实际走法由 SCAN 决定。
+    startup_scan_enabled: true            # 起点有观测盲区时，先原地转向建图，再寻找附近安全目标。
+    startup_yaw_rate: 0.35                # 起步建图转向角速度，单位弧度/秒。
+    startup_turn_timeout: 30.0            # 转满一圈的最长等待时间，单位秒。
+    startup_goal_min_distance: 0.65       # 起步目标与机体的最小水平距离，单位米。
+    startup_goal_max_distance: 2.0        # 起步目标与机体的最大水平距离，单位米。
     bounds_relative_to_start: false       # true 时把边界坐标加到起始机体位置上。
     exploration_min_x: -31.5              # 全图搜索区域的最小 X，单位米。
     exploration_max_x: -0.5               # 全图搜索区域的最大 X，单位米。
@@ -35,7 +46,7 @@
     min_frontier_cells: 3                 # 至少 3 个相连前沿格才算一个有效簇。
     frontier_gain_weight: 1.0             # 簇规模收益在评分中的权重。
     path_cost_weight: 1.0                 # 路径代价在评分中的权重。
-    unknown_path_multiplier: 1.5         # 经过未知格的路径成本倍率。
+    unknown_path_multiplier: 1.5         # 仅前沿终点未知格的评分成本倍率；中间路径不走未知格。
     goal_reach_xy: 0.55                   # 水平距离小于此值视为接近目标，单位米。
     progress_distance: 0.35              # 距离目标至少缩短这么多才算有进度，单位米。
     progress_timeout: 12.0               # 连续无进度达到此秒数后清除目标。

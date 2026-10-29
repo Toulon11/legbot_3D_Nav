@@ -21,8 +21,8 @@ import time
 # 导入 geometry_msgs.msg 提供的类型或函数。
 from geometry_msgs.msg import PoseStamped
 # 导入 nav_msgs.msg 提供的类型或函数。
-from nav_msgs.msg import Odometry
-# 导入 Python 版 ROS 2 节点接口。
+from nav_msgs.msg import Odometry, Path
+# 导入测试客户端使用的 ROS 2 Python 接口。
 import rclpy
 # 导入 rclpy.qos 提供的类型或函数。
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
@@ -68,7 +68,9 @@ def main():
         '/tmp/legbot_exploration_handoff_mission.json', '--dwell-seconds', '0.1'])
     explorer = launch_process([
         sys.argv[1], '--ros-args', '--params-file', config,
-        '-p', 'use_sim_time:=false', '-p', 'observation_only:=false'])
+        '-p', 'use_sim_time:=false', '-p', 'observation_only:=false',
+        '-p', 'min_goal_distance:=2.5', '-p', 'global_search:=false',
+        '-p', 'startup_scan_enabled:=false'])
     rclpy.init()
     node = rclpy.create_node('exploration_handoff_test')
     sensor_pub = node.create_publisher(Odometry, '/slam/odometry_lidar', qos_profile_sensor_data)
@@ -79,15 +81,17 @@ def main():
     state_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                            durability=DurabilityPolicy.TRANSIENT_LOCAL)
     ready_pub = node.create_publisher(Bool, '/go2/demo_ready', state_qos)
-    goals, statuses = [], []
+    goals, statuses, planned_paths = [], [], []
     node.create_subscription(PoseStamped, '/scan/goal', goals.append, 10)
+    node.create_subscription(Path, '/exploration/planned_path', planned_paths.append,
+                             state_qos)
     node.create_subscription(String, '/exploration/status',
                              # 把本次结果放入容器，供下一轮处理。
                              lambda msg: statuses.append(json.loads(msg.data)), state_qos)
-    points = [(4.0 * math.cos(i * math.pi / 100 - math.pi / 2),
-               4.0 * math.sin(i * math.pi / 100 - math.pi / 2), -0.61)
+    points = [(4.0 * math.cos(i * 2 * math.pi / 3600),
+               4.0 * math.sin(i * 2 * math.pi / 3600), -0.61)
               # 依次处理集合中的每一项。
-              for i in range(101)]
+              for i in range(3600)]
     succeeded = False
     ack_start = None
     # 先执行可能抛出异常的 ROS 数据读取。
@@ -119,19 +123,24 @@ def main():
             if goals:
                 assert goals[0].pose.position.z == 0.0, 'SCAN same-floor goal must have z=0'
                 # 条件检查：对应数据还没有取得或初始化；成立才进入下面的分支。
-                if ack_start is None:
-                    ack_start = time.monotonic()
-                if time.monotonic() - ack_start < 2.0:
+                if ack_start is None or ack_start[0] != len(goals):
+                    ack_start = (len(goals), time.monotonic())
+                if time.monotonic() - ack_start[1] < 2.0:
                     # 把更新后的 ROS 消息发布到相应话题。
-                    ack_pub.publish(goals[0])
+                    ack_pub.publish(goals[-1])
             rclpy.spin_once(node, timeout_sec=0.1)
-            if any(item['state'] == 'goal_reached' for item in statuses):
+            if (len(goals) >= 2 and
+                    math.hypot(goals[0].pose.position.x - goals[1].pose.position.x,
+                               goals[0].pose.position.y - goals[1].pose.position.y) > 0.3 and
+                    any(len(path.poses) >= 3 for path in planned_paths) and
+                    any(item.get('route_stage_index', 0) >= 1 for item in statuses)):
                 succeeded = True
                 # 找到满足条件的结果，退出当前循环。
                 break
         if not succeeded:
-            raise AssertionError('Goal handoff did not complete; goals=%d, states=%s' %
-                                 (len(goals), [item['state'] for item in statuses[-12:]]))
+            raise AssertionError('Staged route handoff did not advance; goals=%d, states=%s' %
+                                 (len(goals), [(item['state'], item.get('detail'))
+                                               for item in statuses[-12:]]))
         print('PASS', sys.argv[1], 'forwarded_goal=',
               (goals[0].pose.position.x, goals[0].pose.position.y))
     # 无论是否发生异常，最后都清理 ROS 资源。
