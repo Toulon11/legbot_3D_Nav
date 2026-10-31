@@ -75,8 +75,23 @@ class OnlineLayerMap {
                         double stamp_seconds = 0.0, std::size_t ray_stride = 1);
   std::size_t rebuild_dirty();
   std::vector<LayerSurface> surfaces() const;
+  // Occupied 3-D cells are planning evidence, including vertical obstacle
+  // returns that cannot become a supported walking surface.
+  std::vector<LayerPoint> occupied_voxels() const;
+  template <class Visitor> void for_each_surface(Visitor visitor) const {
+    for (const auto &entry : surfaces_)
+      for (const auto &surface : entry.second) visitor(surface);
+  }
+  template <class Visitor> void for_each_occupied(Visitor visitor) const {
+    for (const auto &voxel : occupied_) {
+      visitor(LayerPoint{(voxel.x + 0.5) * cfg_.xy_resolution,
+                         (voxel.y + 0.5) * cfg_.xy_resolution,
+                         (voxel.z + 0.5) * cfg_.z_resolution});
+    }
+  }
   std::vector<LayerSurface> surfaces_at(double x, double y) const;
   LayerMapStats stats() const;
+  uint64_t version() const { return version_; }
   bool full() const { return map_full_; }
 
  private:
@@ -121,6 +136,7 @@ class OnlineLayerMap {
 
   LayerMapConfig cfg_;
   std::unordered_map<Voxel, Evidence, VoxelHash> evidence_;
+  std::unordered_set<Voxel, VoxelHash> occupied_;
   std::unordered_map<Cell, std::vector<int>, CellHash> column_z_;
   std::unordered_map<Cell, std::vector<LayerSurface>, CellHash> surfaces_;
   std::unordered_set<Cell, CellHash> dirty_;

@@ -56,6 +56,7 @@ void OnlineLayerMap::update(const Voxel &v, bool hit, bool downward_hit, double 
   Evidence &e = it->second;
   e.last_observed = stamp_seconds;
   const bool was_occupied = e.score > 0;
+  const bool was_indexed = was_occupied && e.hits > 0;
   if (hit) {
     e.score = std::min(8, e.score + 3);
     if (e.hits < std::numeric_limits<int>::max()) {
@@ -79,6 +80,11 @@ void OnlineLayerMap::update(const Voxel &v, bool hit, bool downward_hit, double 
   }
   if (hit || was_occupied != (e.score > 0) || e.rays == 3)
     mark_dirty({v.x, v.y});
+  const bool is_indexed = e.score > 0 && e.hits > 0;
+  if (was_indexed != is_indexed) {
+    if (is_indexed) occupied_.insert(v);
+    else occupied_.erase(v);
+  }
 }
 
 std::size_t OnlineLayerMap::integrate(const LayerPoint &origin,
@@ -264,6 +270,13 @@ std::vector<LayerSurface> OnlineLayerMap::surfaces() const {
   for (const auto &entry : surfaces_)
     all.insert(all.end(), entry.second.begin(), entry.second.end());
   return all;
+}
+
+std::vector<LayerPoint> OnlineLayerMap::occupied_voxels() const {
+  std::vector<LayerPoint> points;
+  points.reserve(occupied_.size());
+  for_each_occupied([&](const LayerPoint &point) { points.push_back(point); });
+  return points;
 }
 
 std::vector<LayerSurface> OnlineLayerMap::surfaces_at(double x, double y) const {

@@ -1,4 +1,4 @@
-/**:
+/online_layer_map:
   ros__parameters:
     use_sim_time: true
     frame_id: map
@@ -26,6 +26,7 @@
     max_points_per_cloud: 12000
     max_rays_per_cloud: 1200
     publish_period: 1.0
+    publish_map_topics: true        #在线层析图节点是否发布层析图(平面和占据体素)信息
     max_display_surfaces: 120000
     # Read-only cross-layer A* preview. These topics never command SCAN.
     graph_search_radius: 7.0

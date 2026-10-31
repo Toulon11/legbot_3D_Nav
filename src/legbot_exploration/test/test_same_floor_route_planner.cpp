@@ -83,33 +83,6 @@ int main() {
   for (const auto &point : viewpoints)
     assert(waypoint_footprint_safety(point, grid, cfg, {}) == WaypointSafety::safe);
 
-  // A surface graph still needs observed-free corridor evidence on every edge.
-  Settings small;
-  small.resolution = 0.1;
-  small.robot_radius = 0.0;
-  std::unordered_map<Cell, int, CellHash> fine_grid;
-  std::vector<LayerSurface> surfaces;
-  for (int x = -1; x <= 5; ++x)
-    for (int y = -1; y <= 1; ++y) fine_grid[{x, y}] = 0;
-  for (int x = 0; x < 5; ++x) {
-    LayerSurface s;
-    s.x_cell = x; s.y_cell = 0; s.height = 0.0;
-    s.kind = SurfaceKind::flat;
-    s.clearance = ClearanceKind::observed_clear;
-    s.support_columns = 6; s.hit_observations = 3;
-    surfaces.push_back(s);
-  }
-  auto surface = plan_surface_route(surfaces, {0.05, 0.05, 0.32},
-                                    {0.45, 0.05}, 0.1, 0.32, fine_grid, small, {});
-  assert(surface.reason == "ok");
-  auto surface_stages = stage_surface_route(surface, fine_grid, small, {},
-                                            surfaces, 0.1, 0.0, 0.2);
-  assert(!surface_stages.empty() && surface_stages.back() == XY({0.45, 0.05}));
-  fine_grid.erase({2, 0});
-  surface = plan_surface_route(surfaces, {0.05, 0.05, 0.32},
-                               {0.45, 0.05}, 0.1, 0.32, fine_grid, small, {});
-  assert(surface.points.empty());
-
   RecoveryPlanner recovery(3, 2.0);
   recovery.record_failure({0.0, 0.0}, "planning_failed");
   recovery.record_failure({1.0, 0.0}, "planning_failed");

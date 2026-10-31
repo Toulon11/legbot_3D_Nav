@@ -1,7 +1,11 @@
 #include "legbot_exploration/route_orchestrator.hpp"
 #include "legbot_exploration/recovery_planner.hpp"
+#include "legbot_exploration/layer_route_planner.hpp"
 
 #include <cmath>
+#include <chrono>
+#include <mutex>
+#include <shared_mutex>
 #include <utility>
 
 namespace legbot_exploration {
@@ -46,13 +50,17 @@ std::vector<PlannerResult> plan_candidates(
     if (goal.mode == ExplorationMode::recovery)
       occupancy_result.strict_reason = occupancy_result.reason;
     if (occupancy_result.reason == "ok") {
-      occupancy_result.waypoints = stage_occupancy_route(
-          occupancy_result.route, snapshot.grid, snapshot.settings,
-          snapshot.scan_obstacles, snapshot.segment_length,
-          goal.mode == ExplorationMode::recovery ? nullptr :
-              snapshot.free_observations);
-      if (occupancy_result.waypoints.empty())
-        occupancy_result.reason = "occupancy_staging_failed";
+      if (goal.mode == ExplorationMode::recovery) {
+        occupancy_result.waypoints = stage_occupancy_route(
+            occupancy_result.route, snapshot.grid, snapshot.settings,
+            snapshot.scan_obstacles, snapshot.segment_length);
+        if (occupancy_result.waypoints.empty())
+          occupancy_result.reason = "recovery_staging_failed";
+      } else {
+        occupancy_result.waypoints.assign(
+            occupancy_result.route.points.begin() + 1,
+            occupancy_result.route.points.end());
+      }
     } else if (goal.mode == ExplorationMode::recovery) {
       occupancy_result.route = plan_recovery_direct_route(
           snapshot.grid, start, goal.observation, snapshot.settings,
@@ -67,24 +75,49 @@ std::vector<PlannerResult> plan_candidates(
     results.push_back(std::move(occupancy_result));
   }
 
-  if (goal.request_layer && snapshot.layer_fresh) {
+  if (goal.request_layer && snapshot.layer_fresh &&
+      (snapshot.layer_occupied || snapshot.shared_layer)) {
     PlannerResult layer_result;
     layer_result.goal = goal;
     layer_result.kind = PlannerKind::layer;
     layer_result.source = "layer";
-    layer_result.route = plan_surface_route(
-        snapshot.surfaces, snapshot.base, goal.observation,
-        snapshot.layer_resolution, snapshot.body_height, snapshot.grid,
-        snapshot.settings, snapshot.scan_obstacles);
-    layer_result.reason = layer_result.route.reason;
-    if (layer_result.reason == "ok") {
-      layer_result.waypoints = stage_surface_route(
-          layer_result.route, snapshot.grid, snapshot.settings,
-          snapshot.scan_obstacles, snapshot.surfaces, snapshot.layer_resolution,
-          snapshot.base[2] - snapshot.body_height, snapshot.segment_length);
-      if (layer_result.waypoints.empty())
-        layer_result.reason = "layer_staging_failed";
+    const auto started = std::chrono::steady_clock::now();
+    LayerPlan layer_plan;
+    if (snapshot.shared_layer) {
+      auto &shared = *snapshot.shared_layer;
+      // Announce the pause before waiting for an in-flight map callback.
+      shared.planning_active.store(true);
+      try {
+        {
+          std::unique_lock<std::shared_mutex> write_lock(shared.mutex);
+          shared.map->rebuild_dirty();
+        }
+        {
+          std::shared_lock<std::shared_mutex> read_lock(shared.mutex);
+          layer_plan = plan_layer_route(*shared.map, snapshot.base,
+              goal.observation, snapshot.layer_resolution,
+              snapshot.body_height, snapshot.settings,
+              snapshot.segment_length, 7.0,
+              snapshot.layer_planning_timeout_ms);
+        }
+      } catch (...) {
+        shared.planning_active.store(false);
+        throw;
+      }
+      shared.planning_active.store(false);
+    } else {
+      layer_plan = plan_layer_route(
+          snapshot.surfaces, *snapshot.layer_occupied, snapshot.base,
+          goal.observation, snapshot.layer_resolution, snapshot.body_height,
+          snapshot.settings, snapshot.segment_length);
     }
+    layer_result.planning_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - started).count();
+    if (snapshot.shared_layer)
+      snapshot.shared_layer->last_planning_ms.store(layer_result.planning_ms);
+    layer_result.route = std::move(layer_plan.reference);
+    layer_result.waypoints = std::move(layer_plan.waypoints);
+    layer_result.reason = layer_result.route.reason;
     results.push_back(std::move(layer_result));
   }
   return results;
@@ -114,13 +147,22 @@ const PlannerResult *select_plan(
 }
 
 bool PathProcessor::load(const PlanningGoal &goal, const PlannerResult &result,
-                         bool recovery) {
+                         bool recovery, const PlanningSnapshot *snapshot) {
   if (!result.usable() || result.goal.goal_id != goal.goal_id ||
       result.goal.attempt_id != goal.attempt_id ||
       result.goal.occupancy_version != goal.occupancy_version ||
       result.goal.layer_version != goal.layer_version)
     return false;
-  waypoints_ = result.waypoints;
+  auto execution_waypoints = result.waypoints;
+  if (result.kind == PlannerKind::occupancy && !recovery) {
+    if (!snapshot) return false;
+    execution_waypoints = stage_occupancy_route(
+        result.route, snapshot->grid, snapshot->settings,
+        snapshot->scan_obstacles, snapshot->segment_length,
+        snapshot->free_observations);
+    if (execution_waypoints.empty()) return false;
+  }
+  waypoints_ = std::move(execution_waypoints);
   index_ = 0;
   source_ = result.source;
   recovery_ = recovery;

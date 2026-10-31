@@ -1,5 +1,5 @@
-# ROS 2 参数文件：/** 表示这些参数可供本包中任意节点读取。
-/**:
+# 仅供探索节点读取；组合进程中的在线层析图使用独立参数。
+/legbot_explorer:
   # 固定键名；下面缩进四格的项目才是真正的参数。
   ros__parameters:
     frame_id: map                         # 统一地图坐标系；里程计和点云必须与它一致。
@@ -30,6 +30,7 @@
     layer_surface_resolution: 0.10        # 在线层析图的水平栅格边长；同层路径优先由它规划。
     layer_nominal_body_height: 0.32       # 机体到支撑面的名义高度，单位米。
     layer_surface_timeout: 2.5           # 超过此时间未收到层析图，回退到二维占据路径。
+    layer_planning_timeout_ms: 2000.0    # 同进程层析规划的耗时上限；超时改用二维候选。
     route_segment_length: 3.0            # 两种已验证路径按距离分段；不固定路点数。
     recovery_failure_limit: 3            # 同一物理区域连续失败达到此次数后进入脱困。
     recovery_area_radius: 2.0            # 失败区域的水平合并半径，单位米。

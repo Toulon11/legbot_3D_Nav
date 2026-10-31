@@ -1,5 +1,6 @@
 #include "legbot_exploration/multi_layer_map.hpp"
 #include "legbot_exploration/surface_graph.hpp"
+#include "legbot_exploration/exploration_node_factories.hpp"
 
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -17,6 +18,8 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -153,8 +156,9 @@ visualization_msgs::msg::Marker make_marker(
 
 class OnlineLayerMapNode : public rclcpp::Node {
  public:
-  OnlineLayerMapNode()
-      : Node("online_layer_map"), map_(read_config()) {
+  explicit OnlineLayerMapNode(std::shared_ptr<le::SharedLayerMap> shared = {})
+      : Node("online_layer_map"), map_(read_config()), shared_(std::move(shared)) {
+    if (shared_) shared_->map = &map_;
     xy_resolution_ = get_parameter("xy_resolution").as_double();
     frame_id_ = declare_parameter<std::string>("frame_id", "map");
     const auto cloud_topic = declare_parameter<std::string>(
@@ -168,6 +172,7 @@ class OnlineLayerMapNode : public rclcpp::Node {
     max_rays_ = declare_parameter<int>("max_rays_per_cloud", 1200);
     sync_tolerance_ = declare_parameter<double>("sensor_sync_tolerance", 0.05);
     publish_period_ = declare_parameter<double>("publish_period", 1.0);
+    publish_map_topics_ = declare_parameter<bool>("publish_map_topics", true);
     max_display_surfaces_ = declare_parameter<int>("max_display_surfaces", 120000);
     graph_config_.xy_resolution = xy_resolution_;
     graph_config_.max_step_height = get_parameter("max_step_height").as_double();
@@ -189,6 +194,10 @@ class OnlineLayerMapNode : public rclcpp::Node {
     auto map_qos = rclcpp::QoS(1).transient_local().reliable();
     surface_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
         "/exploration/layers/surfaces", map_qos);
+    planning_surface_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/exploration/layers/planning_surfaces", map_qos);
+    planning_occupied_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+        "/exploration/layers/planning_occupied", map_qos);
     ceiling_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
         "/exploration/layers/ceilings", map_qos);
     status_pub_ = create_publisher<std_msgs::msg::String>(
@@ -260,6 +269,10 @@ class OnlineLayerMapNode : public rclcpp::Node {
 
   void on_cloud(const sensor_msgs::msg::PointCloud2 &cloud) {
     ++cloud_messages_seen_;
+    if (shared_ && shared_->planning_active.load()) {
+      ++shared_->dropped_planning;
+      return;
+    }
     if (cloud.header.frame_id != frame_id_) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
                            "Cloud frame %s differs from layer map frame %s",
@@ -299,7 +312,16 @@ class OnlineLayerMapNode : public rclcpp::Node {
         1, (points.size() + static_cast<std::size_t>(max_rays_) - 1) /
                static_cast<std::size_t>(max_rays_));
     const auto started = std::chrono::steady_clock::now();
+    std::unique_lock<std::shared_mutex> map_lock;
+    if (shared_) {
+      map_lock = std::unique_lock<std::shared_mutex>(shared_->mutex, std::try_to_lock);
+      if (!map_lock.owns_lock() || shared_->planning_active.load()) {
+        ++shared_->dropped_planning;
+        return;
+      }
+    }
     integrated_points_ += map_.integrate(origin, points, stamp_seconds, ray_stride);
+    if (shared_) shared_->current_version.store(map_.version());
     last_integration_ms_ = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - started).count();
     last_raw_cloud_points_ = static_cast<std::size_t>(cloud.width) * cloud.height;
@@ -310,8 +332,25 @@ class OnlineLayerMapNode : public rclcpp::Node {
 
   void publish_map() {
     const auto started = std::chrono::steady_clock::now();
+    std::unique_lock<std::shared_mutex> map_lock;
+    if (shared_) {
+      if (shared_->planning_active.load()) return;
+      map_lock = std::unique_lock<std::shared_mutex>(shared_->mutex);
+      if (shared_->planning_active.load()) return;
+    }
     const std::size_t rebuilt = map_.rebuild_dirty();
-    const auto all = map_.surfaces();
+    const auto all = publish_map_topics_ ? map_.surfaces() :
+        std::vector<le::LayerSurface>{};
+    const auto occupied = publish_map_topics_ ? map_.occupied_voxels() :
+        std::vector<le::LayerPoint>{};
+    const le::LayerMapStats stats = map_.stats();
+    if (map_lock.owns_lock()) map_lock.unlock();
+    if (shared_) {
+      shared_->published_surfaces.store(stats.surfaces);
+      shared_->published_wall_seconds.store(
+          std::chrono::duration<double>(std::chrono::steady_clock::now()
+              .time_since_epoch()).count());
+    }
     const std::size_t stride = std::max<std::size_t>(
         1, (all.size() + static_cast<std::size_t>(max_display_surfaces_) - 1) /
                static_cast<std::size_t>(max_display_surfaces_));
@@ -329,10 +368,18 @@ class OnlineLayerMapNode : public rclcpp::Node {
     std_msgs::msg::Header header;
     header.frame_id = frame_id_;
     header.stamp = now();
-    surface_pub_->publish(make_surface_cloud(all, stride, xy_resolution_, header));
-    ceiling_pub_->publish(make_cloud(ceilings, ceiling_colors, header));
+    if (publish_map_topics_) {
+      surface_pub_->publish(make_surface_cloud(all, stride, xy_resolution_, header));
+      // Display decimation never changes the full planning topics.
+      planning_surface_pub_->publish(make_surface_cloud(all, 1, xy_resolution_, header));
+      planning_occupied_pub_->publish(make_cloud(
+          occupied, std::vector<uint32_t>(occupied.size(), 0xff3030u), header));
+      ceiling_pub_->publish(make_cloud(ceilings, ceiling_colors, header));
+    }
     le::SurfaceGraphPreview graph;
-    if (base_history_.empty()) {
+    if (!publish_map_topics_) {
+      graph.state = "map_topics_disabled";
+    } else if (base_history_.empty()) {
       graph.state = "waiting_for_base_odometry";
     } else if (seconds_apart(base_history_.back().header.stamp, header.stamp) > 2.0) {
       graph.state = "base_odometry_stale";
@@ -340,8 +387,7 @@ class OnlineLayerMapNode : public rclcpp::Node {
       const auto &p = base_history_.back().pose.pose.position;
       graph = le::search_rising_surface(all, {p.x, p.y, p.z}, graph_config_);
     }
-    publish_graph(graph, header);
-    const le::LayerMapStats stats = map_.stats();
+    if (publish_map_topics_) publish_graph(graph, header);
     ++publish_cycles_;
     if (stats.version == 0 && (publish_cycles_ == 1 || publish_cycles_ % 10 == 0)) {
       RCLCPP_WARN(get_logger(),
@@ -366,6 +412,10 @@ class OnlineLayerMapNode : public rclcpp::Node {
          << clouds_received_ << ",\"dropped_sync\":" << dropped_sync_
          << ",\"integrated_points\":" << integrated_points_
          << ",\"cloud_messages_seen\":" << cloud_messages_seen_
+         << ",\"dropped_planning\":"
+         << (shared_ ? shared_->dropped_planning.load() : 0)
+         << ",\"last_layer_planning_ms\":"
+         << (shared_ ? shared_->last_planning_ms.load() : 0.0)
          << ",\"last_raw_cloud_points\":" << last_raw_cloud_points_
          << ",\"last_sampled_points\":" << last_sampled_points_
          << ",\"last_rays_requested\":" << last_rays_requested_
@@ -432,11 +482,13 @@ class OnlineLayerMapNode : public rclcpp::Node {
   }
 
   le::OnlineLayerMap map_;
+  std::shared_ptr<le::SharedLayerMap> shared_;
   le::SurfaceGraphConfig graph_config_;
   double xy_resolution_ = 0.10;
   std::string frame_id_;
   int point_stride_ = 1, max_points_ = 12000, max_rays_ = 1200;
   int max_display_surfaces_ = 120000;
+  bool publish_map_topics_ = true;
   double sync_tolerance_ = 0.05, publish_period_ = 1.0;
   double last_integration_ms_ = 0.0;
   uint64_t clouds_received_ = 0, dropped_sync_ = 0, integrated_points_ = 0;
@@ -447,12 +499,20 @@ class OnlineLayerMapNode : public rclcpp::Node {
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Subscription<Odom>::SharedPtr sensor_sub_, base_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr surface_pub_, ceiling_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr planning_surface_pub_,
+      planning_occupied_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr graph_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr graph_path_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 
+std::shared_ptr<rclcpp::Node> make_online_layer_map_node(
+    std::shared_ptr<le::SharedLayerMap> shared) {
+  return std::make_shared<OnlineLayerMapNode>(std::move(shared));
+}
+
+#ifndef LEGBOT_EXPLORATION_NO_MAIN
 int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
   try { rclcpp::spin(std::make_shared<OnlineLayerMapNode>()); }
@@ -464,3 +524,4 @@ int main(int argc, char **argv) {
   rclcpp::shutdown();
   return 0;
 }
+#endif

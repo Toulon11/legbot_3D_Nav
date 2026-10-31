@@ -15,7 +15,6 @@ def generate_launch_description():
     bringup = share('legbot_bringup')
     exploration = share('legbot_exploration')
     exploration_demo = os.path.join(exploration, 'launch', 'exploration_demo.launch.py')
-    layer_config = os.path.join(exploration, 'config', 'multi_layer_map.yaml')
     rviz_config = os.path.join(exploration, 'rviz', 'multi_layer_map.rviz')
 
     return LaunchDescription([
@@ -42,13 +41,10 @@ def generate_launch_description():
                 'gazebo_gui': LaunchConfiguration('gazebo_gui'),
                 'planner_safety': 'true',
                 'scan_robot_radius': LaunchConfiguration('scan_robot_radius'),
+                'layer_map_in_process': 'true',
             }.items()),
-        # Keep these nodes in this launch file. In particular, the RViz
-        # condition has a distinct name from exploration_demo's start_rviz,
-        # which is set to false above to avoid opening two RViz windows.
-        Node(package='legbot_exploration', executable='online_layer_map_cpp',
-             name='online_layer_map', output='screen',
-             parameters=[layer_config, {'use_sim_time': True}]),
+        # The combined executable owns both explorer and map nodes. RViz
+        # still receives the unchanged complete map topics from the map node.
         Node(package='rviz2', executable='rviz2',
              name='multi_layer_map_rviz', output='screen',
              arguments=['-d', rviz_config],

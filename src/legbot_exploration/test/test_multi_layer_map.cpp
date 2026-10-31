@@ -39,6 +39,19 @@ int main() {
   map.rebuild_dirty();
   for (const auto &surface : map.surfaces())
     assert(std::abs(surface.height - 0.42) >= 0.01);
+  bool vertical_return_preserved = false;
+  for (const auto &point : map.occupied_voxels())
+    if (std::abs(point.x - 0.05) < 0.01 &&
+        std::abs(point.y - 0.05) < 0.01 &&
+        std::abs(point.z - 0.45) < 0.01)
+      vertical_return_preserved = true;
+  assert(vertical_return_preserved);
+  std::size_t indexed_occupied = 0;
+  map.for_each_occupied([&](const le::LayerPoint &) { ++indexed_occupied; });
+  assert(indexed_occupied == map.occupied_voxels().size());
+  std::size_t indexed_surfaces = 0;
+  map.for_each_surface([&](const le::LayerSurface &) { ++indexed_surfaces; });
+  assert(indexed_surfaces == map.surfaces().size());
   bool ceiling_blocks_lower = false;
   for (const auto &surface : map.surfaces())
     if (surface.x_cell == 0 && surface.y_cell == 0 && surface.height < 0.1 &&
@@ -65,6 +78,10 @@ int main() {
     if (surface.x_cell == 0 && surface.y_cell == 0 && surface.height < 0.1 &&
         surface.clearance != le::ClearanceKind::blocked) cleared = true;
   assert(cleared);
+  for (const auto &point : map.occupied_voxels())
+    assert(!(std::abs(point.x - 0.05) < 0.01 &&
+             std::abs(point.y - 0.05) < 0.01 &&
+             std::abs(point.z - 0.35) < 0.01));
 
   // A lone high return is visible as a candidate, but not a supported floor.
   for (int i = 0; i < 2; ++i)

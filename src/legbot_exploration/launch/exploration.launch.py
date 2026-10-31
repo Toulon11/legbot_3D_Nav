@@ -27,6 +27,7 @@ def setup(context):
     use_sim_time = LaunchConfiguration('use_sim_time')
     flat_safety = LaunchConfiguration('flat_safety').perform(context) == 'true'
     planner_safety = LaunchConfiguration('planner_safety').perform(context) == 'true'
+    combined_layer_map = LaunchConfiguration('layer_map_in_process').perform(context) == 'true'
 
     # 将计算结果保存为 actions（启动文件返回的启动动作列表）。
     actions = []
@@ -46,11 +47,13 @@ def setup(context):
     # 把本次结果放入容器，供下一轮处理。
     actions.append(Node(
         package='legbot_exploration',
-        executable='explorer_cpp',
-        name='legbot_explorer',
+        executable='combined_exploration_cpp' if combined_layer_map else 'explorer_cpp',
+        name=None if combined_layer_map else 'legbot_explorer',
         output='screen',
         parameters=[
             os.path.join(share('legbot_exploration'), 'config', 'exploration.yaml'),
+            *([os.path.join(share('legbot_exploration'), 'config',
+                            'multi_layer_map.yaml')] if combined_layer_map else []),
             {
                 'use_sim_time': ParameterValue(use_sim_time, value_type=bool),
                 'observation_only': ParameterValue(
@@ -94,6 +97,8 @@ def generate_launch_description():
         DeclareLaunchArgument('planner_safety', default_value='false',
                               choices=['true', 'false']),
         DeclareLaunchArgument('planner_occupancy_radius', default_value='0.0'),
+        DeclareLaunchArgument('layer_map_in_process', default_value='false',
+                              choices=['true', 'false']),
         # 等参数解析后才运行 setup，选择要启动的节点。
         OpaqueFunction(function=setup),
     ])

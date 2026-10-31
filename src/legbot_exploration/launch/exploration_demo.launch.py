@@ -115,6 +115,8 @@ def setup(context):
                     LaunchConfiguration('scan_robot_radius').perform(context)
                     if flat_world or LaunchConfiguration('planner_safety').perform(context) == 'true'
                     else '0.0'),
+                'layer_map_in_process': LaunchConfiguration(
+                    'layer_map_in_process').perform(context),
             })]))
     # 返回本函数计算得到的结果。
     return actions
@@ -142,6 +144,8 @@ def generate_launch_description():
         DeclareLaunchArgument('planner_safety', default_value='false',
                               choices=['true', 'false'],
                               description='Require current SCAN occupancy and use wider clearance for exploration goals.'),
+        DeclareLaunchArgument('layer_map_in_process', default_value='false',
+                              choices=['true', 'false']),
         DeclareLaunchArgument('scan_robot_radius', default_value='0.20',
                               description='SCAN local obstacle inflation radius in metres.'),
         # 等参数解析后才运行 setup，选择要启动的节点。

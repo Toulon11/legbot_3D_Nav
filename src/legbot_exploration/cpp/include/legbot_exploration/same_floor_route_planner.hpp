@@ -1,7 +1,6 @@
 #pragma once
 
 #include "legbot_exploration/single_floor_exploration.hpp"
-#include "legbot_exploration/multi_layer_map.hpp"
 
 #include <string>
 #include <unordered_map>
@@ -51,21 +50,6 @@ PlannedRoute plan_occupancy_route(
     const std::vector<XY> &inflated_scan_obstacles,
     const FreeObservationCounts *free_observations = nullptr);
 
-// Same-floor surface A*: support and overhead classification are checked on
-// every node. The route is only a candidate; SCAN still validates execution.
-PlannedRoute plan_surface_route(const std::vector<LayerSurface> &surfaces,
-                                const Point &base, const XY &target,
-                                double resolution, double nominal_body_height,
-                                const std::unordered_map<Cell, int, CellHash> &grid,
-                                const Settings &cfg,
-                                const std::vector<XY> &inflated_scan_obstacles,
-                                double search_radius = 7.0);
-
-bool route_conflicts_with_layer(const PlannedRoute &route,
-                                const std::vector<LayerSurface> &surfaces,
-                                double resolution, double ground_height,
-                                double robot_radius);
-
 // Only for a connected occupancy A* route: shortcut across fully observed,
 // inflated-free corridors and split long straight portions as needed.
 std::vector<XY> stage_occupancy_route(
@@ -75,14 +59,5 @@ std::vector<XY> stage_occupancy_route(
     const std::vector<XY> &inflated_scan_obstacles,
     double max_segment_length = 3.0,
     const FreeObservationCounts *free_observations = nullptr);
-
-// Preserve the supported surface graph while simplifying only verified
-// corridors. Every emitted segment must satisfy both maps.
-std::vector<XY> stage_surface_route(
-    const PlannedRoute &route,
-    const std::unordered_map<Cell, int, CellHash> &grid,
-    const Settings &cfg, const std::vector<XY> &inflated_scan_obstacles,
-    const std::vector<LayerSurface> &surfaces, double layer_resolution,
-    double ground_height, double max_segment_length = 3.0);
 
 }  // namespace legbot_exploration

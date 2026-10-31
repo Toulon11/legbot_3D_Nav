@@ -1,6 +1,8 @@
 #pragma once
 
 #include "legbot_exploration/same_floor_route_planner.hpp"
+#include "legbot_exploration/multi_layer_map.hpp"
+#include "legbot_exploration/shared_layer_map.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -39,6 +41,7 @@ struct PlannerResult {
   // Keep both outcomes so the fallback cannot hide an unsafe start.
   std::string strict_reason;
   std::string direct_reason;
+  double planning_ms = 0.0;
 
   bool usable() const { return route.points.size() >= 2 && !waypoints.empty(); }
 };
@@ -54,6 +57,9 @@ struct PlanningSnapshot {
   double segment_length = 3.0;
   bool layer_fresh = false;
   const FreeObservationCounts *free_observations = nullptr;
+  const std::vector<Point> *layer_occupied = nullptr;
+  SharedLayerMap *shared_layer = nullptr;
+  double layer_planning_timeout_ms = 2000.0;
 };
 
 struct ExecutionResult {
@@ -79,7 +85,8 @@ const PlannerResult *select_plan(
 // only after feedback for the current waypoint has been accepted.
 class PathProcessor {
  public:
-  bool load(const PlanningGoal &goal, const PlannerResult &result, bool recovery);
+  bool load(const PlanningGoal &goal, const PlannerResult &result, bool recovery,
+            const PlanningSnapshot *snapshot = nullptr);
   void clear();
   bool active() const { return index_ < waypoints_.size(); }
   bool advance();

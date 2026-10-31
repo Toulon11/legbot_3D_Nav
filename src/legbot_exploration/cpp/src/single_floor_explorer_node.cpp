@@ -2,6 +2,7 @@
 #include "legbot_exploration/same_floor_route_planner.hpp"
 #include "legbot_exploration/route_orchestrator.hpp"
 #include "legbot_exploration/recovery_planner.hpp"
+#include "legbot_exploration/exploration_node_factories.hpp"
 
 #include <geometry_msgs/msg/pose_stamped.hpp> // ROS2 消息：姿态（位置+方向）
 #include <geometry_msgs/msg/twist.hpp> // 起步原地转向请求
@@ -64,9 +65,9 @@ namespace {
 // 定义保存相关数据或行为的 C++ 类型。
 class Explorer : public rclcpp::Node {
  public:
-   Explorer()
+   explicit Explorer(std::shared_ptr<le::SharedLayerMap> shared = {})
        : Node("legbot_explorer"),               // ROS2 节点名
-         map_(declare_settings()) {               // 读取参数并创建体素地图
+         map_(declare_settings()), shared_layer_(std::move(shared)) { // 读取参数并创建体素地图
 
      // ---------- 参数读取 ----------  RMK:fastlivo2发布是话题名称需要与参数一致 后面需要修改
      frame_id_ = declare_parameter<std::string>("frame_id", "map"); // 坐标系 ID
@@ -106,6 +107,8 @@ class Explorer : public rclcpp::Node {
      layer_resolution_ = declare_parameter<double>("layer_surface_resolution", 0.10);
      layer_body_height_ = declare_parameter<double>("layer_nominal_body_height", 0.32);
      layer_timeout_ = declare_parameter<double>("layer_surface_timeout", 2.5);
+     layer_planning_timeout_ms_ = declare_parameter<double>(
+         "layer_planning_timeout_ms", 2000.0);
      route_segment_length_ = declare_parameter<double>("route_segment_length", 3.0);
      const int recovery_failure_limit = declare_parameter<int>("recovery_failure_limit", 3);
      const double recovery_area_radius = declare_parameter<double>("recovery_area_radius", 2.0);
@@ -119,6 +122,7 @@ class Explorer : public rclcpp::Node {
      recovery_max_turn_steps_ = declare_parameter<int>("recovery_max_turn_steps", 4);
      recovery_retry_interval_ = declare_parameter<double>("recovery_retry_interval", 10.0);
      if (layer_resolution_ <= 0.0 || layer_body_height_ <= 0.0 ||
+         layer_planning_timeout_ms_ <= 0.0 ||
          layer_timeout_ <= 0.0 || route_segment_length_ <= 0.0 ||
          recovery_failure_limit < 1 || recovery_area_radius <= 0.0 ||
          recovery_yaw_rate_ <= 0.0 || recovery_yaw_rate_ > 0.6 ||
@@ -221,9 +225,16 @@ class Explorer : public rclcpp::Node {
                stamp_ns(msg->start_time) + 500000000LL >= active_->input_stamp)
              active_scan_bspline_ = *msg;
          });
-     layer_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-         "/exploration/layers/surfaces", state_qos,
-         [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { on_layers(*msg); });
+     if (!shared_layer_) {
+       layer_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+           "/exploration/layers/planning_surfaces", state_qos,
+           [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { on_layers(*msg); });
+       layer_occupied_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+           "/exploration/layers/planning_occupied", state_qos,
+           [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+             on_layer_occupied(*msg);
+           });
+     }
      // 订阅一个 ROS 话题，收到数据时调用对应回调。
      ready_sub_ = create_subscription<std_msgs::msg::Bool>(
          ready_topic, state_qos,
@@ -590,7 +601,7 @@ class Explorer : public rclcpp::Node {
        occupancy_wall_ = wall_now();
    }
 
-   // 接收层析图表面快照；它只提供路径候选，真正发给 SCAN 前还要检查占据图。
+   // 接收未抽稀的层析表面快照；层析路线的安全检查只使用层析证据。
    void on_layers(const sensor_msgs::msg::PointCloud2 &msg) {
      if (msg.header.frame_id != frame_id_ || msg.is_bigendian || msg.point_step < 29)
        return;
@@ -638,7 +649,25 @@ class Explorer : public rclcpp::Node {
      }
      layer_surfaces_ = std::move(surfaces);
      layer_wall_ = wall_now();
+     layer_stamp_ = stamp_ns(msg.header.stamp);
      ++layer_version_;
+   }
+
+   void on_layer_occupied(const sensor_msgs::msg::PointCloud2 &msg) {
+     if (msg.header.frame_id != frame_id_) return;
+     std::vector<le::Point> occupied;
+     occupied.reserve(static_cast<std::size_t>(msg.width) * msg.height);
+     try {
+       sensor_msgs::PointCloud2ConstIterator<float> x(msg, "x"), y(msg, "y"), z(msg, "z");
+       for (; x != x.end(); ++x, ++y, ++z)
+         if (std::isfinite(*x) && std::isfinite(*y) && std::isfinite(*z))
+           occupied.push_back({*x, *y, *z});
+     } catch (const std::runtime_error &) {
+       return;
+     }
+     layer_occupied_ = std::move(occupied);
+     layer_occupied_wall_ = wall_now();
+     layer_occupied_stamp_ = stamp_ns(msg.header.stamp);
    }
 
    // 判断 SCAN 障碍点云是否仍在有效时限内。
@@ -1161,6 +1190,9 @@ class Explorer : public rclcpp::Node {
    // 路点已经落在当前位置的到达范围内时，不再把它交给 SCAN 规划零距离轨迹。
    bool skip_nearby_route_waypoints() {
      if (!base_) return false;
+     // Layer execution waypoints are owned by the layer planner. Forward them
+     // unchanged, including their first point.
+     if (path_processor_.source() == "layer") return path_processor_.active();
      const le::XY position{(*base_)[0], (*base_)[1]};
      route_skipped_nearby_ += path_processor_.skip_within(position, goal_reach_xy_);
      return path_processor_.active();
@@ -1498,8 +1530,16 @@ class Explorer : public rclcpp::Node {
      if (recovery && base_)
        recovery_last_target_distance_ = xy_distance(
            {(*base_)[0], (*base_)[1]}, target);
-     const bool layer_fresh = layer_wall_ > 0.0 &&
-         wall_now() - layer_wall_ <= layer_timeout_ && !layer_surfaces_.empty();
+     if (shared_layer_)
+       layer_version_ = shared_layer_->current_version.load();
+     const bool layer_fresh = shared_layer_ ?
+         (shared_layer_->map != nullptr &&
+          shared_layer_->published_surfaces.load() > 0 &&
+          wall_now() - shared_layer_->published_wall_seconds.load() <= layer_timeout_) :
+         (layer_wall_ > 0.0 && layer_occupied_wall_ > 0.0 &&
+         wall_now() - layer_wall_ <= layer_timeout_ &&
+         wall_now() - layer_occupied_wall_ <= layer_timeout_ &&
+         layer_stamp_ == layer_occupied_stamp_ && !layer_surfaces_.empty());
      auto viewpoints = recovery ? std::vector<le::XY>{target} :
          le::observation_viewpoints(grid, target, cfg_, obstacles);
      if (viewpoints.empty()) {
@@ -1523,8 +1563,10 @@ class Explorer : public rclcpp::Node {
      const auto &free_observations = map_.free_observation_frames();
      const le::PlanningSnapshot snapshot{grid, obstacles, layer_surfaces_, cfg_,
          *base_, layer_resolution_, layer_body_height_, route_segment_length_,
-         layer_fresh, &free_observations};
+         layer_fresh, &free_observations, &layer_occupied_,
+         shared_layer_.get(), layer_planning_timeout_ms_};
      std::string failure = "no_planner_result";
+     bool layer_timed_out = false;
      for (std::size_t i = 0; i < std::min<std::size_t>(viewpoints.size(), 12); ++i) {
        le::PlanningGoal goal;
        goal.goal_id = ++goal_id_;
@@ -1534,7 +1576,7 @@ class Explorer : public rclcpp::Node {
        goal.target = target;
        goal.observation = viewpoints[i];
        goal.mode = control_mode_;
-       goal.request_layer = layer_fresh && !recovery;
+       goal.request_layer = layer_fresh && !recovery && !layer_timed_out;
        goal.request_recovery = recovery;
        {
          std_msgs::msg::String message;
@@ -1553,6 +1595,9 @@ class Explorer : public rclcpp::Node {
        }
        auto results = le::plan_candidates(goal, snapshot);
        for (const auto &result : results) {
+         if (result.kind == le::PlannerKind::layer &&
+             result.reason == "layer_planning_timeout")
+           layer_timed_out = true;
          publish_candidate_path(result);
          std_msgs::msg::String message;
          std::ostringstream out;
@@ -1563,6 +1608,7 @@ class Explorer : public rclcpp::Node {
              << ",\"planner\":\"" << le::planner_name(result.kind)
              << "\",\"usable\":" << (result.usable() ? "true" : "false")
              << ",\"waypoints\":" << result.waypoints.size()
+             << ",\"planning_ms\":" << result.planning_ms
              << ",\"reason\":\"" << result.reason << "\"";
          if (recovery) {
            out << ",\"target_distance\":" << recovery_last_target_distance_
@@ -1583,7 +1629,7 @@ class Explorer : public rclcpp::Node {
          if (!result.usable()) failure = result.reason;
        }
        const auto *chosen = le::select_plan(goal, results);
-       if (!chosen || !path_processor_.load(goal, *chosen, recovery)) continue;
+       if (!chosen || !path_processor_.load(goal, *chosen, recovery, &snapshot)) continue;
        route_selection_target_ = target;
        route_skipped_nearby_ = 0;
        if (!skip_nearby_route_waypoints()) {
@@ -2007,6 +2053,11 @@ class Explorer : public rclcpp::Node {
    std::uint64_t goal_id_ = 0, planning_attempt_id_ = 0;
    std::size_t layer_version_ = 0;
    std::vector<le::LayerSurface> layer_surfaces_;
+   std::shared_ptr<le::SharedLayerMap> shared_layer_;
+   double layer_planning_timeout_ms_ = 2000.0;
+   std::vector<le::Point> layer_occupied_;
+   std::int64_t layer_stamp_ = 0, layer_occupied_stamp_ = 0;
+   double layer_occupied_wall_ = 0.0;
    std::optional<le::Point> base_; // 基座位置（x,y,z）
    std::optional<Active> active_; // 当前活动目标信息
    std::optional<scan_planner::msg::Bspline> active_scan_bspline_;
@@ -2062,6 +2113,7 @@ class Explorer : public rclcpp::Node {
    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr raw_occupancy_sub_;
    rclcpp::Subscription<scan_planner::msg::Bspline>::SharedPtr scan_bspline_sub_;
    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr layer_sub_;
+   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr layer_occupied_sub_;
    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sensor_sub_, base_sub_; // 雷达与机体位姿订阅者
    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr ready_sub_, complete_sub_, plan_ready_sub_; // 就绪与完成信号订阅者
    bool scan_plan_ready_ = false;
@@ -2073,6 +2125,12 @@ class Explorer : public rclcpp::Node {
    rclcpp::TimerBase::SharedPtr motion_timer_;
 };
 
+std::shared_ptr<rclcpp::Node> make_explorer_node(
+    std::shared_ptr<le::SharedLayerMap> shared) {
+  return std::make_shared<Explorer>(std::move(shared));
+}
+
+#ifndef LEGBOT_EXPLORATION_NO_MAIN
 int main(int argc, char **argv) { // 程序入口，接受命令行参数（ROS2 会通过它解析 remap、参数等）
   rclcpp::init(argc, argv); // 初始化 ROS 2 客户端库，必须在创建任何 Node 之前调用
   try {  // 使用 try/catch 捕获后续可能抛出的异常，防止异常导致进程直接崩溃
@@ -2087,3 +2145,4 @@ int main(int argc, char **argv) { // 程序入口，接受命令行参数（ROS2
   rclcpp::shutdown(); // 正常退出时也要调用 shutdown，确保资源释放
   return 0; // 返回 0 表示程序正常退出
 }
+#endif
