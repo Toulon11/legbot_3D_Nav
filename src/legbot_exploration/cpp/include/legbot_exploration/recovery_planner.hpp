@@ -3,6 +3,7 @@
 #include "legbot_exploration/same_floor_route_planner.hpp"
 
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -12,9 +13,9 @@ enum class RecoveryPhase { idle, nearby, turning, settling, history, blocked };
 
 // Tracks a physical failure episode. A different frontier in the same area
 // does not erase previous no-progress evidence.
-class RecoveryPlanner {
+class RecoveryState {
  public:
-  explicit RecoveryPlanner(int failure_limit = 3, double area_radius = 2.0);
+  explicit RecoveryState(int failure_limit = 3, double area_radius = 2.0);
   void record_failure(const XY &position, const std::string &reason);
   bool limit_reached() const { return failures_ >= failure_limit_; }
   void start(const XY &position);
@@ -25,25 +26,17 @@ class RecoveryPlanner {
   void set_phase(RecoveryPhase phase) { phase_ = phase; }
   const std::string &reason() const { return reason_; }
   bool mark_attempted(const XY &point);
+  bool tried(const XY &point) const;
   void reset_attempts() { attempted_.clear(); }
-  std::vector<XY> nearby_candidates(
-      const std::unordered_map<Cell, int, CellHash> &grid, const XY &start,
-      const Settings &cfg, const std::vector<XY> &scan_obstacles,
-      double min_distance, double max_distance) const;
-  std::vector<XY> historical_candidates(
-      const std::vector<XY> &history, const XY &start,
-      const std::unordered_map<Cell, int, CellHash> &grid,
-      const Settings &cfg, const std::vector<XY> &scan_obstacles) const;
 
  private:
-  bool tried(const XY &point) const;
   int failure_limit_;
   double area_radius_;
   int failures_ = 0;
   std::optional<XY> area_;
   RecoveryPhase phase_ = RecoveryPhase::idle;
   std::string reason_;
-  std::vector<XY> attempted_;
+  std::set<XY> attempted_;
 };
 
 const char *recovery_phase_name(RecoveryPhase phase);

@@ -47,7 +47,8 @@ def setup(context):
     # 把本次结果放入容器，供下一轮处理。
     actions.append(Node(
         package='legbot_exploration',
-        executable='combined_exploration_cpp' if combined_layer_map else 'explorer_cpp',
+        executable='combined_exploration_cpp',
+        arguments=['--exploration-mode=' + ('combined' if combined_layer_map else 'flat')],
         name=None if combined_layer_map else 'legbot_explorer',
         output='screen',
         parameters=[
@@ -65,7 +66,6 @@ def setup(context):
                 'planner_occupancy_radius': float(
                     LaunchConfiguration('planner_occupancy_radius').perform(context)),
                 **({'robot_radius': 0.50,
-                    'max_goal_distance': 4.0,
                     'global_search': True,
                     'bounds_relative_to_start': True,
                     'exploration_min_x': -4.5,
@@ -74,7 +74,6 @@ def setup(context):
                     'exploration_max_y': 9.5,
                     'require_planner_occupancy': True} if flat_safety else {}),
                 **({'robot_radius': 0.50,
-                    'max_goal_distance': 4.0,
                     'require_planner_occupancy': True}
                    if planner_safety and not flat_safety else {}),
             },

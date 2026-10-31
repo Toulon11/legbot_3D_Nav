@@ -92,11 +92,9 @@ template <class EachSurface, class EachOccupied>
 LayerPlan plan_layer_route_impl(EachSurface each_surface, EachOccupied each_occupied,
                            const Point &base, const XY &target,
                            double resolution, double nominal_body_height,
-                           const Settings &cfg, double max_segment_length,
-                           double search_radius, double timeout_ms) {
+                           const Settings &cfg, double timeout_ms) {
   LayerPlan out;
   if (resolution <= 0.0 || nominal_body_height <= 0.0 ||
-      max_segment_length <= 0.0 || search_radius <= 0.0 ||
       cfg.robot_radius < 0.0 || cfg.waypoint_safety_margin < 0.0 ||
       timeout_ms <= 0.0) {
     out.reference.reason = "invalid_layer_planning_config";
@@ -115,7 +113,7 @@ LayerPlan plan_layer_route_impl(EachSurface each_surface, EachOccupied each_occu
       return out;
     }
     const XY p = center_of(cell, resolution);
-    if (distance(p, {base[0], base[1]}) <= search_radius && safety.footprint(p))
+    if (safety.footprint(p))
       nodes.emplace(cell, surface);
   }
   if (nodes.empty()) {
@@ -135,12 +133,15 @@ LayerPlan plan_layer_route_impl(EachSurface each_surface, EachOccupied each_occu
   const auto [start_found, start] = nearest({base[0], base[1]});
   const auto [finish_found, finish] = nearest(target);
   if (!start_found || !finish_found) {
-    out.reference.reason = "surface_endpoint_unobserved";
+    out.reference.reason = !start_found ? "surface_start_unobserved" : "surface_goal_unobserved";
     return out;
   }
-  if (!safety.corridor({base[0], base[1]}, center_of(start, resolution)) ||
-      !safety.corridor(center_of(finish, resolution), target)) {
-    out.reference.reason = "layer_endpoint_corridor_blocked";
+  if (!safety.corridor({base[0], base[1]}, center_of(start, resolution))) {
+    out.reference.reason = "layer_start_corridor_blocked";
+    return out;
+  }
+  if (!safety.corridor(center_of(finish, resolution), target)) {
+    out.reference.reason = "layer_goal_corridor_blocked";
     return out;
   }
   struct QueueItem {
@@ -199,7 +200,6 @@ LayerPlan plan_layer_route_impl(EachSurface each_surface, EachOccupied each_occu
     out.reference.points.push_back(target);
   else
     out.reference.points.back() = target;
-  const double limit = std::min(max_segment_length, cfg.max_goal_distance);
   std::size_t current = 0;
   while (current + 1 < out.reference.points.size()) {
     if (std::chrono::steady_clock::now() >= deadline) {
@@ -209,10 +209,11 @@ LayerPlan plan_layer_route_impl(EachSurface each_surface, EachOccupied each_occu
       return out;
     }
     std::size_t farthest = current;
-    for (std::size_t next = current + 1; next < out.reference.points.size(); ++next)
-      if (distance(out.reference.points[current], out.reference.points[next]) <= limit &&
-          safety.corridor(out.reference.points[current], out.reference.points[next]))
+    for (std::size_t next = out.reference.points.size() - 1; next > current; --next)
+      if (safety.corridor(out.reference.points[current], out.reference.points[next])) {
         farthest = next;
+        break;
+      }
     if (farthest == current) {
       out.reference.reason = "layer_execution_corridor_blocked";
       out.reference.points.clear();
@@ -230,8 +231,7 @@ LayerPlan plan_layer_route(const std::vector<LayerSurface> &surfaces,
                            const std::vector<Point> &occupied_voxels,
                            const Point &base, const XY &target,
                            double resolution, double nominal_body_height,
-                           const Settings &cfg, double max_segment_length,
-                           double search_radius) {
+                           const Settings &cfg) {
   const auto each_surface = [&](auto visit) {
     for (const auto &surface : surfaces) visit(surface);
   };
@@ -240,20 +240,17 @@ LayerPlan plan_layer_route(const std::vector<LayerSurface> &surfaces,
       visit(LayerPoint{point[0], point[1], point[2]});
   };
   return plan_layer_route_impl(each_surface, each_occupied, base, target,
-      resolution, nominal_body_height, cfg, max_segment_length,
-      search_radius, 2000.0);
+      resolution, nominal_body_height, cfg, 2000.0);
 }
 
 LayerPlan plan_layer_route(const OnlineLayerMap &map,
                            const Point &base, const XY &target,
                            double resolution, double nominal_body_height,
-                           const Settings &cfg, double max_segment_length,
-                           double search_radius, double timeout_ms) {
+                           const Settings &cfg, double timeout_ms) {
   const auto each_surface = [&](auto visit) { map.for_each_surface(visit); };
   const auto each_occupied = [&](auto visit) { map.for_each_occupied(visit); };
   return plan_layer_route_impl(each_surface, each_occupied, base, target,
-      resolution, nominal_body_height, cfg, max_segment_length,
-      search_radius, timeout_ms);
+      resolution, nominal_body_height, cfg, timeout_ms);
 }
 
 }  // namespace legbot_exploration

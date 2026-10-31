@@ -40,7 +40,8 @@ def generate_launch_description():
             }.items()),
         Node(
             package='legbot_exploration',
-            executable='online_layer_map_cpp',
+            executable='combined_exploration_cpp',
+            arguments=['--exploration-mode=map'],
             name='online_layer_map',
             output='screen',
             parameters=[config, {'use_sim_time': True}],

@@ -30,8 +30,6 @@ struct Settings {
   double exploration_max_x = -0.5;      // 全图边界：X 最大值。
   double exploration_min_y = -15.5;     // 全图边界：Y 最小值。
   double exploration_max_y = 15.5;      // 全图边界：Y 最大值。
-  double min_goal_distance = 1.0;       // 太近的目标不选，单位米。
-  double max_goal_distance = 8.0;       // 单次下发目标不能超过此距离。
   int min_frontier_cells = 3;           // 一个有效前沿簇至少含 3 格。
   double frontier_gain_weight = 1.0;    // 较大前沿簇在评分中更有利。
   double path_cost_weight = 1.0;        // 较长路径在评分中扣分。

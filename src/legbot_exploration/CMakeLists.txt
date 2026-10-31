@@ -23,29 +23,8 @@ find_package(std_srvs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(scan_planner REQUIRED)
 
-# 将单层探索节点、建图选点、路径规划和路径协调编成 explorer_cpp。
-add_executable(explorer_cpp cpp/src/single_floor_explorer_node.cpp cpp/src/single_floor_exploration.cpp
-  cpp/src/same_floor_route_planner.cpp cpp/src/layer_route_planner.cpp
-  cpp/src/route_orchestrator.cpp
-  cpp/src/recovery_planner.cpp cpp/src/multi_layer_map.cpp)
-# 让编译器能找到 cpp/include/ 下的 single_floor_exploration.hpp。
-target_include_directories(explorer_cpp PRIVATE cpp/include)
-# C++ 代码用到 C++17 的 optional 等特性。
-target_compile_features(explorer_cpp PRIVATE cxx_std_17)
-# 把上方 ROS 依赖的头文件与库链接到 explorer_cpp。
-ament_target_dependencies(explorer_cpp rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs std_srvs visualization_msgs scan_planner)
-# 安装为 ros2 run legbot_exploration explorer_cpp 能找到的位置。
-install(TARGETS explorer_cpp DESTINATION lib/${PROJECT_NAME})
-
-# 在线多层地图独立累计三维证据并发布规划快照；它本身不发送运动目标。
-add_executable(online_layer_map_cpp
-  cpp/src/online_layer_map_node.cpp cpp/src/multi_layer_map.cpp
-  cpp/src/surface_graph.cpp)
-target_include_directories(online_layer_map_cpp PRIVATE cpp/include)
-target_compile_features(online_layer_map_cpp PRIVATE cxx_std_17)
-ament_target_dependencies(online_layer_map_cpp rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs visualization_msgs)
-install(TARGETS online_layer_map_cpp DESTINATION lib/${PROJECT_NAME})
-
+# One executable owns the three supported startup modes. The surface graph
+# remains available for the future cross-layer explorer and RViz preview.
 add_executable(combined_exploration_cpp
   cpp/src/combined_exploration_main.cpp
   cpp/src/single_floor_explorer_node.cpp cpp/src/single_floor_exploration.cpp
@@ -53,12 +32,20 @@ add_executable(combined_exploration_cpp
   cpp/src/route_orchestrator.cpp cpp/src/recovery_planner.cpp
   cpp/src/online_layer_map_node.cpp cpp/src/multi_layer_map.cpp
   cpp/src/surface_graph.cpp)
-target_compile_definitions(combined_exploration_cpp PRIVATE LEGBOT_EXPLORATION_NO_MAIN)
 target_include_directories(combined_exploration_cpp PRIVATE cpp/include)
 target_compile_features(combined_exploration_cpp PRIVATE cxx_std_17)
 ament_target_dependencies(combined_exploration_cpp rclcpp geometry_msgs nav_msgs
   sensor_msgs std_msgs std_srvs visualization_msgs scan_planner)
 install(TARGETS combined_exploration_cpp DESTINATION lib/${PROJECT_NAME})
+# Preserve external ros2 run/benchmark names without compiling duplicate nodes.
+# The single main selects the mode from the invoked executable name.
+install(CODE [[
+  foreach(name explorer_cpp online_layer_map_cpp)
+    set(link "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/lib/legbot_exploration/${name}")
+    file(REMOVE "${link}")
+    file(CREATE_LINK combined_exploration_cpp "${link}" SYMBOLIC)
+  endforeach()
+]])
 
 include(CTest)
 if(BUILD_TESTING)

@@ -16,7 +16,7 @@ int main() {
   for (int y = 1; y <= 3; ++y) grid[{3, y}] = 1;
   const auto route = plan_occupancy_route(grid, {0.5, 2.5}, {6.5, 2.5}, cfg, {});
   assert(route.reason == "ok" && route.points.size() > 2);
-  const auto stages = stage_occupancy_route(route, grid, cfg, {}, 3.0);
+  const auto stages = stage_occupancy_route(route, grid, cfg, {});
   assert(stages.size() >= 2 && stages.back() == XY({6.5, 2.5}));
   for (const auto &point : stages)
     assert(waypoint_footprint_safety(point, grid, cfg, {}) == WaypointSafety::safe);
@@ -39,7 +39,6 @@ int main() {
   Settings evidence_cfg;
   evidence_cfg.resolution = 1.0;
   evidence_cfg.robot_radius = 0.0;
-  evidence_cfg.max_goal_distance = 20.0;
   std::unordered_map<Cell, int, CellHash> evidence_grid;
   FreeObservationCounts evidence_frames;
   for (int x = 0; x <= 8; ++x)
@@ -55,7 +54,7 @@ int main() {
   assert(std::any_of(confident_route.points.begin(), confident_route.points.end(),
                      [](const XY &p) { return std::abs(p[1] - 2.5) > 0.1; }));
   const auto confident_stages = stage_occupancy_route(
-      confident_route, evidence_grid, evidence_cfg, {}, 20.0,
+      confident_route, evidence_grid, evidence_cfg, {},
       &evidence_frames);
   assert(confident_stages.size() > 1);
   assert(confident_stages.back() == XY({8.5, 2.5}));
@@ -83,7 +82,7 @@ int main() {
   for (const auto &point : viewpoints)
     assert(waypoint_footprint_safety(point, grid, cfg, {}) == WaypointSafety::safe);
 
-  RecoveryPlanner recovery(3, 2.0);
+  RecoveryState recovery(3, 2.0);
   recovery.record_failure({0.0, 0.0}, "planning_failed");
   recovery.record_failure({1.0, 0.0}, "planning_failed");
   assert(!recovery.limit_reached());

@@ -16,15 +16,13 @@ LayerPlan plan_layer_route(const std::vector<LayerSurface> &surfaces,
                            const std::vector<Point> &occupied_voxels,
                            const Point &base, const XY &target,
                            double resolution, double nominal_body_height,
-                           const Settings &cfg, double max_segment_length,
-                           double search_radius = 7.0);
+                           const Settings &cfg);
 
 // The caller holds SharedLayerMap::mutex for reading throughout this call.
 // No full surface or occupied-voxel array is materialized.
 LayerPlan plan_layer_route(const OnlineLayerMap &map,
                            const Point &base, const XY &target,
                            double resolution, double nominal_body_height,
-                           const Settings &cfg, double max_segment_length,
-                           double search_radius, double timeout_ms);
+                           const Settings &cfg, double timeout_ms);
 
 }  // namespace legbot_exploration

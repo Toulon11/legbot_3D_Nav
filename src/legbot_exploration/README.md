@@ -2,15 +2,17 @@
 
 第一次阅读源码可先看 [代码阅读指南](代码阅读指南.md)：它解释 ROS 话题、体素地图、前沿选点和状态机；关键语句与参数旁也已补上中文注释。
 
-独立 ROS 2 Jazzy 功能包：单层独立入口使用 `explorer_cpp`，多层组合入口使用
-`combined_exploration_cpp`。`python/` 仅保留独立的
+独立 ROS 2 Jazzy 功能包：`combined_exploration_cpp` 是唯一编译的生产可执行文件，
+通过 `--exploration-mode=flat|map|combined` 选择单层探索、仅建图或组合模式。
+旧命令 `explorer_cpp` 和 `online_layer_map_cpp` 是指向同一文件的兼容链接。
+`python/` 仅保留独立的
 Gazebo 真值覆盖率验收工具，通过 `ament_cmake_python` 安装。
 旧 Python 探索器已移至项目根目录 `tmp/legacy_python_explorer_2026-10-29/`，
 不参与当前构建或运行。
 
 ## 探索控制与路径规划的第一步拆分
 
-`explorer_cpp` 仍是唯一向 `/scan/waypoint_input` 发送探索路点的节点。
+探索节点是唯一向 `/scan/waypoint_input` 发送探索路点的节点。
 选定前沿目标后，它给本次请求分配 `goal_id`、`attempt_id`、二维累计地图版本和
 层析图版本。`route_orchestrator.cpp` 对同一次目标请求分别计算二维与层析候选；
 组合入口的层析规划在读锁内直接使用在线地图，路径选择只接受编号和版本均匹配的结果。
@@ -26,8 +28,8 @@ Gazebo 真值覆盖率验收工具，通过 `ament_cmake_python` 安装。
 `/exploration/planned_path` 是最终选中、将分段交给 SCAN 的路点。
 当前规划模块通过包内 C++ 接口交互，这些话题用于观察和核对，
 尚未作为独立进程之间的请求与结果传输接口。
-组合入口中的层析规划直接读取同进程在线地图的表面和占据索引；独立探索节点仍可
-订阅在线地图发布的全量规划点云。层析规划不再调用二维占据格或 SCAN
+组合入口中的层析规划直接读取同进程在线地图的表面和占据索引。单层模式
+只做二维规划，不订阅层析规划点云。层析规划不再调用二维占据格或 SCAN
 膨胀点对其节点、路段和执行路点做交叉检查。层析规划器自行验证支撑、已观测
 净空、障碍与机体扫掠空间，并输出原始 A* 参考路径及最终执行路点。路径处理
 模块对层析路点按原顺序和坐标下发，不简化、不插点，也不跳过附近路点；仅对
@@ -49,7 +51,7 @@ SCAN 在直达目标的全局参考路径生成失败，或当前目标的局部
 
 ## 在线多层地形图
 
-`online_layer_map_cpp` 可独立运行；多层组合入口则将地图节点和探索节点放在同一
+仅建图模式可独立运行；多层组合入口则将地图节点和探索节点放在同一
 进程的两个执行线程。地图节点读取同一套适配器话题：
 `/slam/global_cloud_registered`、`/slam/odometry_lidar` 和
 `/slam/global_odometry_base`，在 `map` 坐标系中按时间匹配点云与雷达位姿，
@@ -70,8 +72,8 @@ SCAN 在直达目标的全局参考路径生成失败，或当前目标的局部
 节点输出：
 
 - `/exploration/layers/surfaces`：可在 RViz 用 PointCloud2 显示。绿色为有观测净空的平坦表面，蓝色为上方尚未充分观测的平坦表面，橙色为台阶候选，紫色为坡度或连接条件不合格，灰色为支撑不足，红色为净空被障碍占用。点云还包含 `slice_index`、`surface_kind`、`clearance_kind`、`support_columns`、`ceiling_z`、`hit_observations` 和 `last_observed` 字段，供后续跨层模块读取。
-- `/exploration/layers/planning_surfaces`：未为 RViz 抽稀的完整表面图；独立运行的探索节点可订阅。组合入口中的层析规划直接读内部地图。
-- `/exploration/layers/planning_occupied`：同一版本的完整三维占据体素中心，包含不形成支撑表面的立柱侧面等命中。独立订阅模式要求两份规划点云时间戳一致；组合入口不通过这两条话题重建地图。
+- `/exploration/layers/planning_surfaces`：未为 RViz 抽稀的完整表面图，继续全量发布供外部检查。组合入口中的层析规划直接读内部地图。
+- `/exploration/layers/planning_occupied`：同一版本的完整三维占据体素中心，包含不形成支撑表面的立柱侧面等命中；组合入口不通过这两条话题重建地图。
 - `/exploration/layers/ceilings`：已观测到的上方障碍点，RViz 中可用 PointCloud2 显示。
 - `/exploration/layers/status`：JSON 统计，包括体素、水平格、候选表面数量、点云同步丢弃数、地图容量状态和每轮更新耗时。
   `last_raw_cloud_points`、`last_sampled_points`、`last_rays_requested` 和
@@ -251,7 +253,7 @@ $$
 完整地图的选点搜索只扩展到已观察网格的外缘一格；动态包围盒超过二百万格时
 不执行该轮路径搜索，并保留“前沿未解决”状态，不宣布完成。
 
-### 3. 路径代价、评分与远距离分段
+### 3. 路径代价与前沿评分
 
 从机体当前位置 $s$ 所在的格运行八邻域 Dijkstra 搜索。设边 $e=(q,q')$ 的水平长度为
 $\ell(e)\in\{r,\sqrt 2r\}$，未知格路径代价倍率为
@@ -269,16 +271,15 @@ $$
 路径的中间格只使用已观察空闲格，未知格仅能作为前沿终点；斜向移动时，
 两个相邻正交格也必须是已观察空闲格。前沿终点的代价按默认倍率 $1.5$ 计入。
 对簇 $C$ 中按簇中心距离
-排序后第一个通过路径、距离和抑制检查的前沿格 $f_C$，代码计算：
+排序后第一个通过路径和抑制检查的前沿格 $f_C$，代码计算：
 
 $$
 J(C,f_C)=w_g\ln(1+|C|)-w_dD(f_C),
 $$
 
 其中 $w_g=$ `frontier_gain_weight`，$w_d=$ `path_cost_weight`。
-各簇比较 $J$，选择得分最高的候选。若 $f_C$ 超过 `max_goal_distance`，
-沿最短路径回溯，选择距离合适的**已观察空闲格** $g_C$ 作候选观察目标；
-此时评分中的 $D(f_C)$ 仍是原前沿格的路径代价。探索控制先在前沿附近
+各簇比较 $J$，选择得分最高的真实前沿目标，不按目标距离替换成中途格。
+探索控制先在前沿附近
 选出同一个已观测、膨胀安全的观察位置。二维占据 A* 和
 同层表面 A* 分别在各自地图快照上规划到它；层析路线合格时优先选择，失败时
 使用二维路线。二维 A* 的节点和边检查完整机体圆盘及 SCAN 膨胀障碍，未知格不能
@@ -306,10 +307,10 @@ J_{\mathrm{obs}}(g)=V(g)-0.25\,\|g-s\|_2.
 $$
 
 这里 $s$ 是机体当前水平位置。$V(g)$ 只是二维遮挡近似，不是完整的雷达视场或
-信息熵计算。若还存在零散前沿但没有簇达到 $m$，持续 `no_frontier_hold` 后把
-最小簇规模暂时降到一格再尝试。若有前沿但持续选不出可规划目标，
-控制模块进入脱困。脱困规划集中负责附近安全短目标、
-分步转向补观测和历史轨迹回退；普通选点和两路平层 A* 不再包含历史回退分支。
+信息熵计算；补充观察点函数目前保留但不调用。若还存在零散前沿但没有簇达到 $m$，
+持续 `no_frontier_hold` 后把最小簇规模暂时降到一格再尝试。若两路规划均明确报告
+起点不安全，控制模块累计失败并进入脱困；其他规划失败保留未解决前沿，继续尝试
+其他候选。控制模块依次选择附近目标、直退、转向及历史点，脱困规划只验证路线。
 
 目标发出后，节点只根据 SCAN 转发目标、停车回执和任务完成信号推进路线。
 规划阶段无法形成路径的候选目标按 `failed_frontier_cooldown` 暂时屏蔽。
@@ -537,4 +538,15 @@ legbot_3D_Nav$ pgrep -af 'gz sim|controller_manager|multi_layer_exploration_demo
 
 #删除查找到的进程
 kill -TERM 125314 161365 161501 161503
+```
+
+## 查看单层探索结果
+```
+likai:~/legbot_3D_Nav$ ros2 topic info /exploration/status
+Type: std_msgs/msg/String
+Publisher count: 1
+Subscription count: 0
+
+#查看单层探索结果
+ros2 topic echo /exploration/status
 ```

@@ -51,13 +51,12 @@ PlannedRoute plan_occupancy_route(
     const FreeObservationCounts *free_observations = nullptr);
 
 // Only for a connected occupancy A* route: shortcut across fully observed,
-// inflated-free corridors and split long straight portions as needed.
+// inflated-free corridors, retaining turns needed around obstacles.
 std::vector<XY> stage_occupancy_route(
     const PlannedRoute &route,
     const std::unordered_map<Cell, int, CellHash> &grid,
     const Settings &cfg,
     const std::vector<XY> &inflated_scan_obstacles,
-    double max_segment_length = 3.0,
     const FreeObservationCounts *free_observations = nullptr);
 
 }  // namespace legbot_exploration

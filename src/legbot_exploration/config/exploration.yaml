@@ -31,7 +31,7 @@
     layer_nominal_body_height: 0.32       # 机体到支撑面的名义高度，单位米。
     layer_surface_timeout: 2.5           # 超过此时间未收到层析图，回退到二维占据路径。
     layer_planning_timeout_ms: 2000.0    # 同进程层析规划的耗时上限；超时改用二维候选。
-    route_segment_length: 3.0            # 两种已验证路径按距离分段；不固定路点数。
+    recovery_direct_max_distance: 3.0    # 仅限连通性未证实的短距离脱困直达。
     recovery_failure_limit: 3            # 同一物理区域连续失败达到此次数后进入脱困。
     recovery_area_radius: 2.0            # 失败区域的水平合并半径，单位米。
     recovery_goal_min_distance: 0.65     # 脱困附近安全目标的最小距离，单位米。
@@ -47,8 +47,6 @@
     exploration_max_x: 31.5               # 覆盖 Building 场景的东侧建筑区域，单位米。
     exploration_min_y: -15.5              # 全图搜索区域的最小 Y，单位米。
     exploration_max_y: 15.5               # 全图搜索区域的最大 Y，单位米。
-    min_goal_distance: 1.0                # 候选目标离机器人至少 1 米。
-    max_goal_distance: 8.0                # 单次下发目标的最大距离，单位米。
     min_frontier_cells: 3                 # 至少 3 个相连前沿格才算一个有效簇。
     frontier_gain_weight: 1.0             # 簇规模收益在评分中的权重。
     path_cost_weight: 1.0                 # 路径代价在评分中的权重。

@@ -52,10 +52,8 @@ int main() {
   assert(selection.goal);
   auto key = map.key({(*selection.goal)[0], (*selection.goal)[1], robot[2]});
   assert(!grid.count({key.x, key.y}));
-  assert(std::hypot((*selection.goal)[0], (*selection.goal)[1]) >= cfg.min_goal_distance);
-  // 场景三：完整地面环的真正前沿在 4 米附近，2 米上限应选近处空闲分段落点。
+  // 场景三：完整地面环的前沿在 4 米附近，直接选择真正的前沿。
   Settings staged_cfg = cfg;
-  staged_cfg.max_goal_distance = 2.0;
   VoxelMap stage_map(cfg);
   std::vector<Point> ring;
   // 依次处理集合中的每一项。
@@ -65,12 +63,9 @@ int main() {
     ring.push_back({4.0 * std::cos(angle), 4.0 * std::sin(angle), -0.2});
   }
   stage_map.integrate({0.0, 0.0, 0.4}, ring, robot[2]);
-  auto stage_grid = stage_map.project({robot[0], robot[1]});
   auto staged = select_frontier(stage_map, robot, staged_cfg, {});
   assert(staged.goal);
-  auto staged_key = stage_map.key({(*staged.goal)[0], (*staged.goal)[1], robot[2]});
-  assert(stage_grid.at({staged_key.x, staged_key.y}) == 0);
-  assert(std::hypot((*staged.goal)[0], (*staged.goal)[1]) <= staged_cfg.max_goal_distance);
+  assert(std::hypot((*staged.goal)[0], (*staged.goal)[1]) > 2.0);
   // 起点邻格只统计原始空闲证据，不因障碍膨胀而停止前沿搜索。
   Settings inflated_cfg = cfg;
   inflated_cfg.robot_radius = 0.50;
@@ -82,7 +77,6 @@ int main() {
   // 场景四：1 米局部窗口没有前沿；全局矩形搜索则应找到同一片远处前沿。
   Settings local_cfg = cfg;
   local_cfg.local_search_radius = 1.0;
-  local_cfg.max_goal_distance = 2.0;
   VoxelMap global_map(local_cfg);
   global_map.integrate({0.0, 0.0, 0.4}, ring, robot[2]);
   assert(select_frontier(global_map, robot, local_cfg, {}).frontier_cells == 0);
@@ -97,8 +91,7 @@ int main() {
   auto global_selection = select_frontier(bounded_map, robot, global_cfg, {});
   assert(global_selection.frontier_cells > 0);
   assert(global_selection.goal);
-  assert(std::hypot((*global_selection.goal)[0], (*global_selection.goal)[1]) <=
-         global_cfg.max_goal_distance);
+  assert(std::hypot((*global_selection.goal)[0], (*global_selection.goal)[1]) > 2.0);
   Settings narrow_cfg = global_cfg;
   narrow_cfg.exploration_min_x = 0.0;
   narrow_cfg.exploration_max_x = 0.25;
@@ -238,7 +231,6 @@ int main() {
 
   coverage_cfg.robot_radius = 0.0;
   coverage_cfg.max_ray_range = 5.0;
-  coverage_cfg.max_goal_distance = 4.0;
   coverage_cfg.exploration_max_x = 6.0;
   coverage_cfg.exploration_max_y = 2.0;
   std::unordered_map<Cell, int, CellHash> open;

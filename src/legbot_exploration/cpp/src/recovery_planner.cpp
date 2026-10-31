@@ -87,11 +87,11 @@ std::string retreat_corridor_reason(
 }
 }  // namespace
 
-RecoveryPlanner::RecoveryPlanner(int failure_limit, double area_radius)
+RecoveryState::RecoveryState(int failure_limit, double area_radius)
     : failure_limit_(std::max(1, failure_limit)),
       area_radius_(std::max(0.1, area_radius)) {}
 
-void RecoveryPlanner::record_failure(const XY &position,
+void RecoveryState::record_failure(const XY &position,
                                      const std::string &reason) {
   if (!area_ || distance(*area_, position) > area_radius_) {
     area_ = position;
@@ -101,13 +101,13 @@ void RecoveryPlanner::record_failure(const XY &position,
   reason_ = reason;
 }
 
-void RecoveryPlanner::start(const XY &position) {
+void RecoveryState::start(const XY &position) {
   if (!area_ || distance(*area_, position) > area_radius_) area_ = position;
   phase_ = RecoveryPhase::nearby;
   attempted_.clear();
 }
 
-void RecoveryPlanner::finish() {
+void RecoveryState::finish() {
   phase_ = RecoveryPhase::idle;
   failures_ = 0;
   area_.reset();
@@ -115,43 +115,12 @@ void RecoveryPlanner::finish() {
   reason_.clear();
 }
 
-bool RecoveryPlanner::tried(const XY &point) const {
-  return std::any_of(attempted_.begin(), attempted_.end(),
-                     [&](const XY &old) { return distance(old, point) < 0.30; });
+bool RecoveryState::tried(const XY &point) const {
+  return attempted_.count(point) != 0;
 }
 
-bool RecoveryPlanner::mark_attempted(const XY &point) {
-  if (tried(point)) return false;
-  attempted_.push_back(point);
-  return true;
-}
-
-std::vector<XY> RecoveryPlanner::nearby_candidates(
-    const std::unordered_map<Cell, int, CellHash> &grid, const XY &start,
-    const Settings &cfg, const std::vector<XY> &scan_obstacles,
-    double min_distance, double max_distance) const {
-  auto candidates = nearby_safe_viewpoints(
-      grid, start, cfg, scan_obstacles, min_distance, max_distance);
-  candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
-                                  [&](const XY &p) { return tried(p); }),
-                   candidates.end());
-  return candidates;
-}
-
-std::vector<XY> RecoveryPlanner::historical_candidates(
-    const std::vector<XY> &history, const XY &start,
-    const std::unordered_map<Cell, int, CellHash> &grid,
-    const Settings &cfg, const std::vector<XY> &scan_obstacles) const {
-  std::vector<XY> result;
-  for (auto it = history.rbegin(); it != history.rend(); ++it) {
-    const double range = distance(*it, start);
-    if (range < std::max(0.65, cfg.min_goal_distance) ||
-        range > cfg.max_goal_distance || tried(*it) ||
-        waypoint_footprint_safety(*it, grid, cfg, scan_obstacles) !=
-            WaypointSafety::safe) continue;
-    result.push_back(*it);
-  }
-  return result;
+bool RecoveryState::mark_attempted(const XY &point) {
+  return attempted_.insert(point).second;
 }
 
 const char *recovery_phase_name(RecoveryPhase phase) {

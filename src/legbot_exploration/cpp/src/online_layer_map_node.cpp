@@ -511,17 +511,3 @@ std::shared_ptr<rclcpp::Node> make_online_layer_map_node(
     std::shared_ptr<le::SharedLayerMap> shared) {
   return std::make_shared<OnlineLayerMapNode>(std::move(shared));
 }
-
-#ifndef LEGBOT_EXPLORATION_NO_MAIN
-int main(int argc, char **argv) {
-  rclcpp::init(argc, argv);
-  try { rclcpp::spin(std::make_shared<OnlineLayerMapNode>()); }
-  catch (const std::exception &error) {
-    RCLCPP_ERROR(rclcpp::get_logger("online_layer_map"), "%s", error.what());
-    rclcpp::shutdown();
-    return 1;
-  }
-  rclcpp::shutdown();
-  return 0;
-}
-#endif

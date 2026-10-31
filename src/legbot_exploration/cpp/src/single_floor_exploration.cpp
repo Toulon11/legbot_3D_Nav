@@ -453,7 +453,7 @@ std::optional<XY> select_observation_goal(const VoxelMap &map, const Point &robo
     Cell cell = queue.front(); queue.pop();
     XY xy = map.center(cell);
     double range = distance(xy, {robot[0], robot[1]});
-    if (free(cell) && range >= cfg.min_goal_distance && range <= cfg.max_goal_distance) {
+    if (free(cell)) {
       bool ignored = false;
       for (const auto &old : suppressed)
         if (distance(xy, old) < cfg.robot_radius * 2.0) { ignored = true; break; }
@@ -640,7 +640,6 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
   auto greater = [](const QueueItem &a, const QueueItem &b) { return a.first > b.first; };
   std::priority_queue<QueueItem, std::vector<QueueItem>, decltype(greater)> queue(greater);
   std::unordered_map<Cell, double, CellHash> costs;
-  std::unordered_map<Cell, Cell, CellHash> parents;
   // 将右侧计算值存入 costs（起点到各格的最短路径代价）。
   costs[origin] = 0.0;
   // 把本次结果放入容器，供下一轮处理。
@@ -680,8 +679,6 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
       if (it == costs.end() || next_cost < it->second) {
         // 将右侧计算值存入 costs（起点到各格的最短路径代价）。
         costs[next] = next_cost;
-        // 将右侧计算值存入 parents（最短路径的前驱格）。
-        parents[next] = cell;
         // 把本次结果放入容器，供下一轮处理。
         queue.push({next_cost, next});
       }
@@ -711,41 +708,6 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
       // 比较新路径和旧路径的累计代价，只保留更短者。
       if (found == costs.end()) continue;
       XY xy = map.center(cell);
-      double range = distance(xy, {robot[0], robot[1]});
-      // 根据当前目标是否存在或是否完成来决定下一步。
-      if (range < cfg.min_goal_distance) continue;
-      // 根据当前目标是否存在或是否完成来决定下一步。
-      if (range > cfg.max_goal_distance) {
-        // 前沿超出单次导航范围：沿最短路径往回找一个近处已观察空闲格。
-        // 先到这个分段点，再重新观察和选点。
-        // 声明可为空的结果，尚未找到时保持空值。
-        std::optional<XY> stage_goal;
-        Cell stage = cell;
-        // 反复处理雷达射线起点，直到循环条件不再成立。
-        while (!(stage == origin)) {
-          auto parent = parents.find(stage);
-          // 只有表达式为真，才执行下面缩进或花括号内的代码。
-          if (parent == parents.end()) break;
-          // 将右侧计算值存入 state（探索状态）。
-          auto state = grid.find(stage);
-          // 检查目标格是否落在避障膨胀后的禁行区。
-          if (state != grid.end() && state->second == 0 && !blocked.count(stage)) {
-            XY candidate = map.center(stage);
-            double stage_range = distance(candidate, {robot[0], robot[1]});
-            // 根据当前目标是否存在或是否完成来决定下一步。
-            if (stage_range >= cfg.min_goal_distance &&
-                stage_range <= cfg.max_goal_distance) {
-              stage_goal = candidate;
-              // 找到满足条件的结果，退出当前循环。
-              break;
-            }
-          }
-          stage = parent->second;
-        }
-        // 根据当前目标是否存在或是否完成来决定下一步。
-        if (!stage_goal) continue;
-        xy = *stage_goal;
-      }
       ++result.candidate_goals;
       bool rejected = false;
       // 依次处理暂时禁止重选的目标。

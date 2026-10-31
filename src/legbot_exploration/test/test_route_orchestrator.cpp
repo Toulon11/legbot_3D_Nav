@@ -47,8 +47,7 @@ int main() {
   for (int x = 0; x <= 7; ++x)
     for (int y = -2; y <= 2; ++y) grid[{x, y}] = 0;
   const std::vector<le::XY> no_obstacles;
-  const std::vector<le::LayerSurface> no_surfaces;
-  const le::PlanningSnapshot snapshot{grid, no_obstacles, no_surfaces, cfg,
+  const le::PlanningSnapshot snapshot{grid, no_obstacles, cfg,
       {1.5, 0.5, 0.32}, 0.1, 0.32, 3.0, false};
   goal.request_layer = false;
   auto planned = le::plan_candidates(goal, snapshot);
@@ -62,6 +61,7 @@ int main() {
   planned = le::plan_candidates(goal, snapshot);
   assert(planned.size() == 1 && !planned[0].usable());
   assert(planned[0].reason == "unsafe_start");
+  assert(planned[0].failure_class == le::PlannerFailureClass::unsafe_start);
   assert(planned[0].source == "occupancy");
   goal.mode = le::ExplorationMode::recovery;
   goal.request_recovery = true;
@@ -111,25 +111,54 @@ int main() {
     }
   const std::vector<le::Point> empty_voxels;
   const std::unordered_map<le::Cell, int, le::CellHash> empty_grid;
-  const le::PlanningSnapshot layer_snapshot{empty_grid, no_obstacles, surfaces,
-      layer_cfg, {0.55, 1.05, 0.32}, 0.10, 0.32, 1.0, true, nullptr,
-      &empty_voxels};
+  const auto plan_synthetic = [&](const std::vector<le::Point> &occupied) {
+    auto route = le::plan_layer_route(surfaces, occupied,
+        {0.55, 1.05, 0.32}, goal.observation, 0.10, 0.32, layer_cfg);
+    le::PlannerResult result;
+    result.goal = goal;
+    result.kind = le::PlannerKind::layer;
+    result.source = "layer";
+    result.reason = route.reference.reason;
+    result.route = std::move(route.reference);
+    result.waypoints = std::move(route.waypoints);
+    return result;
+  };
   goal.mode = le::ExplorationMode::flat;
   goal.request_occupancy = false;
   goal.request_recovery = false;
   goal.request_layer = true;
   goal.observation = {2.55, 1.05};
-  planned = le::plan_candidates(goal, layer_snapshot);
+  planned = {plan_synthetic(empty_voxels)};
   assert(planned.size() == 1 && planned[0].usable());
   assert(planned[0].source == "layer");
   assert(!planned[0].waypoints.empty());
   assert(planned[0].waypoints.back() == goal.observation);
   le::PathProcessor layer_processor;
-  assert(layer_processor.load(goal, planned[0], false, &layer_snapshot));
+  assert(layer_processor.load(goal, planned[0], false));
   assert(layer_processor.waypoints() == planned[0].waypoints);
+  // A distant but connected surface target is planned as one goal; no
+  // seven-metre search window or mandatory three-metre route split remains.
+  std::vector<le::LayerSurface> far_surfaces;
+  for (int x = -5; x <= 95; ++x)
+    for (int y = 5; y <= 15; ++y) {
+      le::LayerSurface s;
+      s.x_cell = x;
+      s.y_cell = y;
+      s.height = 0.0;
+      s.kind = le::SurfaceKind::flat;
+      s.clearance = le::ClearanceKind::observed_clear;
+      s.support_columns = 8;
+      s.hit_observations = 3;
+      far_surfaces.push_back(s);
+    }
+  const auto far_plan = le::plan_layer_route(far_surfaces, empty_voxels,
+      {0.55, 1.05, 0.32}, {8.55, 1.05}, 0.10, 0.32, layer_cfg);
+  assert(far_plan.reference.reason == "ok");
+  assert(far_plan.waypoints.size() == 1);
+  assert(far_plan.waypoints.back() == le::XY({8.55, 1.05}));
   surfaces.erase(std::remove_if(surfaces.begin(), surfaces.end(),
       [](const le::LayerSurface &s) { return s.x_cell == 15; }), surfaces.end());
-  planned = le::plan_candidates(goal, layer_snapshot);
+  planned = {plan_synthetic(empty_voxels)};
   assert(!planned[0].usable());
   surfaces.push_back([] {
     le::LayerSurface s;
@@ -139,7 +168,7 @@ int main() {
     s.support_columns = 8; s.hit_observations = 3;
     return s;
   }());
-  planned = le::plan_candidates(goal, layer_snapshot);
+  planned = {plan_synthetic(empty_voxels)};
   assert(!planned[0].usable());  // A one-cell bridge cannot fit the body.
   for (int y = -5; y <= 25; ++y) {
     if (y == 10) continue;
@@ -148,9 +177,7 @@ int main() {
     surfaces.push_back(s);
   }
   const std::vector<le::Point> pillar{{1.55, 1.05, 0.30}};
-  const le::PlanningSnapshot pillar_snapshot{empty_grid, no_obstacles, surfaces,
-      layer_cfg, {0.55, 1.05, 0.32}, 0.10, 0.32, 1.0, true, nullptr, &pillar};
-  planned = le::plan_candidates(goal, pillar_snapshot);
+  planned = {plan_synthetic(pillar)};
   assert(planned[0].usable());
   for (const auto &point : planned[0].waypoints)
     assert(std::hypot(point[0] - 1.55, point[1] - 1.05) > 0.25);
@@ -176,10 +203,10 @@ int main() {
           points.push_back({p.x, p.y, p.z});
         return points;
       }(), {0.05, 0.05, 0.32}, {0.85, 0.05}, 0.10, 0.32,
-      layer_cfg, 1.0);
+      layer_cfg);
   const le::PlanningSnapshot direct_snapshot{empty_grid, no_obstacles,
-      no_surfaces, layer_cfg, {0.05, 0.05, 0.32}, 0.10, 0.32, 1.0,
-      true, nullptr, nullptr, &shared, 2000.0};
+      layer_cfg, {0.05, 0.05, 0.32}, 0.10, 0.32, 1.0,
+      true, nullptr, &shared, 2000.0};
   goal.observation = {0.85, 0.05};
   planned = le::plan_candidates(goal, direct_snapshot);
   assert(planned.size() == 1);

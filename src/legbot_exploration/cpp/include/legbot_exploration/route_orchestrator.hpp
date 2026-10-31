@@ -16,6 +16,7 @@ namespace legbot_exploration {
 // evidence used by the planners; a later revision alone does not cancel a route.
 enum class ExplorationMode { waiting_initial_data, flat, cross_layer, recovery };
 enum class PlannerKind { occupancy, layer, recovery };
+enum class PlannerFailureClass { none, unsafe_start, unsafe_goal, disconnected, timeout, unavailable, other };
 
 struct PlanningGoal {
   std::uint64_t goal_id = 0;
@@ -37,6 +38,7 @@ struct PlannerResult {
   std::vector<XY> waypoints;
   std::string source;
   std::string reason;
+  PlannerFailureClass failure_class = PlannerFailureClass::none;
   // Recovery first tries connected A*, then a short unverified connection.
   // Keep both outcomes so the fallback cannot hide an unsafe start.
   std::string strict_reason;
@@ -49,15 +51,13 @@ struct PlannerResult {
 struct PlanningSnapshot {
   const std::unordered_map<Cell, int, CellHash> &grid;
   const std::vector<XY> &scan_obstacles;
-  const std::vector<LayerSurface> &surfaces;
   const Settings &settings;
   Point base;
   double layer_resolution = 0.10;
   double body_height = 0.32;
-  double segment_length = 3.0;
+  double recovery_direct_max_distance = 3.0;
   bool layer_fresh = false;
   const FreeObservationCounts *free_observations = nullptr;
-  const std::vector<Point> *layer_occupied = nullptr;
   SharedLayerMap *shared_layer = nullptr;
   double layer_planning_timeout_ms = 2000.0;
 };
@@ -117,5 +117,6 @@ class PathProcessor {
 
 const char *mode_name(ExplorationMode mode);
 const char *planner_name(PlannerKind kind);
+const char *planner_failure_name(PlannerFailureClass failure);
 
 }  // namespace legbot_exploration

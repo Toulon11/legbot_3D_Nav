@@ -332,7 +332,7 @@ PlannedRoute plan_occupancy_route(
     return safe;
   };
   if (!traversable(origin) || !traversable(finish)) {
-    out.reason = "unsafe_endpoint_cell";
+    out.reason = !traversable(origin) ? "unsafe_start_cell" : "unsafe_endpoint_cell";
     return out;
   }
   struct Item {
@@ -406,14 +406,10 @@ std::vector<XY> stage_occupancy_route(
     const std::unordered_map<Cell, int, CellHash> &grid,
     const Settings &cfg,
     const std::vector<XY> &inflated_scan_obstacles,
-    double max_segment_length,
     const FreeObservationCounts *free_observations) {
   std::vector<XY> staged;
-  if (route.reason != "ok" || route.points.size() < 2 ||
-      !std::isfinite(max_segment_length) || max_segment_length <= 0.0 ||
-      !std::isfinite(cfg.max_goal_distance) || cfg.max_goal_distance <= 0.0)
+  if (route.reason != "ok" || route.points.size() < 2)
     return staged;
-  const double limit = std::min(max_segment_length, cfg.max_goal_distance);
   std::vector<double> original_cost(route.points.size(), 0.0);
   if (free_observations) {
     for (std::size_t i = 1; i < route.points.size(); ++i)
@@ -423,9 +419,8 @@ std::vector<XY> stage_occupancy_route(
   std::size_t current = 0;
   while (current + 1 < route.points.size()) {
     std::size_t farthest = current;
-    for (std::size_t next = current + 1; next < route.points.size(); ++next) {
-      if (distance(route.points[current], route.points[next]) > limit + 1e-9 ||
-          !observed_free_corridor(route.points[current], route.points[next],
+    for (std::size_t next = route.points.size() - 1; next > current; --next) {
+      if (!observed_free_corridor(route.points[current], route.points[next],
                                   grid, cfg, inflated_scan_obstacles,
                                   free_observations))
         continue;
@@ -436,6 +431,7 @@ std::vector<XY> stage_occupancy_route(
                   (1.0 + cfg.shortcut_cost_tolerance) + 1e-9)
         continue;
       farthest = next;
+      break;
     }
     if (farthest == current) return {};
     staged.push_back(route.points[farthest]);
