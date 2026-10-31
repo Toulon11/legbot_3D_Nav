@@ -56,6 +56,7 @@ namespace scan_planner
    * But I will merge then someday.*/
   std::vector<std::vector<Eigen::Vector3d>> BsplineOptimizer::initControlPoints(Eigen::MatrixXd &init_points, bool flag_first_init /*= true*/)
   {
+    initial_path_valid_ = true;
 
     if (flag_first_init)
     {
@@ -140,6 +141,7 @@ namespace scan_planner
         if (path.size() < 2)
         {
           ROS_WARN("a star path has less than 2 points, force return!");
+          initial_path_valid_ = false;
           return a_star_paths;
         }
         a_star_paths.push_back(path);
@@ -147,6 +149,7 @@ namespace scan_planner
       else
       {
         ROS_ERROR("a star error, force return!");
+        initial_path_valid_ = false;
         return a_star_paths;
       }
     }
@@ -270,7 +273,6 @@ namespace scan_planner
 
         if (got_intersection_id >= 0)
         {
-          cps_.flag_temp[j] = true;
           double length = (intersection_point - cps_.points.col(j)).norm();
           if (length > 1e-5)
           {
@@ -286,10 +288,14 @@ namespace scan_planner
                   a += grid_map_->getResolution();
                 cps_.base_point[j].push_back((a / length) * intersection_point + (1 - a / length) * cps_.points.col(j));
                 cps_.direction[j].push_back((intersection_point - cps_.points.col(j)).normalized());
+                cps_.flag_temp[j] = true;
+                got_intersection_id = j;
                 break;
               }
             }
           }
+          if (cps_.base_point[j].empty() || cps_.direction[j].empty())
+            got_intersection_id = -1;
         }
       }
 
@@ -345,6 +351,11 @@ namespace scan_planner
         for (int j = got_intersection_id + 1; j <= final_segment_ids[i].second; ++j)
           if (!cps_.flag_temp[j])
           {
+            if (cps_.base_point[j - 1].empty() || cps_.direction[j - 1].empty())
+            {
+              ROS_WARN("Missing rebound direction while extending the initial collision segment.");
+              break;
+            }
             cps_.base_point[j].push_back(cps_.base_point[j - 1].back());
             cps_.direction[j].push_back(cps_.direction[j - 1].back());
           }
@@ -352,6 +363,11 @@ namespace scan_planner
         for (int j = got_intersection_id - 1; j >= final_segment_ids[i].first; --j)
           if (!cps_.flag_temp[j])
           {
+            if (cps_.base_point[j + 1].empty() || cps_.direction[j + 1].empty())
+            {
+              ROS_WARN("Missing rebound direction while extending the initial collision segment.");
+              break;
+            }
             cps_.base_point[j].push_back(cps_.base_point[j + 1].back());
             cps_.direction[j].push_back(cps_.direction[j + 1].back());
           }
@@ -875,7 +891,6 @@ namespace scan_planner
 
           if (got_intersection_id >= 0)
           {
-            cps_.flag_temp[j] = true;
             double length = (intersection_point - cps_.points.col(j)).norm();
             if (length > 1e-5)
             {
@@ -891,6 +906,7 @@ namespace scan_planner
                     a += grid_map_->getResolution();
                   cps_.base_point[j].push_back((a / length) * intersection_point + (1 - a / length) * cps_.points.col(j));
                   cps_.direction[j].push_back((intersection_point - cps_.points.col(j)).normalized());
+                  cps_.flag_temp[j] = true;
                   break;
                 }
               }
@@ -899,6 +915,8 @@ namespace scan_planner
             {
               got_intersection_id = -1;
             }
+            if (cps_.base_point[j].empty() || cps_.direction[j].empty())
+              got_intersection_id = -1;
           }
         }
 
@@ -908,6 +926,12 @@ namespace scan_planner
           for (int j = got_intersection_id + 1; j <= segment_ids[i].second; ++j)
             if (!cps_.flag_temp[j])
             {
+              if (cps_.base_point[j - 1].empty() || cps_.direction[j - 1].empty())
+              {
+                ROS_WARN("Missing rebound direction while extending the collision segment.");
+                force_stop_type_ = STOP_FOR_ERROR;
+                return false;
+              }
               cps_.base_point[j].push_back(cps_.base_point[j - 1].back());
               cps_.direction[j].push_back(cps_.direction[j - 1].back());
             }
@@ -915,6 +939,12 @@ namespace scan_planner
           for (int j = got_intersection_id - 1; j >= segment_ids[i].first; --j)
             if (!cps_.flag_temp[j])
             {
+              if (cps_.base_point[j + 1].empty() || cps_.direction[j + 1].empty())
+              {
+                ROS_WARN("Missing rebound direction while extending the collision segment.");
+                force_stop_type_ = STOP_FOR_ERROR;
+                return false;
+              }
               cps_.base_point[j].push_back(cps_.base_point[j + 1].back());
               cps_.direction[j].push_back(cps_.direction[j + 1].back());
             }
@@ -1043,6 +1073,8 @@ namespace scan_planner
         {
           restart_nums++;
           initControlPoints(cps_.points, false);
+          if (!initialPathValid())
+            return false;
           new_lambda2_ *= 2;
 
           printf("\033[32miter(+1)=%d,time(ms)=%5.3f,keep optimizing\n\033[0m", iter_num_, time_ms);

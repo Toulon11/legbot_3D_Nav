@@ -1,5 +1,5 @@
-// 包含 "legbot_exploration/exploration_core.hpp" 提供的 C++ 声明。
-#include "legbot_exploration/exploration_core.hpp"
+// 包含 "legbot_exploration/single_floor_exploration.hpp" 提供的 C++ 声明。
+#include "legbot_exploration/single_floor_exploration.hpp"
 
 // 包含 <algorithm> 提供的 C++ 声明。
 #include <algorithm>
@@ -63,15 +63,44 @@ XY VoxelMap::center(const Cell &c) const {
 void VoxelMap::mark(const Voxel &v, bool hit) {
   // 将右侧计算值存入 it（哈希表当前位置）。
   auto it = voxels_.find(v);
+  const bool existed = it != voxels_.end();
   // 只有表达式为真，才执行下面缩进或花括号内的代码。
-  if (it == voxels_.end()) {
+  if (!existed) {
     // 地图已经达到体素数量上限，不能继续插入。
     if (voxels_.size() >= cfg_.max_voxels) return;
     // 将右侧计算值存入 it（哈希表当前位置）。
     it = voxels_.emplace(v, 0).first;
   }
+  const double height = (v.z + 0.5) * cfg_.resolution;
+  const auto contribution = [&](int evidence) {
+    if (height < cfg_.free_min_relative_z ||
+        height > cfg_.obstacle_max_relative_z) return 0;
+    if (evidence > 0 && height >= cfg_.obstacle_min_relative_z) return 2;
+    return evidence <= 0 ? 1 : 0;
+  };
+  const int previous = existed ? contribution(it->second) : 0;
   // 将证据值限制在 -3 到 6 之间，避免无限累计。
   it->second = std::clamp(it->second + (hit ? 3 : -1), -3, 6);
+  const int current = contribution(it->second);
+  if (previous == current) return;
+
+  const Cell cell{v.x, v.y};
+  const auto prior = projected_all_.find(cell);
+  const int prior_state = prior == projected_all_.end() ? -1 : prior->second;
+  auto &counts = columns_[cell];
+  if (previous == 1) --counts.free;
+  if (previous == 2) --counts.occupied;
+  if (current == 1) ++counts.free;
+  if (current == 2) ++counts.occupied;
+  const int state = counts.occupied > 0 ? 1 : counts.free > 0 ? 0 : -1;
+  if (state == -1) {
+    projected_all_.erase(cell);
+    columns_.erase(cell);
+  } else {
+    projected_all_[cell] = state;
+  }
+  if (state != 0) free_observation_frames_.erase(cell);
+  if (state != prior_state) dirty_cells_.insert(cell);
 }
 // 遍历当前帧雷达点，沿每条射线累计空闲和障碍证据。
 std::size_t VoxelMap::integrate(const Point &origin, const std::vector<Point> &points,
@@ -80,6 +109,13 @@ std::size_t VoxelMap::integrate(const Point &origin, const std::vector<Point> &p
   if (!std::isfinite(base_z)) return 0;
   // 将右侧计算值存入 used（有效雷达点数）。
   std::size_t used = 0;
+  std::unordered_set<Cell, CellHash> frame_free_columns;
+  const auto remember_free = [&](const Voxel &voxel) {
+    const double height = (voxel.z + 0.5) * cfg_.resolution;
+    if (height >= cfg_.free_min_relative_z &&
+        height <= cfg_.obstacle_max_relative_z)
+      frame_free_columns.insert({voxel.x, voxel.y});
+  };
   // 依次处理一帧点云点集。
   for (const auto &point : points) {
     // 过滤包含无穷大或 NaN 的无效坐标。
@@ -100,14 +136,25 @@ std::size_t VoxelMap::integrate(const Point &origin, const std::vector<Point> &p
       // 只有表达式为真，才执行下面缩进或花括号内的代码。
       if (!last || !(v == *last)) {
         mark(v, false);
+        remember_free(v);
         // 将右侧计算值存入 last（上一个射线体素）。
         last = v;
       }
     }
     bool obstacle = point[2] >= base_z + cfg_.obstacle_min_relative_z &&
                     point[2] <= base_z + cfg_.obstacle_max_relative_z;
-    mark(key({point[0], point[1], point[2] - base_z}), obstacle);
+    const Voxel endpoint = key({point[0], point[1], point[2] - base_z});
+    mark(endpoint, obstacle);
+    if (!obstacle) remember_free(endpoint);
     ++used;
+  }
+  const auto cap = static_cast<std::uint8_t>(
+      std::clamp(cfg_.free_observation_saturation, 1, 255));
+  for (const auto &cell : frame_free_columns) {
+    const auto projected = projected_all_.find(cell);
+    if (projected == projected_all_.end() || projected->second != 0) continue;
+    auto &frames = free_observation_frames_[cell];
+    if (frames < cap) ++frames;
   }
   // 只有表达式为真，才执行下面缩进或花括号内的代码。
   if (used) ++version_;
@@ -116,38 +163,35 @@ std::size_t VoxelMap::integrate(const Point &origin, const std::vector<Point> &p
 }
 // 按高度筛选三维体素，并把相同 XY 的信息压到二维地图。
 std::unordered_map<Cell, int, CellHash> VoxelMap::project(const XY &center_xy) const {
-  return project_impl(center_xy, false);
+  return project_impl(center_xy);
 }
 
 std::unordered_map<Cell, int, CellHash> VoxelMap::project_all() const {
-  return project_impl({0.0, 0.0}, true);
+  return projected_all_;
+}
+
+std::unordered_set<Cell, CellHash> VoxelMap::take_dirty_cells() {
+  auto result = std::move(dirty_cells_);
+  dirty_cells_.clear();
+  return result;
 }
 
 std::unordered_map<Cell, int, CellHash> VoxelMap::project_impl(
-    const XY &center_xy, bool all_observed) const {
+    const XY &center_xy) const {
   std::unordered_map<Cell, int, CellHash> grid;
   double radius = cfg_.local_search_radius + cfg_.resolution * 2.0;
-  double occupied_low = cfg_.obstacle_min_relative_z;
-  double free_low = cfg_.free_min_relative_z;
-  double high = cfg_.obstacle_max_relative_z;
-  // 依次处理当前三维体素。
-  for (const auto &[voxel, evidence] : voxels_) {
-    auto xyz = center(voxel);
+  // 三维证据改变时已同步维护全局二维投影；这里只裁剪显示和局部选点范围。
+  for (const auto &[cell, state] : projected_all_) {
+    auto xy = center(cell);
     // 只有表达式为真，才执行下面缩进或花括号内的代码。
-    if (xyz[2] < free_low || xyz[2] > high) continue;
-    // 只有表达式为真，才执行下面缩进或花括号内的代码。
-    if (!all_observed && cfg_.global_search) {
+    if (cfg_.global_search) {
       // 只有表达式为真，才执行下面缩进或花括号内的代码。
-      if (xyz[0] < cfg_.exploration_min_x || xyz[0] > cfg_.exploration_max_x ||
-          xyz[1] < cfg_.exploration_min_y || xyz[1] > cfg_.exploration_max_y) continue;
-    } else if (!all_observed && !cfg_.global_search &&
-               (std::abs(xyz[0] - center_xy[0]) > radius ||
-                std::abs(xyz[1] - center_xy[1]) > radius)) continue;
-    Cell cell{voxel.x, voxel.y};
-    // 检查当前二维格的已知空闲、障碍或未知状态。
-    if (evidence > 0 && xyz[2] >= occupied_low) grid[cell] = 1;
-    // 上一条件不满足时，再检查这个分支。
-    else if (evidence <= 0) grid.emplace(cell, 0);
+      if (xy[0] < cfg_.exploration_min_x || xy[0] > cfg_.exploration_max_x ||
+          xy[1] < cfg_.exploration_min_y || xy[1] > cfg_.exploration_max_y) continue;
+    } else if (!cfg_.global_search &&
+               (std::abs(xy[0] - center_xy[0]) > radius ||
+                std::abs(xy[1] - center_xy[1]) > radius)) continue;
+    grid.emplace(cell, state);
   }
   // 把此函数算出的值交还给调用者。
   return grid;
@@ -159,35 +203,6 @@ void VoxelMap::set_exploration_bounds(double min_x, double max_x,
   cfg_.exploration_max_x = max_x;
   cfg_.exploration_min_y = min_y;
   cfg_.exploration_max_y = max_y;
-}
-
-bool RecoveryGate::waiting_for_new_cells(std::size_t observed_cells) const {
-  // 把此函数算出的值交还给调用者。
-  return blocked_at_ && observed_cells - std::min(observed_cells, *blocked_at_) <
-                            min_new_cells_;
-}
-
-bool RecoveryGate::eligible(const Selection &selection, std::size_t observed_cells) const {
-  // 返回本轮前沿搜索的结果和诊断计数。
-  return selection.clusters > 0 && !selection.goal &&
-         selection.candidate_goals == selection.suppressed_goals &&
-         !waiting_for_new_cells(observed_cells);
-}
-
-void RecoveryGate::start(std::size_t observed_cells) { started_at_ = observed_cells; }
-
-void RecoveryGate::finish(std::size_t observed_cells) {
-  // 只有表达式为真，才执行下面缩进或花括号内的代码。
-  if (!started_at_) return;
-  // 只有表达式为真，才执行下面缩进或花括号内的代码。
-  if (observed_cells - std::min(observed_cells, *started_at_) < min_new_cells_)
-    blocked_at_ = observed_cells;
-  // 前面的条件不成立时，执行这个备选分支。
-  else
-    // 清空临时状态，准备下一轮处理。
-    blocked_at_.reset();
-  // 清空临时状态，准备下一轮处理。
-  started_at_.reset();
 }
 
 void GoalProgressGate::finish(const XY &goal, std::size_t before, std::size_t after) {
@@ -302,9 +317,45 @@ Coverage assess_reachable_coverage(const std::unordered_map<Cell, int, CellHash>
   return result;
 }
 
+void FrontierIndex::rebuild(const std::unordered_map<Cell, int, CellHash> &grid) {
+  cells_.clear();
+  for (const auto &[cell, state] : grid) {
+    if (state != 0) continue;
+    for (const auto &delta : kFour) {
+      const Cell neighbor{cell.x + delta.x, cell.y + delta.y};
+      if (!grid.count(neighbor)) cells_.insert(neighbor);
+    }
+  }
+}
+
+void FrontierIndex::update(
+    const std::unordered_map<Cell, int, CellHash> &grid,
+    const std::unordered_set<Cell, CellHash> &dirty_cells) {
+  std::unordered_set<Cell, CellHash> candidates;
+  for (const auto &cell : dirty_cells) {
+    candidates.insert(cell);
+    for (const auto &delta : kFour)
+      candidates.insert({cell.x + delta.x, cell.y + delta.y});
+  }
+  for (const auto &cell : candidates) {
+    if (grid.count(cell)) { cells_.erase(cell); continue; }
+    bool borders_free = false;
+    for (const auto &delta : kFour) {
+      const auto it = grid.find({cell.x + delta.x, cell.y + delta.y});
+      if (it != grid.end() && it->second == 0) {
+        borders_free = true;
+        break;
+      }
+    }
+    if (borders_free) cells_.insert(cell);
+    else cells_.erase(cell);
+  }
+}
+
 GlobalFrontiers assess_global_frontiers(
     const std::unordered_map<Cell, int, CellHash> &grid,
-    const Settings &cfg, const XY &robot_xy) {
+    const Settings &cfg, const XY &robot_xy,
+    const std::unordered_set<Cell, CellHash> *indexed_frontiers) {
   GlobalFrontiers result;
   const double r = cfg.resolution;
   if (grid.empty() || !std::isfinite(r) || r <= 0.0 ||
@@ -354,7 +405,10 @@ GlobalFrontiers assess_global_frontiers(
       const Cell next{cell.x + delta.x, cell.y + delta.y};
       if (blocked.count(next)) continue;
       auto it = grid.find(next);
-      if (it == grid.end()) frontiers.insert(next);
+      if (it == grid.end()) {
+        if (!indexed_frontiers || indexed_frontiers->count(next))
+          frontiers.insert(next);
+      }
       else if (it->second == 0 && seen.insert(next).second) queue.push(next);
     }
   }
@@ -508,18 +562,27 @@ Selection select_frontier(const VoxelMap &map, const Point &robot, const Setting
         if (std::hypot(dx, dy) * cfg.resolution <= extra_radius)
           blocked.insert({center.x + dx, center.y + dy});
   }
-  // 第二步：从已观察空闲格向上下左右找未知格，这些未知格就是原始前沿。
+  // 第二步：优先从动态索引直接读取前沿；独立调用仍可从投影图提取。
   std::unordered_set<Cell, CellHash> frontier;
-  // 依次处理当前状态。
-  for (const auto &[cell, state] : grid) {
-    // 只有表达式为真，才执行下面缩进或花括号内的代码。
-    if (state != 0) continue;
-    // 依次处理集合中的每一项。
-    for (const auto &d : kFour) {
-      Cell next{cell.x + d.x, cell.y + d.y};
-      // 检查目标格是否落在避障膨胀后的禁行区。
-      if (inside(next) && !grid.count(next) && !blocked.count(next) &&
-          (!allowed_frontiers || allowed_frontiers->count(next))) frontier.insert(next);
+  if (allowed_frontiers) {
+    for (const auto &cell : *allowed_frontiers) {
+      if (!inside(cell) || grid.count(cell) || blocked.count(cell)) continue;
+      for (const auto &delta : kFour) {
+        const auto neighbor = grid.find({cell.x + delta.x, cell.y + delta.y});
+        if (neighbor != grid.end() && neighbor->second == 0) {
+          frontier.insert(cell);
+          break;
+        }
+      }
+    }
+  } else {
+    for (const auto &[cell, state] : grid) {
+      if (state != 0) continue;
+      for (const auto &d : kFour) {
+        Cell next{cell.x + d.x, cell.y + d.y};
+        if (inside(next) && !grid.count(next) && !blocked.count(next))
+          frontier.insert(next);
+      }
     }
   }
   result.frontier_cells = frontier.size();

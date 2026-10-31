@@ -23,6 +23,7 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>visualization_msgs</depend>
+  <depend>scan_planner</depend>
   <!-- Python 点云读取库只需在运行 Python 节点时存在。 -->
   <exec_depend>sensor_msgs_py</exec_depend>
   <exec_depend>ament_index_python</exec_depend>

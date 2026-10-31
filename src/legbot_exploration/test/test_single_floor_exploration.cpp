@@ -1,5 +1,5 @@
-// 包含 "legbot_exploration/exploration_core.hpp" 提供的 C++ 声明。
-#include "legbot_exploration/exploration_core.hpp"
+// 包含 "legbot_exploration/single_floor_exploration.hpp" 提供的 C++ 声明。
+#include "legbot_exploration/single_floor_exploration.hpp"
 
 // 包含 <cassert> 提供的 C++ 声明。
 #include <cassert>
@@ -139,32 +139,54 @@ int main() {
   assert(obstacle_grid.at({8, 0}) == 1);
   assert(obstacle_grid.at({0, 0}) == 0);
 
-  // 三个互不相连的原始前沿格不构成有效簇。
-  // 不能仅凭原始前沿数量非零就启动轨迹回退。
-  RecoveryGate recovery(8);
-  Selection residual;
-  residual.frontier_cells = 3;
-  assert(!recovery.eligible(residual, 100));
-  Selection unreachable;
-  unreachable.frontier_cells = 5;
-  unreachable.clusters = 1;
-  assert(recovery.eligible(unreachable, 100));
-  recovery.start(100);
-  recovery.finish(103);
-  assert(recovery.waiting_for_new_cells(103));
-  assert(!recovery.eligible(unreachable, 110));
-  assert(recovery.eligible(unreachable, 111));
-  unreachable.reachable_frontier_cells = 1;
-  unreachable.candidate_goals = 1;
-  assert(!recovery.eligible(unreachable, 111));
-  unreachable.suppressed_goals = 1;
-  assert(recovery.eligible(unreachable, 111));
-  unreachable.reachable_frontier_cells = 0;
-  unreachable.candidate_goals = 0;
-  unreachable.suppressed_goals = 0;
-  recovery.start(111);
-  recovery.finish(120);
-  assert(!recovery.waiting_for_new_cells(120));
+  // One dense scan is still one independent free observation per column.
+  VoxelMap evidence_map(cfg);
+  const std::vector<Point> repeated_hits(20, Point{2.0, 0.0, -0.2});
+  evidence_map.integrate({0.0, 0.0, 0.4}, repeated_hits, robot[2]);
+  assert(evidence_map.free_observation_frames().at({0, 0}) == 1);
+  evidence_map.integrate({0.0, 0.0, 0.4}, repeated_hits, robot[2]);
+  assert(evidence_map.free_observation_frames().at({0, 0}) == 2);
+  evidence_map.integrate({0.0, 0.0, 0.4}, repeated_hits, robot[2]);
+  evidence_map.integrate({0.0, 0.0, 0.4}, repeated_hits, robot[2]);
+  assert(evidence_map.free_observation_frames().at({0, 0}) == 3);
+  evidence_map.integrate({0.0, 0.0, 0.4}, {{1.0, 0.0, 0.4}}, robot[2]);
+  assert(evidence_map.project_all().at({4, 0}) == 1);
+  assert(evidence_map.free_observation_frames().count({4, 0}) == 0);
+
+  // 动态前沿索引只重算变化格及其四邻格；结果须与独立全图搜索一致。
+  std::unordered_map<Cell, int, CellHash> changing{{{0, 0}, 0}};
+  FrontierIndex frontier_index;
+  frontier_index.rebuild(changing);
+  assert(frontier_index.cells().size() == 4);
+  assert(frontier_index.cells().count({1, 0}) == 1);
+  changing[{1, 0}] = 0;
+  frontier_index.update(changing, {{1, 0}});
+  assert(frontier_index.cells().count({1, 0}) == 0);
+  assert(frontier_index.cells().count({2, 0}) == 1);
+  auto indexed_audit = assess_global_frontiers(changing, audit_cfg, {0.5, 0.5},
+                                               &frontier_index.cells());
+  auto independent_audit = assess_global_frontiers(changing, audit_cfg, {0.5, 0.5});
+  assert(indexed_audit.cells == independent_audit.cells);
+  changing[{1, 0}] = 1;
+  frontier_index.update(changing, {{1, 0}});
+  assert(frontier_index.cells().count({2, 0}) == 0);
+  assert(frontier_index.cells().count({1, 0}) == 0);
+  assert(assess_global_frontiers(changing, audit_cfg, {0.5, 0.5},
+                                &frontier_index.cells()).cells ==
+         assess_global_frontiers(changing, audit_cfg, {0.5, 0.5}).cells);
+
+  // 同一障碍体素被后续无命中射线穿过时，二维状态与变化格均需更新。
+  Settings changing_cfg = audit_cfg;
+  changing_cfg.max_ray_range = 10.0;
+  VoxelMap changing_map(changing_cfg);
+  changing_map.integrate({0.5, 0.5, 0.4}, {{2.5, 0.5, 0.4}}, 0.4);
+  assert(changing_map.project_all().at({2, 0}) == 1);
+  changing_map.take_dirty_cells();
+  for (int repeat = 0; repeat < 6; ++repeat)
+    changing_map.integrate({0.5, 0.5, 0.4}, {{4.5, 0.5, 0.4}}, 0.4);
+  assert(changing_map.project_all().at({2, 0}) == 0);
+  assert(changing_map.take_dirty_cells().count({2, 0}) == 1);
+
   GoalProgressGate goal_progress(8);
   goal_progress.finish({2.0, 1.0}, 100, 103);
   assert(goal_progress.blocked(110).size() == 1);

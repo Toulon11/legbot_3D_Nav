@@ -17,27 +17,29 @@ find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 # 布尔就绪信号和状态字符串定义在 std_msgs 中。
 find_package(std_msgs REQUIRED)
-# 暂停与清除服务使用 std_srvs 类型。
+# 探索暂停服务使用 std_srvs 类型。
 find_package(std_srvs REQUIRED)
 # RViz 前沿标记使用 visualization_msgs 类型。
 find_package(visualization_msgs REQUIRED)
+find_package(scan_planner REQUIRED)
 
-# 将 ROS 节点与核心算法两个 .cpp 文件编成 explorer_cpp 可执行程序。
-add_executable(explorer_cpp cpp/src/explorer_node.cpp cpp/src/exploration_core.cpp
-  cpp/src/route_planner.cpp)
-# 让编译器能找到 cpp/include/ 下的 exploration_core.hpp。
+# 将单层探索节点、建图选点、路径规划和路径协调编成 explorer_cpp。
+add_executable(explorer_cpp cpp/src/single_floor_explorer_node.cpp cpp/src/single_floor_exploration.cpp
+  cpp/src/same_floor_route_planner.cpp cpp/src/route_orchestrator.cpp
+  cpp/src/recovery_planner.cpp)
+# 让编译器能找到 cpp/include/ 下的 single_floor_exploration.hpp。
 target_include_directories(explorer_cpp PRIVATE cpp/include)
 # C++ 代码用到 C++17 的 optional 等特性。
 target_compile_features(explorer_cpp PRIVATE cxx_std_17)
 # 把上方 ROS 依赖的头文件与库链接到 explorer_cpp。
-ament_target_dependencies(explorer_cpp rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs std_srvs visualization_msgs)
+ament_target_dependencies(explorer_cpp rclcpp geometry_msgs nav_msgs sensor_msgs std_msgs std_srvs visualization_msgs scan_planner)
 # 安装为 ros2 run legbot_exploration explorer_cpp 能找到的位置。
 install(TARGETS explorer_cpp DESTINATION lib/${PROJECT_NAME})
 
 # A separate observational map for multi-level terrain. It never sends goals
 # and does not alter the C++ single-floor explorer.
 add_executable(online_layer_map_cpp
-  cpp/src/multi_layer_map_node.cpp cpp/src/multi_layer_map.cpp
+  cpp/src/online_layer_map_node.cpp cpp/src/multi_layer_map.cpp
   cpp/src/surface_graph.cpp)
 target_include_directories(online_layer_map_cpp PRIVATE cpp/include)
 target_compile_features(online_layer_map_cpp PRIVATE cxx_std_17)
@@ -47,7 +49,7 @@ install(TARGETS online_layer_map_cpp DESTINATION lib/${PROJECT_NAME})
 include(CTest)
 if(BUILD_TESTING)
   add_executable(test_exploration_core
-    test/test_core.cpp cpp/src/exploration_core.cpp)
+    test/test_single_floor_exploration.cpp cpp/src/single_floor_exploration.cpp)
   target_include_directories(test_exploration_core PRIVATE cpp/include)
   target_compile_features(test_exploration_core PRIVATE cxx_std_17)
   target_compile_options(test_exploration_core PRIVATE -UNDEBUG)
@@ -65,11 +67,20 @@ if(BUILD_TESTING)
   target_compile_options(test_surface_graph PRIVATE -UNDEBUG)
   add_test(NAME online_surface_graph_astar COMMAND test_surface_graph)
   add_executable(test_route_planner
-    test/test_route_planner.cpp cpp/src/route_planner.cpp cpp/src/exploration_core.cpp)
+    test/test_same_floor_route_planner.cpp cpp/src/same_floor_route_planner.cpp
+    cpp/src/recovery_planner.cpp cpp/src/single_floor_exploration.cpp)
   target_include_directories(test_route_planner PRIVATE cpp/include)
   target_compile_features(test_route_planner PRIVATE cxx_std_17)
   target_compile_options(test_route_planner PRIVATE -UNDEBUG)
   add_test(NAME exploration_route_safety COMMAND test_route_planner)
+  add_executable(test_planning_pipeline
+    test/test_route_orchestrator.cpp cpp/src/route_orchestrator.cpp
+    cpp/src/same_floor_route_planner.cpp cpp/src/recovery_planner.cpp
+    cpp/src/single_floor_exploration.cpp)
+  target_include_directories(test_planning_pipeline PRIVATE cpp/include)
+  target_compile_features(test_planning_pipeline PRIVATE cxx_std_17)
+  target_compile_options(test_planning_pipeline PRIVATE -UNDEBUG)
+  add_test(NAME exploration_planning_pipeline COMMAND test_planning_pipeline)
 endif()
 
 # 把 python/legbot_exploration/ 安装为可导入的 Python 模块。

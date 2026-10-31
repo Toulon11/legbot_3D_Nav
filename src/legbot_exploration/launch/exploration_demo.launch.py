@@ -93,6 +93,9 @@ def setup(context):
                 'sensor_pose_topic': sensor_pose,
                 'manual_goal_use_message_z': 'false',
                 'robot_radius': LaunchConfiguration('scan_robot_radius').perform(context),
+                # 探索路径含有近距离转折点；0.80 m 减速圈会让约 0.45 m 的路点
+                # 从下发起就只有极小速度。仅覆盖本探索演示的启动参数。
+                'goal_slowdown_distance': '0.55',
             })]),
     ])
     if LaunchConfiguration('start_rviz').perform(context) == 'true':

@@ -30,15 +30,20 @@
     layer_surface_resolution: 0.10        # 在线层析图的水平栅格边长；同层路径优先由它规划。
     layer_nominal_body_height: 0.32       # 机体到支撑面的名义高度，单位米。
     layer_surface_timeout: 2.5           # 超过此时间未收到层析图，回退到二维占据路径。
-    route_segment_length: 3.0            # 参考路径每约 3 米选一个目标点，整条路线最多 3 个；实际走法由 SCAN 决定。
-    startup_scan_enabled: true            # 起点有观测盲区时，先原地转向建图，再寻找附近安全目标。
-    startup_yaw_rate: 0.35                # 起步建图转向角速度，单位弧度/秒。
-    startup_turn_timeout: 30.0            # 转满一圈的最长等待时间，单位秒。
-    startup_goal_min_distance: 0.65       # 起步目标与机体的最小水平距离，单位米。
-    startup_goal_max_distance: 2.0        # 起步目标与机体的最大水平距离，单位米。
+    route_segment_length: 3.0            # 两种已验证路径按距离分段；不固定路点数。
+    recovery_failure_limit: 3            # 同一物理区域连续失败达到此次数后进入脱困。
+    recovery_area_radius: 2.0            # 失败区域的水平合并半径，单位米。
+    recovery_goal_min_distance: 0.65     # 脱困附近安全目标的最小距离，单位米。
+    recovery_goal_max_distance: 2.0      # 脱困附近安全目标的最大距离，单位米。
+    recovery_reverse_distance: 0.35      # 附近目标失败后，保持朝向直退的单次距离，单位米。
+    recovery_yaw_rate: 0.35              # 仅脱困时转向的角速度，单位弧度/秒。
+    recovery_turn_step: 0.70             # 每次补观测小角度转向量，单位弧度。
+    recovery_turn_timeout: 8.0           # 单步转向超时，单位秒。
+    recovery_max_turn_steps: 4           # 转向尝试上限；之后尝试历史轨迹回退。
+    recovery_retry_interval: 10.0        # 脱困受阻后定期重查安全路线，兼容地图状态变化但不强制运动。
     bounds_relative_to_start: false       # true 时把边界坐标加到起始机体位置上。
     exploration_min_x: -31.5              # 全图搜索区域的最小 X，单位米。
-    exploration_max_x: -0.5               # 全图搜索区域的最大 X，单位米。
+    exploration_max_x: 31.5               # 覆盖 Building 场景的东侧建筑区域，单位米。
     exploration_min_y: -15.5              # 全图搜索区域的最小 Y，单位米。
     exploration_max_y: 15.5               # 全图搜索区域的最大 Y，单位米。
     min_goal_distance: 1.0                # 候选目标离机器人至少 1 米。
@@ -47,16 +52,14 @@
     frontier_gain_weight: 1.0             # 簇规模收益在评分中的权重。
     path_cost_weight: 1.0                 # 路径代价在评分中的权重。
     unknown_path_multiplier: 1.5         # 仅前沿终点未知格的评分成本倍率；中间路径不走未知格。
-    goal_reach_xy: 0.55                   # 水平距离小于此值视为接近目标，单位米。
-    progress_distance: 0.35              # 距离目标至少缩短这么多才算有进度，单位米。
-    progress_timeout: 12.0               # 连续无进度达到此秒数后清除目标。
-    goal_timeout: 90.0                   # 单个目标执行的总超时，单位秒。
-    goal_forward_timeout: 3.0            # 下发后等待 SCAN 确认转发的超时，单位秒。
+    free_observation_saturation: 3       # 同一格被多少帧空闲射线穿过后视作观测充分；每帧最多记一次。
+    low_evidence_cost_weight: 0.7        # 只有一帧空闲观测时二维 A* 的额外代价；三帧后不再加罚。
+    shortcut_cost_tolerance: 0.05       # 二维路线简化后允许的最大观测代价增幅比例。
+    goal_reach_xy: 0.55                   # 校验 SCAN 停车回执位置及过滤首次下发前的近距离路点。
     failed_frontier_cooldown: 45.0       # 失败目标附近暂不重选的时长，单位秒。
+    low_yield_retry_cooldown: 8.0        # 低观测收益目标刚到达后的短暂冷却；无高收益目标时可重选其他低收益目标。
     no_frontier_hold: 8.0                # 连续 8 秒找不到前沿，才判定区域探索完成。
-    recovery_min_new_cells: 8            # 回退或目标成功后，至少新观察 8 格才算有效收益。
+    recovery_min_new_cells: 8            # 到达后新增观测低于该数量时按低收益目标处理。
     planner_occupancy_timeout: 2.0       # SCAN 障碍点云的有效时长，单位秒。
     planner_occupancy_height_tolerance: 0.5 # 只考虑与机体高度差不超过此值的障碍。
-    near_goal_dwell: 1.5                 # 持续接近目标后触发到达兜底的时间，单位秒。
-    blocked_goal_dwell: 2.0              # 目标持续落在障碍内后触发清除的时间，单位秒。
     observation_only: true               # true 只计算和显示，不发送运动目标。

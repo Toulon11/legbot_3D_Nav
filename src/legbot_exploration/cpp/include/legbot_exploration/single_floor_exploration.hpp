@@ -1,4 +1,4 @@
-// 本头文件只声明数据结构和函数接口；具体计算见 exploration_core.cpp。
+// 本头文件只声明数据结构和函数接口；具体计算见 single_floor_exploration.cpp。
 #pragma once  // 防止同一个头文件被重复包含。
 
 #include <array>
@@ -36,6 +36,9 @@ struct Settings {
   double frontier_gain_weight = 1.0;    // 较大前沿簇在评分中更有利。
   double path_cost_weight = 1.0;        // 较长路径在评分中扣分。
   double unknown_path_multiplier = 1.5; // 未知格路径代价相对已知格的倍数。
+  int free_observation_saturation = 3;   // 独立点云帧的空闲观测达到此数后不再增加置信度。
+  double low_evidence_cost_weight = 0.7; // 只有一帧空闲证据时的额外二维 A* 代价。
+  double shortcut_cost_tolerance = 0.05; // 简化路线相对原路线允许的最大代价增幅。
 };
 
 // Cell 只含 X/Y 整数格号；Voxel 还多一个高度 Z 格号。
@@ -52,6 +55,7 @@ struct Voxel {
 struct CellHash { // 散列函数使 Cell 可以充当 unordered_map 的键。
   std::size_t operator()(const Cell &c) const;
 };
+using FreeObservationCounts = std::unordered_map<Cell, std::uint8_t, CellHash>;
 struct VoxelHash { // 散列函数使 Voxel 可以充当 unordered_map 的键。
   std::size_t operator()(const Voxel &v) const;
 };
@@ -69,16 +73,24 @@ class VoxelMap {
   // 高度证据相对“采集该帧时”的机体高度保存。
   std::unordered_map<Cell, int, CellHash> project(const XY &center_xy) const; // 三维证据压成二维格子。
   std::unordered_map<Cell, int, CellHash> project_all() const; // 不按预设矩形裁剪累计地图。
+  const FreeObservationCounts &free_observation_frames() const {
+    return free_observation_frames_;
+  }
+  std::unordered_set<Cell, CellHash> take_dirty_cells(); // 取走投影状态发生变化的水平格。
   void set_exploration_bounds(double min_x, double max_x, double min_y, double max_y); // 更新全局搜索边界。
   std::size_t size() const { return voxels_.size(); } // 已保存的体素数。
   std::size_t version() const { return version_; } // 地图更新次数。
 
  private:
-  std::unordered_map<Cell, int, CellHash> project_impl(const XY &center_xy,
-                                                       bool all_observed) const;
+  std::unordered_map<Cell, int, CellHash> project_impl(const XY &center_xy) const;
   void mark(const Voxel &voxel, bool hit); // hit 表示射线末端命中障碍。
+  struct ColumnCounts { int free = 0, occupied = 0; };
   Settings cfg_; // 当前参数副本。
   std::unordered_map<Voxel, int, VoxelHash> voxels_; // 三维格号到证据值。
+  std::unordered_map<Cell, ColumnCounts, CellHash> columns_; // 每列投影所需的证据计数。
+  std::unordered_map<Cell, int, CellHash> projected_all_; // 与全量投影等价的累计二维图。
+  FreeObservationCounts free_observation_frames_; // 每列被独立帧中的空闲射线穿过的次数。
+  std::unordered_set<Cell, CellHash> dirty_cells_; // 待更新前沿的水平格。
   std::size_t version_ = 0; // 每融合一次有效点云就加 1。
 };
 
@@ -127,9 +139,21 @@ struct GlobalFrontiers {
   std::size_t frontier_cells = 0;
   std::unordered_set<Cell, CellHash> cells; // 仅机器人连通空闲区边上的未知格。
 };
+// 维护当前未知与已知空闲区域的交界。失败目标的冷却不改变这里的原始前沿。
+class FrontierIndex {
+ public:
+  void rebuild(const std::unordered_map<Cell, int, CellHash> &grid);
+  void update(const std::unordered_map<Cell, int, CellHash> &grid,
+              const std::unordered_set<Cell, CellHash> &dirty_cells);
+  const std::unordered_set<Cell, CellHash> &cells() const { return cells_; }
+
+ private:
+  std::unordered_set<Cell, CellHash> cells_;
+};
 GlobalFrontiers assess_global_frontiers(
     const std::unordered_map<Cell, int, CellHash> &grid,
-    const Settings &cfg, const XY &robot_xy);
+    const Settings &cfg, const XY &robot_xy,
+    const std::unordered_set<Cell, CellHash> *indexed_frontiers = nullptr);
 
 // 普通前沿耗尽而仍有未知格时，从已观察且连通的空闲格找补充观测位置。
 std::optional<XY> select_observation_goal(const VoxelMap &map, const Point &robot,
@@ -137,22 +161,6 @@ std::optional<XY> select_observation_goal(const VoxelMap &map, const Point &robo
                                           const std::unordered_map<Cell, int, CellHash> &grid,
                                           const std::vector<XY> &suppressed,
                                           const std::vector<XY> &external_obstacles = {});
-
-// 只有确实存在前沿簇、但当前不可达时才允许沿旧轨迹回退。
-// 回退若没有带来足够的新观察格，地图增长之前就暂不重复回退。
-class RecoveryGate {
- public:
-  explicit RecoveryGate(std::size_t min_new_cells) : min_new_cells_(min_new_cells) {}
-  bool eligible(const Selection &selection, std::size_t observed_cells) const;
-  bool waiting_for_new_cells(std::size_t observed_cells) const;
-  void start(std::size_t observed_cells);
-  void finish(std::size_t observed_cells);
-
- private:
-  std::size_t min_new_cells_;
-  std::optional<std::size_t> started_at_;
-  std::optional<std::size_t> blocked_at_;
-};
 
 // 对已到达却没有带来新观察格的目标进行暂时屏蔽。
 // 等地图继续增长到门槛后，再允许选到该区域。

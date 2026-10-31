@@ -1,5 +1,7 @@
-#include "legbot_exploration/exploration_core.hpp" // 包含项目核心头文件，提供地图和设置等功能
-#include "legbot_exploration/route_planner.hpp"
+#include "legbot_exploration/single_floor_exploration.hpp" // 包含项目核心头文件，提供地图和设置等功能
+#include "legbot_exploration/same_floor_route_planner.hpp"
+#include "legbot_exploration/route_orchestrator.hpp"
+#include "legbot_exploration/recovery_planner.hpp"
 
 #include <geometry_msgs/msg/pose_stamped.hpp> // ROS2 消息：姿态（位置+方向）
 #include <geometry_msgs/msg/twist.hpp> // 起步原地转向请求
@@ -7,21 +9,25 @@
 #include <nav_msgs/msg/occupancy_grid.hpp> // 全局逐格验收地图
 #include <nav_msgs/msg/path.hpp> // 实际走过的机体轨迹
 #include <rclcpp/rclcpp.hpp> // ROS2 C++ 客户端库
+#include <scan_planner/msg/bspline.hpp> // SCAN 实际下发的 B 样条轨迹
 #include <sensor_msgs/msg/point_cloud2.hpp> // ROS2 点云消息类型
 #include <sensor_msgs/point_cloud2_iterator.hpp> // 点云迭代器工具
 #include <std_msgs/msg/bool.hpp> // 布尔型标准消息
 #include <std_msgs/msg/int32.hpp> // GO2 步态模式
 #include <std_msgs/msg/string.hpp> // 字符串标准消息
 #include <std_srvs/srv/set_bool.hpp> // 设置布尔服务（用于暂停）
-#include <std_srvs/srv/trigger.hpp> // 触发服务（用于清除前沿）
 #include <visualization_msgs/msg/marker_array.hpp> // RViz 可视化 Marker
 
 #include <algorithm> // 常用算法库
+#include <array>
+#include <charconv> // 精确解析 SCAN 目标时间戳
 #include <chrono> // 时间工具
 #include <cmath> // 数学函数（hypot）
 #include <cstdint> // 固定宽度整数类型
 #include <deque> // 双端队列容器
+#include <iomanip> // 保留倒退目标的坐标精度
 #include <limits> // 数值极限
+#include <map> // 按拒绝原因汇总本轮脱困规划结果
 #include <memory> // 智能指针
 #include <optional> // 可选值类型
 #include <sstream> // 字符流，用于构造 JSON
@@ -72,50 +78,56 @@ class Explorer : public rclcpp::Node {
      auto ready_topic = declare_parameter<std::string>("ready_topic", "/go2/demo_ready"); // 探测准备状态主题
      auto occupancy_topic = declare_parameter<std::string>(
          "planner_occupancy_topic", "/local_planner/grid_map/occupancy_inflate");
+     auto raw_occupancy_topic = declare_parameter<std::string>(
+         "planner_raw_occupancy_topic", "/local_planner/grid_map/occupancy");
      point_stride_ = declare_parameter<int>("point_stride", 8);                       // 点云抽稀步长
      max_points_ = declare_parameter<int>("max_points_per_cloud", 1000);           // 单帧最大采点数
      sync_tolerance_ = declare_parameter<double>("sensor_sync_tolerance", 0.03);   // 同步容差（秒）
      odom_timeout_ = declare_parameter<double>("odom_timeout", 1.0);
      cloud_timeout_ = declare_parameter<double>("cloud_timeout", 2.0);
      goal_reach_xy_ = declare_parameter<double>("goal_reach_xy", 0.55);
-     progress_distance_ = declare_parameter<double>("progress_distance", 0.35);
-     progress_timeout_ = declare_parameter<double>("progress_timeout", 12.0);
-     goal_timeout_ = declare_parameter<double>("goal_timeout", 90.0);
-     forward_timeout_ = declare_parameter<double>("goal_forward_timeout", 3.0);
      cooldown_ = declare_parameter<double>("failed_frontier_cooldown", 45.0);
+     low_yield_retry_cooldown_ = declare_parameter<double>("low_yield_retry_cooldown", 8.0);
      no_frontier_hold_ = declare_parameter<double>("no_frontier_hold", 8.0);
      int recovery_min_new_cells = declare_parameter<int>("recovery_min_new_cells", 8);
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
      if (recovery_min_new_cells < 1)
        // 发现非法输入，抛出错误并停止当前流程。
        throw std::invalid_argument("recovery_min_new_cells must be positive");
-     recovery_gate_ = le::RecoveryGate(static_cast<std::size_t>(recovery_min_new_cells));
+     if (!std::isfinite(low_yield_retry_cooldown_) || low_yield_retry_cooldown_ < 0.0)
+       throw std::invalid_argument("low_yield_retry_cooldown must be nonnegative");
+     min_new_cells_ = static_cast<std::size_t>(recovery_min_new_cells);
      goal_progress_gate_ = le::GoalProgressGate(static_cast<std::size_t>(recovery_min_new_cells));
      occupancy_timeout_ = declare_parameter<double>("planner_occupancy_timeout", 2.0);
      occupancy_height_tolerance_ = declare_parameter<double>("planner_occupancy_height_tolerance", 0.5);
      require_planner_occupancy_ = declare_parameter<bool>("require_planner_occupancy", false);
-     near_goal_dwell_ = declare_parameter<double>("near_goal_dwell", 1.5);
-     blocked_goal_dwell_ = declare_parameter<double>("blocked_goal_dwell", 2.0);
      observation_only_ = declare_parameter<bool>("observation_only", true);
      bounds_relative_to_start_ = declare_parameter<bool>("bounds_relative_to_start", false);
      layer_resolution_ = declare_parameter<double>("layer_surface_resolution", 0.10);
      layer_body_height_ = declare_parameter<double>("layer_nominal_body_height", 0.32);
      layer_timeout_ = declare_parameter<double>("layer_surface_timeout", 2.5);
      route_segment_length_ = declare_parameter<double>("route_segment_length", 3.0);
-     startup_scan_enabled_ = declare_parameter<bool>("startup_scan_enabled", true);
-     startup_yaw_rate_ = declare_parameter<double>("startup_yaw_rate", 0.35);
-     startup_turn_timeout_ = declare_parameter<double>("startup_turn_timeout", 30.0);
-     startup_goal_min_distance_ = declare_parameter<double>(
-         "startup_goal_min_distance", 0.65);
-     startup_goal_max_distance_ = declare_parameter<double>(
-         "startup_goal_max_distance", 2.0);
+     const int recovery_failure_limit = declare_parameter<int>("recovery_failure_limit", 3);
+     const double recovery_area_radius = declare_parameter<double>("recovery_area_radius", 2.0);
+     recovery_ = le::RecoveryPlanner(recovery_failure_limit, recovery_area_radius);
+     recovery_yaw_rate_ = declare_parameter<double>("recovery_yaw_rate", 0.35);
+     recovery_turn_step_ = declare_parameter<double>("recovery_turn_step", 0.70);
+     recovery_turn_timeout_ = declare_parameter<double>("recovery_turn_timeout", 8.0);
+     recovery_goal_min_distance_ = declare_parameter<double>("recovery_goal_min_distance", 0.65);
+     recovery_goal_max_distance_ = declare_parameter<double>("recovery_goal_max_distance", 2.0);
+     recovery_reverse_distance_ = declare_parameter<double>("recovery_reverse_distance", 0.35);
+     recovery_max_turn_steps_ = declare_parameter<int>("recovery_max_turn_steps", 4);
+     recovery_retry_interval_ = declare_parameter<double>("recovery_retry_interval", 10.0);
      if (layer_resolution_ <= 0.0 || layer_body_height_ <= 0.0 ||
          layer_timeout_ <= 0.0 || route_segment_length_ <= 0.0 ||
-         !std::isfinite(startup_yaw_rate_) || startup_yaw_rate_ <= 0.0 ||
-         startup_yaw_rate_ > 0.6 || startup_turn_timeout_ <= 0.0 ||
-         startup_goal_min_distance_ <= 0.0 ||
-         startup_goal_max_distance_ < startup_goal_min_distance_)
-       throw std::invalid_argument("layer and route parameters must be positive");
+         recovery_failure_limit < 1 || recovery_area_radius <= 0.0 ||
+         recovery_yaw_rate_ <= 0.0 || recovery_yaw_rate_ > 0.6 ||
+         recovery_turn_step_ <= 0.0 || recovery_turn_timeout_ <= 0.0 ||
+         recovery_goal_min_distance_ <= 0.0 ||
+         recovery_goal_max_distance_ < recovery_goal_min_distance_ ||
+         recovery_reverse_distance_ < 0.20 || recovery_reverse_distance_ > 0.60 ||
+         recovery_max_turn_steps_ < 0 || recovery_retry_interval_ <= 0.0)
+       throw std::invalid_argument("invalid layer or recovery parameters");
 
      // 参数合法性检查（分辨率、搜索半径、抽稀步长、点数、体素上限必须 > 0）
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
@@ -137,13 +149,41 @@ class Explorer : public rclcpp::Node {
      marker_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/exploration/frontiers", state_qos);
      // 建立 ROS 发布者，用来向指定话题发送消息。
      status_pub_ = create_publisher<std_msgs::msg::String>("/exploration/status", state_qos);
+     goal_diagnostic_pub_ = create_publisher<std_msgs::msg::String>(
+         "/exploration/diagnostics/goal_event", state_qos);
+     diagnostic_reference_pub_ = create_publisher<nav_msgs::msg::Path>(
+         "/exploration/diagnostics/last_reference_path", state_qos);
+     diagnostic_actual_pub_ = create_publisher<nav_msgs::msg::Path>(
+         "/exploration/diagnostics/last_actual_path", state_qos);
+     diagnostic_bspline_pub_ = create_publisher<scan_planner::msg::Bspline>(
+         "/exploration/diagnostics/last_scan_bspline", state_qos);
+     planning_goal_pub_ = create_publisher<std_msgs::msg::String>(
+         "/exploration/planning_goal", state_qos);
+     planning_result_pub_ = create_publisher<std_msgs::msg::String>(
+         "/exploration/planning_results", state_qos);
+     execution_result_pub_ = create_publisher<std_msgs::msg::String>(
+         "/exploration/execution_feedback", state_qos);
      coverage_pub_ = create_publisher<nav_msgs::msg::OccupancyGrid>("/exploration/coverage_grid", state_qos);
      // 建立 ROS 发布者，用来向指定话题发送消息。
      trajectory_pub_ = create_publisher<nav_msgs::msg::Path>("/exploration/trajectory", state_qos);
      planned_path_pub_ = create_publisher<nav_msgs::msg::Path>(
          "/exploration/planned_path", state_qos);
-     bootstrap_turn_pub_ = create_publisher<geometry_msgs::msg::Twist>(
+     selected_occupancy_path_pub_ = create_publisher<nav_msgs::msg::Path>(
+         "/exploration/selected_routes/occupancy", state_qos);
+     selected_layer_path_pub_ = create_publisher<nav_msgs::msg::Path>(
+         "/exploration/selected_routes/layer", state_qos);
+     selected_recovery_path_pub_ = create_publisher<nav_msgs::msg::Path>(
+         "/exploration/selected_routes/recovery", state_qos);
+     occupancy_plan_pub_ = create_publisher<nav_msgs::msg::Path>(
+         "/exploration/plans/occupancy", state_qos);
+     layer_plan_pub_ = create_publisher<nav_msgs::msg::Path>(
+         "/exploration/plans/layer", state_qos);
+     recovery_plan_pub_ = create_publisher<nav_msgs::msg::Path>(
+         "/exploration/plans/recovery", state_qos);
+     recovery_turn_pub_ = create_publisher<geometry_msgs::msg::Twist>(
          "/exploration/bootstrap_turn_cmd", 10);
+     recovery_reverse_pub_ = create_publisher<std_msgs::msg::String>(
+         "/scan/recovery_reverse_request", 10);
      control_mode_pub_ = create_publisher<std_msgs::msg::Int32>(
          "/go2/control_mode", 10);
      trajectory_.header.frame_id = frame_id_;
@@ -167,6 +207,20 @@ class Explorer : public rclcpp::Node {
        occupancy_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
            occupancy_topic, rclcpp::SensorDataQoS(),
            [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { on_occupancy(*msg); });
+     if (!raw_occupancy_topic.empty())
+       raw_occupancy_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+           raw_occupancy_topic, rclcpp::SensorDataQoS(),
+           [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+             if (read_occupancy_points(*msg, raw_obstacles_))
+               raw_occupancy_wall_ = wall_now();
+           });
+     scan_bspline_sub_ = create_subscription<scan_planner::msg::Bspline>(
+         "/scan/planning/bspline", 10,
+         [this](scan_planner::msg::Bspline::ConstSharedPtr msg) {
+           if (active_ && !active_->reverse &&
+               stamp_ns(msg->start_time) + 500000000LL >= active_->input_stamp)
+             active_scan_bspline_ = *msg;
+         });
      layer_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
          "/exploration/layers/surfaces", state_qos,
          [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { on_layers(*msg); });
@@ -190,6 +244,17 @@ class Explorer : public rclcpp::Node {
      complete_sub_ = create_subscription<std_msgs::msg::Bool>(
          "/scan/mission_complete", state_qos,
          [this](std_msgs::msg::Bool::ConstSharedPtr msg) { on_complete(*msg); });
+     plan_ready_sub_ = create_subscription<std_msgs::msg::Bool>(
+         "/scan/plan_ready", state_qos,
+         [this](std_msgs::msg::Bool::ConstSharedPtr msg) { scan_plan_ready_ = msg->data; });
+     scan_failure_sub_ = create_subscription<std_msgs::msg::String>(
+         "/scan/goal_plan_failed", 10,
+         [this](std_msgs::msg::String::ConstSharedPtr msg) { on_scan_failure(*msg); });
+     recovery_reverse_result_sub_ = create_subscription<std_msgs::msg::String>(
+         "/scan/recovery_reverse_result", 10,
+         [this](std_msgs::msg::String::ConstSharedPtr msg) {
+           on_recovery_reverse_result(*msg);
+         });
 
      // 暂停服务 /exploration/set_paused
      // 建立 ROS 服务，让外部可以暂停或恢复探索。
@@ -197,49 +262,44 @@ class Explorer : public rclcpp::Node {
          "/exploration/set_paused",
          [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
                 std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
-           // 当收到暂停请求且当前有活动目标且未在清除时，先发起一次清除
-           // 只有表达式为真，才执行下面缩进或花括号内的代码。
-           if (request->data && active_ && !clearing_) start_clear("paused");
            paused_ = request->data;
            response->success = true;
            response->message = paused_ ? "exploration paused" : "exploration resumed";
          });
 
-     // 用于清除已发布前沿点的外部 Trigger 服务
-     // 建立 ROS 服务客户端，用于请求 SCAN 清除航点。
-     clear_client_ = create_client<std_srvs::srv::Trigger>("/scan/waypoints/clear");
-
      // 每秒调用一次的主循环计时器
      timer_ = create_wall_timer(1s, [this]() { tick(); });
-     bootstrap_motion_timer_ = create_wall_timer(
-         50ms, [this]() { bootstrap_motion_tick(); });
+     motion_timer_ = create_wall_timer(
+         50ms, [this]() { motion_tick(); });
 
      // 初始状态上报（观测模式或等待数据）
      report(observation_only_ ? "observation_only" : "waiting_for_data");
    }
 
  private:
-   enum class BootstrapState { pending, turning, settling, seeking, done, failed };
    // ---------------------------------------------------------------
    // 结构体：记录当前活动的目标信息
    // ---------------------------------------------------------------
    // 定义保存相关数据或行为的 C++ 类型。
    struct Active {
      le::XY xy;                    // 目标 XY 坐标
-     double sent = 0.0;            // 目标发送时的 wall 时间
      int64_t input_stamp = 0;     // 手动输入目标的时间戳（纳秒）
      std::optional<int64_t> stamp; // 外部 Goal 消息的时间戳（纳秒）
-     double best_distance = 0.0;  // 迄今记录的最小距离（用于进度检测）
-     double progress_wall = 0.0;   // 最近一次进度更新的 wall 时间
      bool ack = false;             // 是否收到前进确认（Ack）
      bool armed = false;           // 是否已收到前进前的 “armed” 标记（mission_complete false）
      bool complete = false;        // 是否已收到完成信号（mission_complete true）
-     // 声明可为空的结果，尚未找到时保持空值。
-     std::optional<double> near_since;
-     // 声明可为空的结果，尚未找到时保持空值。
-     std::optional<double> blocked_since;
      bool recovery = false;
+     bool reverse = false;
      std::size_t observed_cells_at_send = 0;
+     double initial_distance = 0.0; // SCAN 完成回执后核算脱困位移。
+     le::Point pose_at_send{0.0, 0.0, 0.0};
+     std::size_t trajectory_start_index = 0;
+     std::size_t map_version_at_send = 0, layer_version_at_send = 0;
+     std::uint64_t goal_id = 0, attempt_id = 0;
+     std::size_t stage_index = 0;
+     std::optional<double> raw_distance_at_send, inflated_distance_at_send;
+     std::string source_at_send;
+     std::vector<le::XY> reference_route;
    };
    struct Suppressed { le::XY xy; double expiry; }; // 被抑制的前沿（冷却）
 
@@ -282,6 +342,19 @@ class Explorer : public rclcpp::Node {
      cfg.frontier_gain_weight = declare_parameter<double>("frontier_gain_weight", cfg.frontier_gain_weight);
      cfg.path_cost_weight = declare_parameter<double>("path_cost_weight", cfg.path_cost_weight);
      cfg.unknown_path_multiplier = declare_parameter<double>("unknown_path_multiplier", cfg.unknown_path_multiplier);
+     cfg.free_observation_saturation = declare_parameter<int>(
+         "free_observation_saturation", cfg.free_observation_saturation);
+     cfg.low_evidence_cost_weight = declare_parameter<double>(
+         "low_evidence_cost_weight", cfg.low_evidence_cost_weight);
+     cfg.shortcut_cost_tolerance = declare_parameter<double>(
+         "shortcut_cost_tolerance", cfg.shortcut_cost_tolerance);
+     if (cfg.free_observation_saturation < 1 ||
+         cfg.free_observation_saturation > 255 ||
+         !std::isfinite(cfg.low_evidence_cost_weight) ||
+         cfg.low_evidence_cost_weight < 0.0 ||
+         !std::isfinite(cfg.shortcut_cost_tolerance) ||
+         cfg.shortcut_cost_tolerance < 0.0)
+       throw std::invalid_argument("invalid occupancy evidence parameters");
      cfg_ = cfg;
      // 把此函数算出的值交还给调用者。
      return cfg;
@@ -300,6 +373,8 @@ class Explorer : public rclcpp::Node {
      stream << ",\"global_search\":" << (cfg_.global_search ? "true" : "false");
      stream << ",\"global_frontier_valid\":" << (global_frontiers_.valid ? "true" : "false");
      stream << ",\"global_frontier_cells\":" << global_frontiers_.frontier_cells;
+     stream << ",\"indexed_frontier_cells\":" << frontier_index_.cells().size();
+     stream << ",\"frontier_index_repairs\":" << frontier_index_repairs_;
      stream << ",\"global_reachable_free_cells\":" << global_frontiers_.reachable_free_cells;
      stream << ",\"frontier_cells\":" << last_frontier_cells_;
      stream << ",\"frontier_clusters\":" << last_frontier_clusters_;
@@ -319,11 +394,63 @@ class Explorer : public rclcpp::Node {
      stream << ",\"excluded_unknown_cells\":" << coverage_.excluded_unknown_cells;
      stream << ",\"reachable_coverage_ratio\":" << coverage_.reachable_ratio();
      stream << ",\"unresolved_unknown_cells\":" << unresolved_unknown_cells_;
-     stream << ",\"route_source\":\"" << route_source_ << "\"";
-     stream << ",\"route_stages\":" << route_stages_.size();
-     stream << ",\"route_stage_index\":" << route_index_;
-     stream << ",\"bootstrap_state\":" << static_cast<int>(bootstrap_state_);
-     stream << ",\"bootstrap_rotation\":" << bootstrap_rotation_;
+     stream << ",\"route_source\":\"" << path_processor_.source() << "\"";
+     stream << ",\"control_mode\":\"" << le::mode_name(control_mode_) << "\"";
+     stream << ",\"goal_id\":" << goal_id_;
+     stream << ",\"planning_attempt_id\":" << planning_attempt_id_;
+     stream << ",\"layer_map_version\":" << layer_version_;
+     stream << ",\"route_stages\":" << path_processor_.waypoints().size();
+     stream << ",\"route_stage_index\":" << path_processor_.index();
+     stream << ",\"route_skipped_nearby\":" << route_skipped_nearby_;
+     stream << ",\"scan_failure_count\":" << scan_failure_count_;
+     if (!scan_last_failure_.empty())
+       stream << ",\"scan_last_failure\":\"" << scan_last_failure_ << "\"";
+     if (route_selection_target_)
+       stream << ",\"selected_goal_x\":" << (*route_selection_target_)[0]
+              << ",\"selected_goal_y\":" << (*route_selection_target_)[1];
+     if (active_ && base_)
+       stream << ",\"active_waypoint_x\":" << active_->xy[0]
+              << ",\"active_waypoint_y\":" << active_->xy[1]
+              << ",\"active_waypoint_distance\":"
+              << xy_distance(active_->xy, {(*base_)[0], (*base_)[1]});
+     stream << ",\"recovery_phase\":\"" << le::recovery_phase_name(recovery_.phase()) << "\"";
+     stream << ",\"recovery_failures\":" << recovery_.failures();
+     stream << ",\"recovery_turn_steps\":" << recovery_turn_steps_;
+     stream << ",\"recovery_nearby_attempts\":" << recovery_nearby_attempts_;
+     stream << ",\"recovery_history_attempts\":" << recovery_history_attempts_;
+     stream << ",\"recovery_reverse_attempted\":"
+            << (recovery_reverse_attempted_ ? "true" : "false");
+     stream << ",\"recovery_reverse_sent\":"
+            << (recovery_reverse_sent_ ? "true" : "false");
+     stream << ",\"recovery_reverse_last_distance\":"
+            << recovery_reverse_last_distance_;
+     stream << ",\"recovery_reverse_next_index\":"
+            << recovery_reverse_next_index_;
+     stream << ",\"recovery_last_target_distance\":" << recovery_last_target_distance_;
+     stream << ",\"recovery_direct_limit\":" << route_segment_length_;
+     if (recovery_.active() && !recovery_turn_block_reason_.empty())
+       stream << ",\"recovery_turn_block_reason\":\"" << recovery_turn_block_reason_ << "\"";
+     const auto append_rejections = [&](const char *name,
+         const std::map<std::string, int> &rejections) {
+       stream << ",\"" << name << "\":{";
+       bool first = true;
+       for (const auto &[reason, count] : rejections) {
+         if (!first) stream << ',';
+         stream << '\"' << reason << "\":" << count;
+         first = false;
+       }
+       stream << '}';
+     };
+     if (recovery_.active()) {
+       append_rejections("recovery_strict_rejections", recovery_strict_rejections_);
+       append_rejections("recovery_direct_rejections", recovery_direct_rejections_);
+       append_rejections("recovery_reverse_rejections", recovery_reverse_rejections_);
+     }
+     if (recovery_.active() && !recovery_reverse_last_failure_.empty())
+       stream << ",\"recovery_reverse_last_failure\":\""
+              << recovery_reverse_last_failure_ << "\"";
+     if (recovery_.active() && !recovery_last_failure_.empty())
+       stream << ",\"recovery_last_failure\":\"" << recovery_last_failure_ << "\"";
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
      if (!detail.empty()) stream << ",\"detail\":\"" << detail << "\"";
      stream << '}';
@@ -388,9 +515,9 @@ class Explorer : public rclcpp::Node {
      if (std::isfinite(q_norm) && q_norm >= 0.5 && q_norm <= 1.5) {
        const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y),
                                      1.0 - 2.0 * (q.y * q.y + q.z * q.z));
-       if (bootstrap_state_ == BootstrapState::turning && base_yaw_) {
+       if (recovery_.phase() == le::RecoveryPhase::turning && base_yaw_) {
          const double delta = std::remainder(yaw - *base_yaw_, 2.0 * M_PI);
-         if (std::abs(delta) < 0.5) bootstrap_rotation_ += delta;
+         if (std::abs(delta) < 0.5) recovery_rotation_ += delta;
        }
        base_yaw_ = yaw;
        yaw_wall_ = wall_now();
@@ -426,10 +553,10 @@ class Explorer : public rclcpp::Node {
      process_clouds();
    }
 
-   // 接收 SCAN 规划器提供的障碍点。
-   void on_occupancy(const sensor_msgs::msg::PointCloud2 &msg) {
+   bool read_occupancy_points(const sensor_msgs::msg::PointCloud2 &msg,
+                              std::vector<le::XY> &output) {
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
-     if (msg.header.frame_id != frame_id_ || !base_) return;
+     if (msg.header.frame_id != frame_id_ || !base_) return false;
      bool x_found = false, y_found = false, z_found = false;
      // 依次处理收到或待发送的 ROS 消息。
      for (const auto &field : msg.fields) {
@@ -441,9 +568,9 @@ class Explorer : public rclcpp::Node {
        if (field.name == "z" && field.datatype == sensor_msgs::msg::PointField::FLOAT32) z_found = true;
      }
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
-     if (!x_found || !y_found || !z_found) return;
+     if (!x_found || !y_found || !z_found) return false;
      // 清空临时状态，准备下一轮处理。
-     external_obstacles_.clear();
+     output.clear();
      sensor_msgs::PointCloud2ConstIterator<float> x(msg, "x"), y(msg, "y"), z(msg, "z");
      const std::size_t total = static_cast<std::size_t>(msg.width) * msg.height;
      // 依次处理集合中的每一项。
@@ -452,9 +579,15 @@ class Explorer : public rclcpp::Node {
        if (std::isfinite(*x) && std::isfinite(*y) && std::isfinite(*z) &&
            std::abs(*z - (*base_)[2]) <= occupancy_height_tolerance_)
          // 把本次结果放入容器，供下一轮处理。
-         external_obstacles_.push_back({*x, *y});
+         output.push_back({*x, *y});
      }
-     occupancy_wall_ = wall_now();
+     return true;
+   }
+
+   // 接收 SCAN 规划器提供的膨胀障碍点。
+   void on_occupancy(const sensor_msgs::msg::PointCloud2 &msg) {
+     if (read_occupancy_points(msg, external_obstacles_))
+       occupancy_wall_ = wall_now();
    }
 
    // 接收层析图表面快照；它只提供路径候选，真正发给 SCAN 前还要检查占据图。
@@ -505,6 +638,7 @@ class Explorer : public rclcpp::Node {
      }
      layer_surfaces_ = std::move(surfaces);
      layer_wall_ = wall_now();
+     ++layer_version_;
    }
 
    // 判断 SCAN 障碍点云是否仍在有效时限内。
@@ -626,15 +760,14 @@ class Explorer : public rclcpp::Node {
      // 只有时间戳与本轮消息匹配时才采用这份数据。
      if (active_ && xy_distance(xy, active_->xy) < 0.05 && stamp_ns(msg.header.stamp) == active_->input_stamp) return;
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
-     if (!clearing_) {
-       if (bootstrap_state_ == BootstrapState::turning) stop_bootstrap_turn();
-       bootstrap_state_ = BootstrapState::done;
-       // 清空临时状态，准备下一轮处理。
-       active_.reset();
-       clear_route();
-       paused_ = true;
-       report("paused_for_manual_goal");
-     }
+     if (recovery_.phase() == le::RecoveryPhase::turning) stop_recovery_turn();
+     recovery_.finish();
+     control_mode_ = le::ExplorationMode::flat;
+     // An external manual goal supersedes the exploration route.
+     active_.reset();
+     reset_planned_route();
+     paused_ = true;
+     report("paused_for_manual_goal");
    }
 
    // ---------------------------------------------------------------
@@ -643,11 +776,8 @@ class Explorer : public rclcpp::Node {
    // 确认 SCAN 已接收或转发当前目标。
    void on_goal(const geometry_msgs::msg::PoseStamped &msg) {
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
-     if (clearing_ || msg.header.frame_id != frame_id_) return;
+     if (msg.header.frame_id != frame_id_) return;
      le::XY xy{msg.pose.position.x, msg.pose.position.y};
-     // 若最近一次清除结束后很短时间内且目标与基座距离 < 0.25 m，视为重复目标，直接返回
-     // 只有表达式为真，才执行下面缩进或花括号内的代码。
-     if (base_ && wall_now() - last_clear_wall_ < 2.0 && xy_distance(xy, {(*base_)[0], (*base_)[1]}) < 0.25) return;
      // 尚无对应数据或目标时，进入此分支。
      if (!active_) {
        paused_ = true;
@@ -660,11 +790,17 @@ class Explorer : public rclcpp::Node {
        // 与当前活动目标几乎相同，只更新时间戳（保证是最新的 Goal）
        if (stamp_ns(msg.header.stamp) < active_->input_stamp) return; // 老旧消息直接忽略
        active_->stamp = stamp_ns(msg.header.stamp);
+       path_processor_.bind_scan_goal(*active_->stamp);
+       if (pending_scan_failure_ && pending_scan_failure_->first == *active_->stamp) {
+         const auto pending = *pending_scan_failure_;
+         pending_scan_failure_.reset();
+         handle_scan_failure(pending.first, pending.second);
+       }
      } else {
        // 完全不同的目标：先清除当前目标并暂停
        // 清空临时状态，准备下一轮处理。
        active_.reset();
-       clear_route();
+       reset_planned_route();
        paused_ = true;
        report("paused_for_manual_goal");
      }
@@ -708,72 +844,210 @@ class Explorer : public rclcpp::Node {
    // 在回执和完成信号齐备时结算目标。
    void finish_if_complete() {
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
-     if (active_ && active_->ack && active_->complete) {
+     if (active_ && active_->ack && active_->complete && active_->stamp) {
+       auto result = path_processor_.resolve_execution(*active_->stamp, true, "goal_reached");
+       if (!result) return;
+       publish_execution_result(*result);
+       const bool recovered = active_->recovery && base_ &&
+           active_->initial_distance -
+               xy_distance(active_->xy, {(*base_)[0], (*base_)[1]}) >= 0.30;
        RCLCPP_INFO(get_logger(), "Frontier goal reached: %.2f, %.2f", active_->xy[0], active_->xy[1]);
        finish_active_goal();
        // 清空临时状态，准备下一轮处理。
        active_.reset();
        advance_route();
+       if (recovered && !path_processor_.active()) {
+         recovery_.finish();
+         recovery_turn_steps_ = 0;
+         control_mode_ = le::ExplorationMode::flat;
+       }
        // 清空临时状态，准备下一轮处理。
        empty_since_.reset();
        report("goal_reached");
      }
    }
 
-   // ---------------------------------------------------------------
-   // 请求清除已发布前沿点的 Trigger 服务
-   // ---------------------------------------------------------------
-   // 请求 SCAN 清空当前航点。
-   void request_clear() {
-     // 只有表达式为真，才执行下面缩进或花括号内的代码。
-     if (!clearing_ || clear_inflight_ || !clear_client_->service_is_ready()) return;
-     clear_inflight_ = true;
-     auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
-     clear_client_->async_send_request(request,
-         [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
-           clear_inflight_ = false;
-           try {
-             // 只有表达式为真，才执行下面缩进或花括号内的代码。
-             if (future.get()->success) {
-               clearing_ = false;
-               last_clear_wall_ = wall_now();
-               finish_active_goal();
-               // 清空临时状态，准备下一轮处理。
-               active_.reset();
-               // 只有表达式为真，才执行下面缩进或花括号内的代码。
-               if (clearing_reason_ == "proximity_reached") {
-                 advance_route();
-                 // 清空临时状态，准备下一轮处理。
-                 empty_since_.reset();
-                 report("goal_reached", "proximity_fallback");
-               } else {
-                 clear_route();
-                 report("goal_cleared");
-               }
-               // 清空临时状态，准备下一轮处理。
-               clearing_reason_.clear();
-             }
-           } catch (const std::exception &exc) {
-             RCLCPP_WARN(get_logger(), "Waypoint clear failed: %s", exc.what());
-           }
-         });
+   void publish_execution_result(const le::ExecutionResult &result) {
+     std_msgs::msg::String message;
+     std::ostringstream out;
+     out << "{\"goal_id\":" << result.goal_id
+         << ",\"attempt_id\":" << result.attempt_id
+         << ",\"stage_index\":" << result.stage_index
+         << ",\"scan_goal_stamp\":" << result.scan_goal_stamp
+         << ",\"source\":\"" << result.source
+         << "\",\"status\":\"" << (result.success ? "succeeded" : "failed")
+         << "\",\"reason\":\"" << result.reason << "\"}";
+     message.data = out.str();
+     execution_result_pub_->publish(message);
    }
 
-   // ---------------------------------------------------------------
-   // 开始清除流程（因超时、无进度或手动暂停）
-   // ---------------------------------------------------------------
-   // 进入清除当前目标的流程。
-   void start_clear(const std::string &reason) {
-     // 尚无对应数据或目标时，进入此分支。
-     if (!active_ || clearing_) return;
-     // 只有表达式为真，才执行下面缩进或花括号内的代码。
-     if (reason != "paused" && reason != "proximity_reached")
-       // 把本次结果放入容器，供下一轮处理。
-       suppressed_.push_back({active_->xy, wall_now() + cooldown_});
-     clearing_ = true;
-     clearing_reason_ = reason;
-     report("clearing_goal", reason);
-     request_clear();
+   std::optional<double> nearest_obstacle_distance(
+       const le::XY &point, const std::vector<le::XY> &obstacles,
+       double last_update) const {
+     if (last_update <= 0.0 ||
+         wall_now() - last_update > occupancy_timeout_ || obstacles.empty())
+       return std::nullopt;
+     double nearest = std::numeric_limits<double>::infinity();
+     for (const auto &obstacle : obstacles)
+       nearest = std::min(nearest, xy_distance(point, obstacle));
+     return nearest;
+   }
+
+   void publish_goal_diagnostic(const Active &goal, const char *event,
+                                const std::string &reason) {
+     const auto append_distance = [](std::ostringstream &out, const char *key,
+                                     std::optional<double> value) {
+       out << ",\"" << key << "\":";
+       if (value && std::isfinite(*value)) out << *value;
+       else out << "null";
+     };
+     const le::XY current = base_ ?
+         le::XY{(*base_)[0], (*base_)[1]} :
+         le::XY{goal.pose_at_send[0], goal.pose_at_send[1]};
+     std::ostringstream out;
+     out << std::setprecision(9) << "{\"event\":\"" << event
+         << "\",\"reason\":\"" << reason
+         << "\",\"goal_id\":" << goal.goal_id
+         << ",\"attempt_id\":" << goal.attempt_id
+         << ",\"stage_index\":" << goal.stage_index
+         << "\",\"input_stamp\":" << goal.input_stamp
+         << ",\"scan_goal_stamp\":" << goal.stamp.value_or(0)
+         << ",\"source\":\"" << goal.source_at_send
+         << "\",\"map_version_at_send\":" << goal.map_version_at_send
+         << ",\"map_version_now\":" << map_.version()
+         << ",\"layer_version_at_send\":" << goal.layer_version_at_send
+         << ",\"layer_version_now\":" << layer_version_
+         << ",\"start_x\":" << goal.pose_at_send[0]
+         << ",\"start_y\":" << goal.pose_at_send[1]
+         << ",\"start_z\":" << goal.pose_at_send[2]
+         << ",\"current_x\":" << current[0]
+         << ",\"current_y\":" << current[1]
+         << ",\"target_x\":" << goal.xy[0]
+         << ",\"target_y\":" << goal.xy[1]
+         << ",\"target_distance_now\":" << xy_distance(current, goal.xy)
+         << ",\"reference_points\":" << goal.reference_route.size()
+         << ",\"scan_bspline_traj_id\":"
+         << (active_scan_bspline_ ? active_scan_bspline_->traj_id : -1);
+     append_distance(out, "raw_distance_at_send", goal.raw_distance_at_send);
+     append_distance(out, "inflated_distance_at_send", goal.inflated_distance_at_send);
+     append_distance(out, "raw_distance_now",
+                     nearest_obstacle_distance(current, raw_obstacles_, raw_occupancy_wall_));
+     append_distance(out, "inflated_distance_now",
+                     nearest_obstacle_distance(current, external_obstacles_, occupancy_wall_));
+     out << '}';
+     std_msgs::msg::String message;
+     message.data = out.str();
+     goal_diagnostic_pub_->publish(message);
+     RCLCPP_INFO(get_logger(), "Goal diagnostic: %s", message.data.c_str());
+     if (std::string(event) != "failed") return;
+     nav_msgs::msg::Path reference, actual;
+     reference.header.frame_id = actual.header.frame_id = frame_id_;
+     reference.header.stamp = actual.header.stamp = now();
+     const auto add_reference = [&](const le::XY &p) {
+       geometry_msgs::msg::PoseStamped pose;
+       pose.header = reference.header;
+       pose.pose.position.x = p[0];
+       pose.pose.position.y = p[1];
+       pose.pose.position.z = goal.pose_at_send[2];
+       pose.pose.orientation.w = 1.0;
+       reference.poses.push_back(pose);
+     };
+     add_reference({goal.pose_at_send[0], goal.pose_at_send[1]});
+     for (const auto &point : goal.reference_route) add_reference(point);
+     diagnostic_reference_pub_->publish(reference);
+     geometry_msgs::msg::PoseStamped start_pose;
+     start_pose.header = actual.header;
+     start_pose.pose.position.x = goal.pose_at_send[0];
+     start_pose.pose.position.y = goal.pose_at_send[1];
+     start_pose.pose.position.z = goal.pose_at_send[2];
+     start_pose.pose.orientation.w = 1.0;
+     actual.poses.push_back(start_pose);
+     for (std::size_t i = goal.trajectory_start_index;
+          i < trajectory_.poses.size(); ++i)
+       actual.poses.push_back(trajectory_.poses[i]);
+     diagnostic_actual_pub_->publish(actual);
+     if (active_scan_bspline_)
+       diagnostic_bspline_pub_->publish(*active_scan_bspline_);
+   }
+
+   void handle_scan_failure(std::int64_t stamp, const std::string &reason) {
+     if (!active_ || !active_->stamp || *active_->stamp != stamp) return;
+     auto result = path_processor_.resolve_execution(stamp, false, reason);
+     if (!result) return;
+     publish_goal_diagnostic(*active_, "failed", reason);
+     publish_execution_result(*result);
+     ++scan_failure_count_;
+     scan_last_failure_ = reason;
+     const bool recovering = active_->recovery;
+     const bool reversing = active_->reverse;
+     const le::XY failed_target = route_selection_target_.value_or(active_->xy);
+     active_.reset();
+     reset_planned_route();
+     scan_plan_ready_ = false;
+     if (recovering) {
+       recovery_last_failure_ = reason;
+       if (reversing) {
+         recovery_reverse_last_failure_ = reason;
+         ++recovery_reverse_rejections_[reason];
+         recovery_reverse_attempted_ = false; // try the next short distance
+       }
+       report(reversing ? "recovery_reverse_failed" : "recovery_scan_failed", reason);
+       return;
+     }
+     suppressed_.push_back({failed_target, wall_now() + cooldown_});
+     if (base_) {
+       recovery_.record_failure({(*base_)[0], (*base_)[1]}, reason);
+       if (recovery_.limit_reached()) start_recovery(reason);
+     }
+     report("scan_plan_failed", reason);
+   }
+
+   void on_scan_failure(const std_msgs::msg::String &msg) {
+     const auto separator = msg.data.find('|');
+     if (separator == std::string::npos || separator == 0 || !active_) return;
+     std::int64_t stamp = 0;
+     const auto *begin = msg.data.data();
+     const auto *end = begin + separator;
+     const auto parsed = std::from_chars(begin, end, stamp);
+     if (parsed.ec != std::errc{} || parsed.ptr != end || stamp <= 0) return;
+     const auto reason = msg.data.substr(separator + 1);
+     if (reason.empty() || reason.size() > 80 ||
+         !std::all_of(reason.begin(), reason.end(), [](unsigned char ch) {
+           return (ch >= 'a' && ch <= 'z') || ch == '_';
+         })) return;
+     if (!active_->stamp) {
+       if (stamp >= active_->input_stamp)
+         pending_scan_failure_ = std::make_pair(stamp, reason);
+       return;
+     }
+     handle_scan_failure(stamp, reason);
+   }
+
+   void on_recovery_reverse_result(const std_msgs::msg::String &msg) {
+     if (!active_ || !active_->reverse || !active_->stamp) return;
+     const auto separator = msg.data.find('|');
+     if (separator == std::string::npos ||
+         msg.data.substr(separator + 1) != "succeeded") return;
+     std::int64_t stamp = 0;
+     const auto *begin = msg.data.data();
+     const auto parsed = std::from_chars(begin, begin + separator, stamp);
+     if (parsed.ec != std::errc{} || parsed.ptr != begin + separator ||
+         stamp != *active_->stamp) return;
+     auto result = path_processor_.resolve_execution(
+         stamp, true, "reverse_completed");
+     if (!result) return;
+     publish_execution_result(*result);
+     active_.reset();
+     reset_planned_route();
+     recovery_reverse_next_index_ = 0;
+     recovery_reverse_attempted_ = false;
+     recovery_nearby_attempts_ = 0;
+     recovery_history_attempts_ = 0;
+     recovery_.reset_attempts();
+     recovery_reverse_map_version_ = map_.version();
+     recovery_reverse_refresh_pending_ = true;
+     recovery_.set_phase(le::RecoveryPhase::settling);
+     report("recovery_reverse_waiting_for_map");
    }
 
    // ---------------------------------------------------------------
@@ -781,6 +1055,10 @@ class Explorer : public rclcpp::Node {
    // ---------------------------------------------------------------
    // 把选中的探索目标发送给 SCAN 航点协调器。
    void publish_target(const le::XY &xy, const std::string &detail = "") {
+     // A latched plan_ready from the preceding waypoint must not arm this one.
+     scan_plan_ready_ = false;
+     pending_scan_failure_.reset();
+     path_processor_.begin_execution();
      geometry_msgs::msg::PoseStamped msg;
      msg.header.stamp = now();
      msg.header.frame_id = frame_id_;
@@ -789,16 +1067,30 @@ class Explorer : public rclcpp::Node {
      // SCAN 的手动目标接口只接受 XY，Z 设为 0
      msg.pose.position.z = 0.0;
      msg.pose.orientation.w = 1.0;
-     double current = wall_now();
-     active_ = Active{xy, current, stamp_ns(msg.header.stamp), std::nullopt,
-                     xy_distance(xy, {(*base_)[0], (*base_)[1]}), current,
-                     false, false, false, std::nullopt, std::nullopt};
-     active_->recovery = detail == "recovery_backtrack";
+     active_ = Active{};
+     active_->xy = xy;
+     active_->input_stamp = stamp_ns(msg.header.stamp);
+     active_->initial_distance = xy_distance(
+         xy, {(*base_)[0], (*base_)[1]});
+     active_->pose_at_send = *base_;
+     active_->trajectory_start_index = trajectory_.poses.size();
+     active_->map_version_at_send = map_.version();
+     active_->layer_version_at_send = layer_version_;
+     active_->goal_id = path_processor_.goal_id();
+     active_->attempt_id = path_processor_.attempt_id();
+     active_->stage_index = path_processor_.index();
+     active_->source_at_send = path_processor_.source();
+     active_->reference_route = path_processor_.waypoints();
+     const le::XY here{(*base_)[0], (*base_)[1]};
+     active_->raw_distance_at_send = nearest_obstacle_distance(
+         here, raw_obstacles_, raw_occupancy_wall_);
+     active_->inflated_distance_at_send = nearest_obstacle_distance(
+         here, external_obstacles_, occupancy_wall_);
+     active_->recovery = control_mode_ == le::ExplorationMode::recovery;
      active_->observed_cells_at_send = map_.project({(*base_)[0], (*base_)[1]}).size();
-     // 只有表达式为真，才执行下面缩进或花括号内的代码。
-     if (active_->recovery)
-       recovery_gate_.start(active_->observed_cells_at_send);
+     active_scan_bspline_.reset();
      waypoint_pub_->publish(msg);
+     publish_goal_diagnostic(*active_, "sent", "");
      report("goal_sent", detail);
    }
 
@@ -816,226 +1108,517 @@ class Explorer : public rclcpp::Node {
        path.poses.push_back(pose);
      }
      planned_path_pub_->publish(path);
+     // Candidate paths have separate diagnostic topics. These three topics
+     // show only the route that the path processor actually selected.
+     nav_msgs::msg::Path empty;
+     empty.header = path.header;
+     const auto &source = path_processor_.source();
+     const bool has_route = !path.poses.empty();
+     selected_occupancy_path_pub_->publish(
+         has_route && source == "occupancy" ? path : empty);
+     selected_layer_path_pub_->publish(
+         has_route && source == "layer" ? path : empty);
+     selected_recovery_path_pub_->publish(
+         has_route && source.rfind("recovery", 0) == 0 ? path : empty);
    }
 
-   void clear_route() {
-     route_stages_.clear();
-     route_index_ = 0;
-     route_source_ = "none";
-     route_is_recovery_ = false;
+   void publish_candidate_path(const le::PlannerResult &result) {
+     nav_msgs::msg::Path path;
+     path.header.frame_id = frame_id_;
+     path.header.stamp = now();
+     if (result.usable()) {
+       for (const auto &xy : result.route.points) {
+         geometry_msgs::msg::PoseStamped pose;
+         pose.header = path.header;
+         pose.pose.position.x = xy[0];
+         pose.pose.position.y = xy[1];
+         pose.pose.position.z = base_ ? (*base_)[2] : 0.0;
+         pose.pose.orientation.w = 1.0;
+         path.poses.push_back(pose);
+       }
+     }
+     switch (result.kind) {
+       case le::PlannerKind::occupancy: occupancy_plan_pub_->publish(path); break;
+       case le::PlannerKind::layer: layer_plan_pub_->publish(path); break;
+       case le::PlannerKind::recovery: recovery_plan_pub_->publish(path); break;
+     }
+   }
+
+   // Reset only exploration's local path display/state. This never calls SCAN.
+   void reset_planned_route() {
+     path_processor_.clear();
+     route_selection_target_.reset();
+     route_skipped_nearby_ = 0;
      publish_planned_path({});
+     nav_msgs::msg::Path empty;
+     empty.header.frame_id = frame_id_;
+     empty.header.stamp = now();
+     occupancy_plan_pub_->publish(empty);
+     layer_plan_pub_->publish(empty);
+     recovery_plan_pub_->publish(empty);
    }
 
-   bool normal_waypoint_safe(
-       const le::XY &point,
-       const std::unordered_map<le::Cell, int, le::CellHash> &grid,
-       const std::vector<le::XY> &obstacles, bool layer_fresh) const {
-     if (le::waypoint_footprint_safety(point, grid, cfg_, obstacles) !=
-         le::WaypointSafety::safe) return false;
-     if (!layer_fresh) return true;
-     le::PlannedRoute one_waypoint;
-     one_waypoint.points = {point, point};
-     return !le::route_conflicts_with_layer(
-         one_waypoint, layer_surfaces_, layer_resolution_,
-         (*base_)[2] - layer_body_height_,
-         cfg_.robot_radius + cfg_.waypoint_safety_margin);
+   // 路点已经落在当前位置的到达范围内时，不再把它交给 SCAN 规划零距离轨迹。
+   bool skip_nearby_route_waypoints() {
+     if (!base_) return false;
+     const le::XY position{(*base_)[0], (*base_)[1]};
+     route_skipped_nearby_ += path_processor_.skip_within(position, goal_reach_xy_);
+     return path_processor_.active();
    }
 
-   // 转向时保持 GO2 的 RL 模式；结束后只发零角速度。
-   // 模式 2 在固定站立状态下会切换到趴下，不能在等待阶段重复发送。
-   void bootstrap_motion_tick() {
-     if (bootstrap_state_ != BootstrapState::turning) return;
-     geometry_msgs::msg::Twist cmd;
-     const bool fresh = base_ && wall_now() - base_wall_ <= odom_timeout_ &&
-         wall_now() - cloud_wall_ <= cloud_timeout_;
-     if (fresh && ready_ && !paused_ && !observation_only_) {
-       cmd.angular.z = startup_yaw_rate_;
+   // SCAN 的转向适配器仍订阅旧话题名；转向只可能发生在脱困状态。
+   void motion_tick() {
+     if (active_ && active_->stamp && (scan_plan_ready_ || active_->reverse) &&
+         !active_->complete && !paused_ && ready_ &&
+         !observation_only_) {
        std_msgs::msg::Int32 mode;
        mode.data = 3;
        control_mode_pub_->publish(mode);
      }
-     bootstrap_turn_pub_->publish(cmd);
+     if (recovery_.phase() != le::RecoveryPhase::turning) return;
+     geometry_msgs::msg::Twist cmd;
+     if (!active_ && base_ &&
+         wall_now() - base_wall_ <= odom_timeout_ &&
+         wall_now() - cloud_wall_ <= cloud_timeout_ && ready_ &&
+         !paused_ && !observation_only_) {
+       cmd.angular.z = recovery_yaw_rate_;
+       std_msgs::msg::Int32 mode;
+       mode.data = 3;
+       control_mode_pub_->publish(mode);
+     }
+     recovery_turn_pub_->publish(cmd);
    }
 
-   void stop_bootstrap_turn() {
-     bootstrap_turn_pub_->publish(geometry_msgs::msg::Twist{});
+   void stop_recovery_turn() {
+     recovery_turn_pub_->publish(geometry_msgs::msg::Twist{});
    }
 
-   bool handle_bootstrap(
+   // The robot already occupies this position. Turning is allowed with an
+   // observed-free centre and no measured obstacle in the swept body disk;
+   // unobserved ground under its feet is not asserted to be traversable.
+   bool can_turn_here(const std::unordered_map<le::Cell, int, le::CellHash> &grid,
+                      const std::vector<le::XY> &obstacles) const {
+     if (!base_ || cfg_.resolution <= 0.0) return false;
+     const le::XY xy{(*base_)[0], (*base_)[1]};
+     const le::Cell centre{static_cast<int>(std::floor(xy[0] / cfg_.resolution)),
+                           static_cast<int>(std::floor(xy[1] / cfg_.resolution))};
+     const auto at = grid.find(centre);
+     if (at != grid.end() && at->second != 0) return false;
+     bool nearby_free = false;
+     const double radius = cfg_.robot_radius + cfg_.waypoint_safety_margin;
+     for (const auto &[cell, state] : grid) {
+       const le::XY p{(cell.x + 0.5) * cfg_.resolution,
+                      (cell.y + 0.5) * cfg_.resolution};
+       if (state == 0 && xy_distance(p, xy) <= 1.0) nearby_free = true;
+       if (state != 1) continue;
+       if (xy_distance(p, xy) <= radius + cfg_.resolution * 0.7072) return false;
+     }
+     if (!nearby_free) return false;
+     const double extra = std::max(0.0, radius - cfg_.planner_occupancy_radius) +
+         cfg_.planner_occupancy_resolution * 0.7072;
+     return std::none_of(obstacles.begin(), obstacles.end(),
+                         [&](const le::XY &p) { return xy_distance(p, xy) <= extra; });
+   }
+
+   void start_recovery(const std::string &reason) {
+     if (!base_ || observation_only_ || paused_) return;
+     const le::XY xy{(*base_)[0], (*base_)[1]};
+     if (!recovery_.active()) {
+       recovery_.start(xy);
+       recovery_turn_steps_ = 0;
+       recovery_reverse_attempted_ = false;
+       recovery_reverse_next_index_ = 0;
+       recovery_reverse_last_distance_ = 0.0;
+       recovery_reverse_refresh_pending_ = false;
+       recovery_reverse_sent_ = false;
+       recovery_reverse_last_failure_.clear();
+       recovery_reverse_rejections_.clear();
+       recovery_nearby_attempts_ = 0;
+       recovery_history_attempts_ = 0;
+       recovery_last_failure_.clear();
+       recovery_turn_block_reason_.clear();
+       recovery_last_target_distance_ = 0.0;
+       recovery_strict_rejections_.clear();
+       recovery_direct_rejections_.clear();
+     }
+     control_mode_ = le::ExplorationMode::recovery;
+     report("recovery_started", reason);
+   }
+
+   bool try_recovery_reverse(
        const std::unordered_map<le::Cell, int, le::CellHash> &grid,
-       const std::vector<le::XY> &obstacles, bool layer_fresh, double current) {
-     if (!startup_scan_enabled_ || observation_only_ ||
-         bootstrap_state_ == BootstrapState::done) return false;
-     if (bootstrap_state_ == BootstrapState::failed) {
-       report("bootstrap_failed", bootstrap_failure_reason_);
-       bootstrap_state_ = BootstrapState::done;
+       const std::vector<le::XY> &obstacles, double current,
+       double reverse_distance) {
+     recovery_reverse_last_distance_ = reverse_distance;
+     const auto reject = [this](const std::string &reason) {
+       recovery_reverse_last_failure_ = reason;
+       recovery_last_failure_ = reason;
+       ++recovery_reverse_rejections_[reason];
+       return false;
+     };
+     if (!base_) return reject("reverse_pose_unavailable");
+     if (!base_yaw_) return reject("reverse_yaw_unavailable");
+     if (current - yaw_wall_ > odom_timeout_)
+       return reject("reverse_yaw_stale");
+     if (!planner_occupancy_fresh(current))
+       return reject("reverse_scan_occupancy_stale");
+     if (recovery_reverse_pub_->get_subscription_count() == 0)
+       return reject("reverse_executor_unavailable");
+     const le::XY start{(*base_)[0], (*base_)[1]};
+     auto route = le::plan_recovery_reverse_route(
+         grid, start, *base_yaw_, cfg_, obstacles, reverse_distance);
+     if (route.reason != "ok") {
+       return reject(route.reason);
+     }
+     le::PlanningGoal goal;
+     goal.goal_id = ++goal_id_;
+     goal.attempt_id = ++planning_attempt_id_;
+     goal.occupancy_version = map_.version();
+     goal.layer_version = layer_version_;
+     goal.mode = le::ExplorationMode::recovery;
+     goal.target = route.points.back();
+     goal.observation = goal.target;
+     goal.request_occupancy = false;
+     goal.request_layer = false;
+     goal.request_recovery = true;
+     le::PlannerResult result;
+     result.goal = goal;
+     result.kind = le::PlannerKind::recovery;
+     result.route = route;
+     result.waypoints = {goal.target};
+     result.source = "recovery_reverse";
+     result.reason = "ok";
+     if (!path_processor_.load(goal, result, true))
+       return reject("reverse_route_load_failed");
+     const auto stamp = now().nanoseconds();
+     if (stamp <= 0) {
+       reset_planned_route();
+       return reject("reverse_clock_unavailable");
+     }
+     Active activity;
+     activity.xy = goal.target;
+     activity.input_stamp = stamp;
+     activity.stamp = stamp;
+     activity.recovery = true;
+     activity.reverse = true;
+     activity.initial_distance = reverse_distance;
+     activity.pose_at_send = *base_;
+     activity.trajectory_start_index = trajectory_.poses.size();
+     activity.map_version_at_send = map_.version();
+     activity.layer_version_at_send = layer_version_;
+     activity.goal_id = goal.goal_id;
+     activity.attempt_id = goal.attempt_id;
+     activity.source_at_send = "recovery_reverse";
+     activity.reference_route = route.points;
+     activity.raw_distance_at_send = nearest_obstacle_distance(
+         start, raw_obstacles_, raw_occupancy_wall_);
+     activity.inflated_distance_at_send = nearest_obstacle_distance(
+         start, external_obstacles_, occupancy_wall_);
+     active_ = activity;
+     path_processor_.bind_scan_goal(stamp);
+     route_selection_target_ = goal.target;
+     recovery_last_target_distance_ = reverse_distance;
+     publish_candidate_path(result);
+     publish_planned_path(route);
+     std_msgs::msg::String request;
+     std::ostringstream out;
+     out << std::setprecision(17) << stamp << '|' << start[0] << '|'
+         << start[1] << '|' << goal.target[0] << '|' << goal.target[1]
+         << '|' << *base_yaw_;
+     request.data = out.str();
+     recovery_reverse_pub_->publish(request);
+     active_scan_bspline_.reset();
+     publish_goal_diagnostic(*active_, "sent", "");
+     recovery_reverse_sent_ = true;
+     recovery_reverse_last_failure_.clear();
+     report("recovery_reverse_sent");
+     return true;
+   }
+
+   bool handle_recovery(
+       const std::unordered_map<le::Cell, int, le::CellHash> &grid,
+       const std::vector<le::XY> &obstacles, double current) {
+     if (!recovery_.active()) return false;
+     if (active_) return true;
+     if (path_processor_.active()) return false;
+     if (cfg_.global_search && global_frontiers_.valid &&
+         global_frontiers_.frontier_cells == 0) {
+       if (recovery_.phase() == le::RecoveryPhase::turning) stop_recovery_turn();
+       recovery_.finish();
+       control_mode_ = le::ExplorationMode::flat;
        return false;
      }
-     if (grid.empty()) {
-       report("waiting_for_initial_map");
-       return true;
-     }
-     if (paused_ || !ready_ || waypoint_pub_->get_subscription_count() == 0) {
-       report("bootstrap_waiting_for_control");
-       return true;
-     }
-     if (require_planner_occupancy_ && !planner_occupancy_fresh(current)) {
-       report("waiting_for_planner_occupancy");
+     if (!ready_ || paused_ || observation_only_ ||
+         waypoint_pub_->get_subscription_count() == 0 ||
+         (require_planner_occupancy_ && !planner_occupancy_fresh(current))) {
+       if (recovery_.phase() == le::RecoveryPhase::turning) stop_recovery_turn();
+       report("recovery_waiting_for_control");
        return true;
      }
      const le::XY start{(*base_)[0], (*base_)[1]};
-     if (bootstrap_state_ == BootstrapState::pending) {
-       if (!base_yaw_ || current - yaw_wall_ > odom_timeout_ ||
-           bootstrap_turn_pub_->get_subscription_count() == 0) {
-         report("bootstrap_waiting_for_turn_adapter");
-         return true;
-       }
-       const auto footprint = le::waypoint_footprint_safety(
-           start, grid, cfg_, obstacles);
-       bool missing_support = false;
-       if (layer_fresh) {
-         missing_support = true;
-         for (const auto &s : layer_surfaces_) {
-           const le::XY p{(s.x_cell + 0.5) * layer_resolution_,
-                          (s.y_cell + 0.5) * layer_resolution_};
-           if (xy_distance(start, p) <= 0.45 &&
-               std::abs(s.height - ((*base_)[2] - layer_body_height_)) <= 0.20 &&
-               s.kind == le::SurfaceKind::flat &&
-               s.clearance != le::ClearanceKind::blocked &&
-               s.support_columns >= 5 && s.hit_observations >= 1) {
-             missing_support = false;
-             break;
-           }
-         }
-       }
-       if (footprint != le::WaypointSafety::unknown_footprint && !missing_support) {
-         bootstrap_state_ = BootstrapState::done;
-         return false;
-       }
-       bootstrap_start_ = start;
-       bootstrap_rotation_ = 0.0;
-       bootstrap_started_ = current;
-       bootstrap_state_ = BootstrapState::turning;
-       report("bootstrap_turning");
-       return true;
-     }
-     if (bootstrap_state_ == BootstrapState::turning) {
+     if (recovery_.phase() == le::RecoveryPhase::turning) {
        if (current - yaw_wall_ > odom_timeout_ ||
-           xy_distance(start, bootstrap_start_) > 0.25) {
-         stop_bootstrap_turn();
-         bootstrap_state_ = BootstrapState::failed;
-         bootstrap_failure_reason_ = "turn_interrupted_or_body_drift";
-         report("bootstrap_failed", bootstrap_failure_reason_);
-         return true;
-       }
-       if (current - bootstrap_started_ >= startup_turn_timeout_ &&
-           bootstrap_rotation_ < 2.0 * M_PI - 0.10) {
-         stop_bootstrap_turn();
-         bootstrap_state_ = BootstrapState::failed;
-         bootstrap_failure_reason_ = "turn_timeout";
-         report("bootstrap_failed", bootstrap_failure_reason_);
-         return true;
-       }
-       if (bootstrap_rotation_ >= 2.0 * M_PI - 0.10) {
-         stop_bootstrap_turn();
-         bootstrap_state_ = BootstrapState::settling;
-         bootstrap_started_ = current;
-         report("bootstrap_settling");
-       } else report("bootstrap_turning");
+           xy_distance(start, recovery_turn_origin_) > 0.25 ||
+           current - recovery_turn_started_ > recovery_turn_timeout_) {
+         stop_recovery_turn();
+         recovery_.set_phase(le::RecoveryPhase::history);
+         report("recovery_turn_interrupted");
+       } else if (recovery_rotation_ >= recovery_turn_step_) {
+         stop_recovery_turn();
+         ++recovery_turn_steps_;
+         recovery_turn_started_ = current;
+         recovery_.set_phase(le::RecoveryPhase::settling);
+         report("recovery_turn_settling");
+       } else report("recovery_turning");
        return true;
      }
-     if (bootstrap_state_ == BootstrapState::settling) {
-       if (current - bootstrap_started_ < 1.5) {
-         report("bootstrap_settling");
+     if (recovery_.phase() == le::RecoveryPhase::settling) {
+       if (recovery_reverse_refresh_pending_) {
+         if (map_.version() <= recovery_reverse_map_version_ ||
+             current - cloud_wall_ > cloud_timeout_) {
+           report("recovery_reverse_waiting_for_map");
+           return true;
+         }
+         recovery_reverse_refresh_pending_ = false;
+         if (le::waypoint_footprint_safety(start, grid, cfg_, obstacles) ==
+             le::WaypointSafety::safe) {
+           recovery_.finish();
+           recovery_turn_steps_ = 0;
+           control_mode_ = le::ExplorationMode::flat;
+           report("recovery_reverse_completed");
+           return true;
+         }
+         recovery_.set_phase(le::RecoveryPhase::nearby);
+         report("recovery_reverse_partial");
          return true;
        }
-       bootstrap_state_ = BootstrapState::seeking;
-     }
-     if (bootstrap_state_ == BootstrapState::seeking) {
-       for (const auto &goal : le::startup_viewpoints(
-                grid, start, cfg_, obstacles, startup_goal_min_distance_,
-                startup_goal_max_distance_)) {
-         if (!normal_waypoint_safe(goal, grid, obstacles, layer_fresh)) continue;
-         bootstrap_state_ = BootstrapState::done;
-         publish_planned_path({{goal}, "bootstrap"});
-         publish_target(goal, "bootstrap_nearby_safe_viewpoint");
+       if (current - recovery_turn_started_ < 1.5) {
+         report("recovery_turn_settling");
          return true;
        }
-       bootstrap_state_ = BootstrapState::done;
-       report("bootstrap_no_nearby_safe_viewpoint");
-       return false;
+       recovery_.reset_attempts();
+       recovery_nearby_attempts_ = 0;
+       recovery_.set_phase(le::RecoveryPhase::nearby);
      }
-     return false;
+     if (recovery_.phase() == le::RecoveryPhase::nearby) {
+       const auto candidates = recovery_.nearby_candidates(
+           grid, start, cfg_, obstacles, recovery_goal_min_distance_,
+           recovery_goal_max_distance_);
+       const auto batch = std::min<std::size_t>(candidates.size(), 8);
+       for (std::size_t i = 0; i < batch; ++i) {
+         if (!recovery_.mark_attempted(candidates[i])) continue;
+         ++recovery_nearby_attempts_;
+         if (prepare_route(candidates[i], grid, obstacles, "recovery_nearby")) return true;
+       }
+       if (candidates.size() > batch && recovery_nearby_attempts_ < 24) {
+         report("recovery_trying_nearby");
+         return true;
+       }
+       if (!recovery_reverse_attempted_) {
+         std::array<double, 4> distances{
+             0.22, recovery_reverse_distance_, 0.50, 0.60};
+         std::sort(distances.begin(), distances.end());
+         while (recovery_reverse_next_index_ < distances.size()) {
+           const std::size_t index = recovery_reverse_next_index_++;
+           const double candidate = distances[index];
+           if (index > 0 && candidate <= distances[index - 1] + 1e-6)
+             continue;
+           if (try_recovery_reverse(grid, obstacles, current, candidate)) return true;
+         }
+         recovery_reverse_attempted_ = true;
+       }
+       if (recovery_turn_steps_ < recovery_max_turn_steps_ &&
+           base_yaw_ && current - yaw_wall_ <= odom_timeout_ &&
+           recovery_turn_pub_->get_subscription_count() > 0 &&
+           can_turn_here(grid, obstacles)) {
+         recovery_turn_block_reason_.clear();
+         recovery_rotation_ = 0.0;
+         recovery_turn_origin_ = start;
+         recovery_turn_started_ = current;
+         recovery_.set_phase(le::RecoveryPhase::turning);
+         report("recovery_turning");
+         return true;
+       }
+       if (recovery_turn_steps_ >= recovery_max_turn_steps_)
+         recovery_turn_block_reason_ = "turn_limit_reached";
+       else if (!base_yaw_ || current - yaw_wall_ > odom_timeout_)
+         recovery_turn_block_reason_ = "yaw_unavailable_or_stale";
+       else if (recovery_turn_pub_->get_subscription_count() == 0)
+         recovery_turn_block_reason_ = "turn_subscriber_missing";
+       else
+         recovery_turn_block_reason_ = "unsafe_turn_footprint";
+       recovery_.set_phase(le::RecoveryPhase::history);
+     }
+     if (recovery_.phase() == le::RecoveryPhase::history) {
+       std::vector<le::XY> history;
+       history.reserve(trajectory_.poses.size());
+       for (const auto &p : trajectory_.poses)
+         history.push_back({p.pose.position.x, p.pose.position.y});
+       const auto candidates = recovery_.historical_candidates(
+           history, start, grid, cfg_, obstacles);
+       const auto batch = std::min<std::size_t>(candidates.size(), 8);
+       for (std::size_t i = 0; i < batch; ++i) {
+         if (!recovery_.mark_attempted(candidates[i])) continue;
+         ++recovery_history_attempts_;
+         if (prepare_route(candidates[i], grid, obstacles, "recovery_history")) return true;
+       }
+       if (candidates.size() > batch && recovery_history_attempts_ < 24) {
+         report("recovery_trying_history");
+         return true;
+       }
+       recovery_.set_phase(le::RecoveryPhase::blocked);
+       recovery_blocked_observed_ = grid.size();
+       recovery_blocked_wall_ = current;
+     }
+     if (recovery_.phase() == le::RecoveryPhase::blocked &&
+         (grid.size() > recovery_blocked_observed_ + min_new_cells_ ||
+          current - recovery_blocked_wall_ >= recovery_retry_interval_)) {
+       recovery_.reset_attempts();
+       recovery_nearby_attempts_ = 0;
+       recovery_history_attempts_ = 0;
+       recovery_.set_phase(le::RecoveryPhase::nearby);
+       recovery_reverse_attempted_ = false;
+       recovery_reverse_next_index_ = 0;
+       recovery_blocked_observed_ = grid.size();
+       recovery_blocked_wall_ = current;
+       report("recovery_recheck");
+       return true;
+     }
+     report("recovery_blocked", recovery_last_failure_.empty() ?
+            "no_safe_recovery_route" : recovery_last_failure_);
+     return true;
    }
 
-   // 两个规划器只交付路径；此处唯一决定并发布哪一条路径及其首个路点。
+   // 控制器先选安全观察点，再让两路规划器独立规划到同一个点。
    bool prepare_route(const le::XY &target,
                       const std::unordered_map<le::Cell, int, le::CellHash> &grid,
                       const std::vector<le::XY> &obstacles,
                       const std::string &detail = "") {
-     const le::XY start{(*base_)[0], (*base_)[1]};
-     auto occupancy = le::plan_occupancy_route(grid, start, target, cfg_, obstacles);
-     if (occupancy.points.size() < 2) {
-       suppressed_.push_back({target, wall_now() + cooldown_});
-       report("route_unavailable", occupancy.reason);
-       return false;
-     }
-     std::string source = "occupancy";
-     auto stages = le::stage_route(occupancy, grid, cfg_, obstacles,
-                                   route_segment_length_);
-     const auto waypoints_conflict_with_layer = [&](const std::vector<le::XY> &waypoints) {
-       le::PlannedRoute sent;
-       sent.points.push_back(start);
-       sent.points.insert(sent.points.end(), waypoints.begin(), waypoints.end());
-       return le::route_conflicts_with_layer(
-           sent, layer_surfaces_, layer_resolution_,
-           (*base_)[2] - layer_body_height_,
-           cfg_.robot_radius + cfg_.waypoint_safety_margin);
-     };
+     const bool recovery = control_mode_ == le::ExplorationMode::recovery;
+     if (recovery && base_)
+       recovery_last_target_distance_ = xy_distance(
+           {(*base_)[0], (*base_)[1]}, target);
      const bool layer_fresh = layer_wall_ > 0.0 &&
          wall_now() - layer_wall_ <= layer_timeout_ && !layer_surfaces_.empty();
-     if (layer_fresh) {
-       auto surface = le::plan_surface_route(
-           layer_surfaces_, *base_, occupancy.points.back(),
-           layer_resolution_, layer_body_height_);
-       auto surface_stages = le::stage_route(
-           surface, grid, cfg_, obstacles, route_segment_length_);
-       if (surface.points.size() >= 2 && !surface_stages.empty() &&
-           !waypoints_conflict_with_layer(surface_stages)) {
-         stages = std::move(surface_stages);
-         source = "layer";
+     auto viewpoints = recovery ? std::vector<le::XY>{target} :
+         le::observation_viewpoints(grid, target, cfg_, obstacles);
+     if (viewpoints.empty()) {
+       if (recovery) recovery_last_failure_ = "no_safe_recovery_viewpoint";
+       if (!recovery) suppressed_.push_back({target, wall_now() + cooldown_});
+       if (!recovery && base_) {
+         recovery_.record_failure({(*base_)[0], (*base_)[1]},
+                                  "no_safe_observation_position");
+         if (recovery_.limit_reached())
+           start_recovery("no_safe_observation_position");
        }
-       if (source == "occupancy" && !stages.empty() &&
-           waypoints_conflict_with_layer(stages)) {
-         suppressed_.push_back({target, wall_now() + cooldown_});
-         report("route_unavailable", "waypoint_inside_layer_clearance");
-         return false;
-       }
-     }
-     if (stages.empty()) {
-       suppressed_.push_back({target, wall_now() + cooldown_});
-       report("route_unavailable", "no_safe_waypoints");
+       report("route_unavailable", "no_safe_observation_position");
        return false;
      }
-     if (!normal_waypoint_safe(stages.front(), grid, obstacles, layer_fresh)) {
-       report("route_unavailable", "first_waypoint_no_longer_safe");
-       return false;
+     nav_msgs::msg::Path empty;
+     empty.header.frame_id = frame_id_;
+     empty.header.stamp = now();
+     occupancy_plan_pub_->publish(empty);
+     layer_plan_pub_->publish(empty);
+     recovery_plan_pub_->publish(empty);
+     const auto &free_observations = map_.free_observation_frames();
+     const le::PlanningSnapshot snapshot{grid, obstacles, layer_surfaces_, cfg_,
+         *base_, layer_resolution_, layer_body_height_, route_segment_length_,
+         layer_fresh, &free_observations};
+     std::string failure = "no_planner_result";
+     for (std::size_t i = 0; i < std::min<std::size_t>(viewpoints.size(), 12); ++i) {
+       le::PlanningGoal goal;
+       goal.goal_id = ++goal_id_;
+       goal.attempt_id = ++planning_attempt_id_;
+       goal.occupancy_version = map_.version();
+       goal.layer_version = layer_version_;
+       goal.target = target;
+       goal.observation = viewpoints[i];
+       goal.mode = control_mode_;
+       goal.request_layer = layer_fresh && !recovery;
+       goal.request_recovery = recovery;
+       {
+         std_msgs::msg::String message;
+         std::ostringstream out;
+         out << "{\"goal_id\":" << goal.goal_id << ",\"attempt_id\":"
+             << goal.attempt_id << ",\"occupancy_version\":"
+             << goal.occupancy_version << ",\"layer_version\":"
+             << goal.layer_version << ",\"mode\":\""
+             << le::mode_name(goal.mode) << "\",\"planner_mask\":\""
+             << (recovery ? "recovery" : goal.request_layer ? "occupancy,layer" : "occupancy")
+             << "\",\"x\":" << target[0] << ",\"y\":" << target[1]
+             << ",\"observation_x\":" << goal.observation[0]
+             << ",\"observation_y\":" << goal.observation[1] << '}';
+         message.data = out.str();
+         planning_goal_pub_->publish(message);
+       }
+       auto results = le::plan_candidates(goal, snapshot);
+       for (const auto &result : results) {
+         publish_candidate_path(result);
+         std_msgs::msg::String message;
+         std::ostringstream out;
+         out << "{\"goal_id\":" << result.goal.goal_id
+             << ",\"attempt_id\":" << result.goal.attempt_id
+             << ",\"occupancy_version\":" << result.goal.occupancy_version
+             << ",\"layer_version\":" << result.goal.layer_version
+             << ",\"planner\":\"" << le::planner_name(result.kind)
+             << "\",\"usable\":" << (result.usable() ? "true" : "false")
+             << ",\"waypoints\":" << result.waypoints.size()
+             << ",\"reason\":\"" << result.reason << "\"";
+         if (recovery) {
+           out << ",\"target_distance\":" << recovery_last_target_distance_
+               << ",\"direct_limit\":" << route_segment_length_
+               << ",\"strict_reason\":\"" << result.strict_reason
+               << "\",\"direct_reason\":\"" << result.direct_reason << "\"";
+         }
+         out << '}';
+         message.data = out.str();
+         planning_result_pub_->publish(message);
+         if (recovery) {
+           if (!result.strict_reason.empty() && result.strict_reason != "ok")
+             ++recovery_strict_rejections_[result.strict_reason];
+           if (!result.direct_reason.empty() &&
+               result.direct_reason != "unverified_recovery_connection")
+             ++recovery_direct_rejections_[result.direct_reason];
+         }
+         if (!result.usable()) failure = result.reason;
+       }
+       const auto *chosen = le::select_plan(goal, results);
+       if (!chosen || !path_processor_.load(goal, *chosen, recovery)) continue;
+       route_selection_target_ = target;
+       route_skipped_nearby_ = 0;
+       if (!skip_nearby_route_waypoints()) {
+         reset_planned_route();
+         failure = "observation_position_already_reached";
+         continue;
+       }
+       control_mode_ = goal.mode;
+       le::PlannedRoute sent_route;
+       sent_route.points = path_processor_.waypoints();
+       publish_planned_path(sent_route);
+       RCLCPP_INFO(get_logger(),
+           "Route goal=%llu frontier=(%.2f, %.2f) observation=(%.2f, %.2f) planner=%s stages=%zu",
+           static_cast<unsigned long long>(goal.goal_id), target[0], target[1],
+           goal.observation[0], goal.observation[1], path_processor_.source().c_str(),
+           path_processor_.waypoints().size());
+       publish_target(path_processor_.current(),
+                      recovery ? "recovery_nearby" : path_processor_.source() + "_route" +
+                      (detail == "low_yield_frontier" ? "_low_yield" : ""));
+       if (recovery) recovery_last_failure_.clear();
+       return true;
      }
-     route_stages_ = std::move(stages);
-     route_index_ = 0;
-     route_source_ = source;
-     route_is_recovery_ = detail == "recovery_backtrack";
-     // RViz 显示的就是逐次交给 SCAN 的安全路点，不显示未经下发检查的原始 A* 格。
-     le::PlannedRoute sent_route;
-     sent_route.points = route_stages_;
-     publish_planned_path(sent_route);
-     publish_target(route_stages_.front(), route_is_recovery_ ? detail : source + "_route");
-     return true;
+     if (!recovery) suppressed_.push_back({target, wall_now() + cooldown_});
+     if (recovery) recovery_last_failure_ = failure;
+     if (!recovery && base_) {
+       recovery_.record_failure({(*base_)[0], (*base_)[1]}, failure);
+       if (recovery_.limit_reached()) start_recovery(failure);
+     }
+     report("route_unavailable", failure);
+     return false;
    }
 
    void advance_route() {
-     if (route_stages_.empty()) return;
-     if (++route_index_ >= route_stages_.size()) clear_route();
+     if (!path_processor_.active()) return;
+     if (!path_processor_.advance()) reset_planned_route();
    }
 
    // 记录目标结束时地图是否增长。
@@ -1044,39 +1627,15 @@ class Explorer : public rclcpp::Node {
      if (!active_ || !base_) return;
      auto observed = map_.project({(*base_)[0], (*base_)[1]}).size();
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
-     if (route_stages_.size() > route_index_ + 1) return;
-     if (active_->recovery)
-       recovery_gate_.finish(observed);
-     // 上一条件不满足时，再检查这个分支。
-     else if (clearing_reason_.empty() || clearing_reason_ == "proximity_reached")
+     if (path_processor_.waypoints().size() > path_processor_.index() + 1) return;
+     if (!active_->recovery) {
        goal_progress_gate_.finish(active_->xy, active_->observed_cells_at_send, observed);
-   }
-
-   // 声明可为空的结果，尚未找到时保持空值。
-   std::optional<le::XY> backtrack_goal() const {
-     // 只有表达式为真，才执行下面缩进或花括号内的代码。
-     if (!base_ || trajectory_.poses.empty()) return std::nullopt;
-     // 将右侧计算值存入 grid（二维投影地图）。
-     auto grid = cfg_.global_search ? map_.project_all() :
-         map_.project({(*base_)[0], (*base_)[1]});
-     // 依次处理集合中的每一项。
-     for (auto it = trajectory_.poses.rbegin(); it != trajectory_.poses.rend(); ++it) {
-       le::XY xy{it->pose.position.x, it->pose.position.y};
-       double range = xy_distance(xy, {(*base_)[0], (*base_)[1]});
-       // 根据当前目标是否存在或是否完成来决定下一步。
-       if (range < std::max(2.0, cfg_.min_goal_distance) ||
-           range > cfg_.max_goal_distance) continue;
-       le::Cell cell{static_cast<int>(std::floor(xy[0] / cfg_.resolution)),
-                     static_cast<int>(std::floor(xy[1] / cfg_.resolution))};
-       // 将右侧计算值存入 state（探索状态）。
-       auto state = grid.find(cell);
-       // 检查当前二维格的已知空闲、障碍或未知状态。
-       if (state == grid.end() || state->second != 0 || planner_blocks(xy)) continue;
-       // 把此函数算出的值交还给调用者。
-       return xy;
+       // 低收益目标可以在没有高收益目标时重试，但短时间内不重复同一点。
+       const auto gained = observed - std::min(observed, active_->observed_cells_at_send);
+       if (gained < min_new_cells_ && low_yield_retry_cooldown_ > 0.0)
+         suppressed_.push_back({route_selection_target_.value_or(active_->xy),
+                                wall_now() + low_yield_retry_cooldown_});
      }
-     // 把此函数算出的值交还给调用者。
-     return std::nullopt;
    }
 
    // ---------------------------------------------------------------
@@ -1107,7 +1666,7 @@ class Explorer : public rclcpp::Node {
    }
 
    // ---------------------------------------------------------------
-   // 主循环 tick：每秒执行一次，负责状态调度、超时检测、前沿搜索、目标发布等
+   // 主循环 tick：每秒执行状态调度、前沿搜索与目标发布
    // ---------------------------------------------------------------
    // 每秒执行一次探索状态机。
    void tick() {
@@ -1118,15 +1677,13 @@ class Explorer : public rclcpp::Node {
        trajectory_pub_->publish(trajectory_);
      }
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
-     if (clearing_) { empty_since_.reset(); request_clear(); return; }
      // 数据失效检查：基座、里程计、点云必须在对应超时范围内
-     // 数据或目标超时后，转入等待或清除流程。
+     // 感知数据过期时暂停新的选点；已下发路点仍由 SCAN 执行。
      if (!base_ || current - base_wall_ > odom_timeout_ ||
          cloud_wall_ == 0.0 || current - cloud_wall_ > cloud_timeout_) {
-       if (bootstrap_state_ == BootstrapState::turning) {
-         stop_bootstrap_turn();
-         bootstrap_state_ = BootstrapState::failed;
-         bootstrap_failure_reason_ = "stale_odometry_or_cloud";
+       if (recovery_.phase() == le::RecoveryPhase::turning) {
+         stop_recovery_turn();
+         recovery_.set_phase(le::RecoveryPhase::history);
        }
        // 清空临时状态，准备下一轮处理。
        empty_since_.reset();
@@ -1143,79 +1700,26 @@ class Explorer : public rclcpp::Node {
      coverage_ = le::assess_reachable_coverage(projected, cfg_,
                                                {(*base_)[0], (*base_)[1]});
      publish_coverage_grid(projected);
-     if (cfg_.global_search)
+     if (cfg_.global_search) {
+       auto dirty = map_.take_dirty_cells();
+       if (!frontier_index_initialized_) {
+         frontier_index_.rebuild(route_grid);
+         frontier_index_initialized_ = true;
+       } else if (!dirty.empty()) {
+         frontier_index_.update(route_grid, dirty);
+       }
        global_frontiers_ = le::assess_global_frontiers(
-           route_grid, cfg_, {(*base_)[0], (*base_)[1]});
+           route_grid, cfg_, {(*base_)[0], (*base_)[1]},
+           &frontier_index_.cells());
+     }
 
-     // ------------------- 已有活动目标的情况 -------------------
-     // 只有表达式为真，才执行下面缩进或花括号内的代码。
+     // A sent waypoint stays active until SCAN acknowledges completion or an
+     // external manual goal takes over. Map changes and elapsed time do not
+     // invalidate it here.
      if (active_) {
        empty_since_.reset();
-       // 尚无对应数据或目标时，进入此分支。
-       if (!active_->stamp) {
-         // 尚未收到外部 Goal 时间戳，若超出 forward_timeout_ 则放弃该目标
-         // 数据或目标超时后，转入等待或清除流程。
-         if (current - active_->sent > forward_timeout_) {
-           // 只有表达式为真，才执行下面缩进或花括号内的代码。
-           if (active_->recovery && base_)
-             recovery_gate_.finish(map_.project({(*base_)[0], (*base_)[1]}).size());
-           // 清空临时状态，准备下一轮处理。
-           active_.reset();
-           clear_route();
-           report("goal_not_forwarded");
-         }
-         // 结束当前函数，不再执行后面的语句。
-         return;
-       }
-       double remaining = xy_distance(active_->xy, {(*base_)[0], (*base_)[1]});
-       // 根据当前目标是否存在或是否完成来决定下一步。
-       if (remaining <= goal_reach_xy_) {
-         // 清空临时状态，准备下一轮处理。
-         active_->blocked_since.reset();
-         // 尚无对应数据或目标时，进入此分支。
-         if (!active_->near_since) active_->near_since = current;
-         // 上一条件不满足时，再检查这个分支。
-         else if (current - *active_->near_since >= near_goal_dwell_) {
-           start_clear("proximity_reached");
-           // 结束当前函数，不再执行后面的语句。
-           return;
-         }
-       } else {
-         // 清空临时状态，准备下一轮处理。
-         active_->near_since.reset();
-         // 只有表达式为真，才执行下面缩进或花括号内的代码。
-         static const std::vector<le::XY> no_obstacles;
-         const auto &current_obstacles = planner_occupancy_fresh(current) ?
-             external_obstacles_ : no_obstacles;
-         const bool current_layer_fresh = layer_wall_ > 0.0 &&
-             current - layer_wall_ <= layer_timeout_ && !layer_surfaces_.empty();
-         if (!normal_waypoint_safe(
-                 active_->xy, route_grid, current_obstacles, current_layer_fresh)) {
-           // 尚无对应数据或目标时，进入此分支。
-           if (!active_->blocked_since) active_->blocked_since = current;
-           // 上一条件不满足时，再检查这个分支。
-           else if (current - *active_->blocked_since >= blocked_goal_dwell_) {
-             start_clear("target_occupied_in_scan");
-             // 结束当前函数，不再执行后面的语句。
-             return;
-           }
-         } else {
-           // 清空临时状态，准备下一轮处理。
-           active_->blocked_since.reset();
-         }
-       }
-       // 进度检测：若当前距离比历史最佳距离再小 progress_distance_，更新进度计时
-       // 只有表达式为真，才执行下面缩进或花括号内的代码。
-       if (remaining < active_->best_distance - progress_distance_) {
-         active_->best_distance = remaining;
-         active_->progress_wall = current;
-       }
-       // 超时处理：整体目标超时或长时间没有进度
-       // 根据当前目标是否存在或是否完成来决定下一步。
-       if (current - active_->sent > goal_timeout_) start_clear("goal_timeout");
-       // 上一条件不满足时，再检查这个分支。
-       else if (current - active_->progress_wall > progress_timeout_) start_clear("no_progress");
-       // 结束当前函数，不再执行后面的语句。
+       report(active_->stamp ? "waiting_for_scan_completion" :
+              "waiting_for_scan_forward");
        return;
      }
 
@@ -1227,13 +1731,12 @@ class Explorer : public rclcpp::Node {
        // 结束当前函数，不再执行后面的语句。
        return;
      }
-     static const std::vector<le::XY> no_bootstrap_obstacles;
-     const auto &bootstrap_obstacles = planner_occupancy_fresh(current) ?
-         external_obstacles_ : no_bootstrap_obstacles;
-     const bool bootstrap_layer_fresh = layer_wall_ > 0.0 &&
-         current - layer_wall_ <= layer_timeout_ && !layer_surfaces_.empty();
-     if (!active_ && handle_bootstrap(route_grid, bootstrap_obstacles,
-                                     bootstrap_layer_fresh, current)) return;
+     if (control_mode_ == le::ExplorationMode::waiting_initial_data)
+       control_mode_ = le::ExplorationMode::flat;
+     static const std::vector<le::XY> no_recovery_obstacles;
+     const auto &recovery_obstacles = planner_occupancy_fresh(current) ?
+         external_obstacles_ : no_recovery_obstacles;
+     if (handle_recovery(route_grid, recovery_obstacles, current)) return;
      // 投影到水平面，检查是否还有 free（未占据）空间
      // 矩形覆盖率只供显示；全局完成不依赖预设矩形是否覆盖整片场地。
      unresolved_unknown_cells_ = 0;
@@ -1243,6 +1746,11 @@ class Explorer : public rclcpp::Node {
      // 只有表达式为真，才执行下面缩进或花括号内的代码。
      if (!has_free) {
        empty_since_.reset();
+       if (!route_grid.empty() && !observation_only_ && !paused_ && ready_ &&
+           waypoint_pub_->get_subscription_count() > 0) {
+         start_recovery("no_reachability_seed");
+         if (handle_recovery(route_grid, recovery_obstacles, current)) return;
+       }
        report("waiting_for_free_space");
        // 结束当前函数，不再执行后面的语句。
        return;
@@ -1257,36 +1765,58 @@ class Explorer : public rclcpp::Node {
      static const std::vector<le::XY> no_route_obstacles;
      const auto &route_obstacles = planner_occupancy_fresh(current) ?
          external_obstacles_ : no_route_obstacles;
-     const bool layer_fresh = layer_wall_ > 0.0 &&
-         current - layer_wall_ <= layer_timeout_ && !layer_surfaces_.empty();
-     if (!route_stages_.empty() && route_index_ < route_stages_.size()) {
+     if (path_processor_.active()) {
        if (observation_only_ || paused_ || !ready_ ||
            waypoint_pub_->get_subscription_count() == 0) {
          report(paused_ ? "paused" : "waiting_for_waypoint_coordinator");
          return;
        }
-       if (!normal_waypoint_safe(route_stages_[route_index_], route_grid,
-                                 route_obstacles, layer_fresh)) {
-         clear_route();
-         report("route_invalidated", "next_waypoint_no_longer_safe");
-         return;
-       }
-       publish_target(route_stages_[route_index_],
-                      route_is_recovery_ ? "recovery_backtrack" : route_source_ + "_route");
+       // The route advances only after the preceding SCAN completion callback.
+       publish_target(path_processor_.current(),
+                      path_processor_.recovery() ? "recovery_route" :
+                      path_processor_.source() + "_route");
        return;
      }
      if (cfg_.global_search && !global_frontiers_.valid) {
        empty_since_.reset();
+       if (!route_grid.empty() && !observation_only_ && !paused_ && ready_ &&
+           waypoint_pub_->get_subscription_count() > 0) {
+         start_recovery("no_reachability_seed");
+         if (handle_recovery(route_grid, route_obstacles, current)) return;
+       }
        report("waiting_for_reachability_seed");
        return;
      }
      if (cfg_.global_search && global_frontiers_.frontier_cells == 0) {
+       if (paused_) {
+         empty_since_.reset();
+         report("paused");
+         return;
+       }
+       if (!empty_since_) empty_since_ = current;
+       if (current - *empty_since_ >= no_frontier_hold_) {
+         // 只有完成前才独立全图复核；缓存遗漏会触发修复而非误报完成。
+         auto audit = le::assess_global_frontiers(
+             route_grid, cfg_, {(*base_)[0], (*base_)[1]});
+         if (!audit.valid) {
+           empty_since_.reset();
+           report("waiting_for_reachability_seed");
+           return;
+         }
+         if (audit.frontier_cells > 0) {
+           frontier_index_.rebuild(route_grid);
+           ++frontier_index_repairs_;
+           global_frontiers_ = std::move(audit);
+           empty_since_.reset();
+           report("frontier_index_repaired");
+           return;
+         }
+       }
        unresolved_unknown_cells_ = 0;
        last_frontier_cells_ = last_frontier_clusters_ = 0;
        last_reachable_frontier_cells_ = last_candidate_goals_ = 0;
        last_suppressed_goals_ = last_open_start_neighbors_ = 0;
        publish_marker(std::nullopt);
-       if (!empty_since_) empty_since_ = current;
        report(current - *empty_since_ >= no_frontier_hold_ ?
               "exploration_complete" : "waiting_for_coverage_confirmation");
        return;
@@ -1295,13 +1825,16 @@ class Explorer : public rclcpp::Node {
      std::vector<le::XY> failed;
      // 依次处理水平坐标。
      for (const auto &s : suppressed_) failed.push_back(s.xy);
+     const auto temporary_failures = failed;
      auto unproductive = goal_progress_gate_.blocked(projected.size());
      failed.insert(failed.end(), unproductive.begin(), unproductive.end());
      static const std::vector<le::XY> no_external_obstacles;
      const auto &obstacles = planner_occupancy_fresh(current) ?
          external_obstacles_ : no_external_obstacles;
      // 将右侧计算值存入 selection（前沿搜索结果）。
-     auto selection = le::select_frontier(map_, *base_, cfg_, failed, obstacles);
+     auto selection = le::select_frontier(
+         map_, *base_, cfg_, failed, obstacles, false,
+         cfg_.global_search ? &global_frontiers_.cells : nullptr);
      bool search_all_observed = false;
      if (cfg_.global_search && !selection.goal && global_frontiers_.frontier_cells > 0) {
        auto beyond_bounds = le::select_frontier(map_, *base_, cfg_, failed,
@@ -1309,6 +1842,28 @@ class Explorer : public rclcpp::Node {
        if (beyond_bounds.goal || beyond_bounds.frontier_cells > selection.frontier_cells) {
          selection = std::move(beyond_bounds);
          search_all_observed = true;
+       }
+     }
+     // 高收益目标用尽时，允许重新考虑低收益目标；仍避开正在冷却的失败目标。
+     bool low_yield_goal = false;
+     if (!selection.goal && !unproductive.empty()) {
+       auto lower_yield = le::select_frontier(
+           map_, *base_, cfg_, temporary_failures, obstacles, false,
+           cfg_.global_search ? &global_frontiers_.cells : nullptr);
+       bool lower_search_all = false;
+       if (cfg_.global_search && !lower_yield.goal && global_frontiers_.frontier_cells > 0) {
+         auto beyond_bounds = le::select_frontier(
+             map_, *base_, cfg_, temporary_failures, obstacles, true,
+             &global_frontiers_.cells);
+         if (beyond_bounds.goal || beyond_bounds.frontier_cells > lower_yield.frontier_cells) {
+           lower_yield = std::move(beyond_bounds);
+           lower_search_all = true;
+         }
+       }
+       if (lower_yield.goal) {
+         selection = std::move(lower_yield);
+         search_all_observed = lower_search_all;
+         low_yield_goal = true;
        }
      }
      bool residual_goal = false;
@@ -1324,7 +1879,7 @@ class Explorer : public rclcpp::Node {
          residual_cfg.min_frontier_cells = 1;
          auto residual = le::select_frontier(
              map_, *base_, residual_cfg, failed, obstacles, search_all_observed,
-             search_all_observed ? &global_frontiers_.cells : nullptr);
+             &global_frontiers_.cells);
          if (!residual.goal && !search_all_observed &&
              global_frontiers_.frontier_cells > 0)
            residual = le::select_frontier(map_, *base_, residual_cfg, failed,
@@ -1357,20 +1912,11 @@ class Explorer : public rclcpp::Node {
      publish_marker(selection.goal);
      // 根据当前目标是否存在或是否完成来决定下一步。
      if (!selection.goal) {
-       // 只有表达式为真，才执行下面缩进或花括号内的代码。
-       if (cfg_.global_search &&
-           recovery_gate_.eligible(selection, projected.size()) &&
+       if (cfg_.global_search && global_frontiers_.frontier_cells > 0 &&
            !observation_only_ && !paused_ && ready_ &&
            waypoint_pub_->get_subscription_count() > 0) {
-         auto recovery = backtrack_goal();
-         // 只有表达式为真，才执行下面缩进或花括号内的代码。
-         if (recovery) {
-           // 把本次结果放入容器，供下一轮处理。
-           suppressed_.push_back({{(*base_)[0], (*base_)[1]}, current + cooldown_});
-           prepare_route(*recovery, route_grid, obstacles, "recovery_backtrack");
-           // 结束当前函数，不再执行后面的语句。
-           return;
-         }
+         start_recovery("no_reachable_frontier_goal");
+         if (handle_recovery(route_grid, obstacles, current)) return;
        }
        if (cfg_.global_search) unresolved_unknown_cells_ = coverage_.reachable_unknown_cells;
        // 检查未知边界是否仍存在或是否满足簇规模。
@@ -1380,20 +1926,12 @@ class Explorer : public rclcpp::Node {
          empty_since_.reset();
          report(selection.frontier_cells == 0 ? "global_frontiers_unresolved" :
                 selection.clusters > 0 ? "frontiers_unreachable_or_suppressed" :
-                "frontiers_below_cluster_threshold",
-                selection.clusters > 0 &&
-                        recovery_gate_.waiting_for_new_cells(projected.size()) ?
-                    "recovery_waiting_for_new_observations" : "");
+                "frontiers_below_cluster_threshold");
        } else {
-         if (cfg_.global_search && global_frontiers_.frontier_cells > 0) {
-           empty_since_.reset();
-           report("unknown_regions_unobservable_or_unreachable");
-         } else {
-           if (!empty_since_) empty_since_ = current;
-           report(current - *empty_since_ >= no_frontier_hold_ ?
-                  (cfg_.global_search ? "exploration_complete" : "current_region_complete") :
-                  "waiting_for_frontier");
-         }
+         // 全图模式已在上方通过独立复核退出；这里只处理局部模式。
+         if (!empty_since_) empty_since_ = current;
+         report(current - *empty_since_ >= no_frontier_hold_ ?
+                "current_region_complete" : "waiting_for_frontier");
        }
        // 结束当前函数，不再执行后面的语句。
        return;
@@ -1411,7 +1949,8 @@ class Explorer : public rclcpp::Node {
      else
      prepare_route(*selection.goal, route_grid, obstacles,
                    observation_goal ? "supplemental_observation" :
-                   (residual_goal ? "residual_frontier" : ""));
+                   (residual_goal ? "residual_frontier" :
+                    low_yield_goal ? "low_yield_frontier" : ""));
    }
 
    // ===============================================================
@@ -1422,37 +1961,58 @@ class Explorer : public rclcpp::Node {
    std::string frame_id_, last_status_; // 坐标系 ID 与最近一次状态字符串
    int point_stride_ = 8, max_points_ = 1000; // 点云抽稀步长与最大点数
    double sync_tolerance_ = 0.03, odom_timeout_ = 1.0, cloud_timeout_ = 2.0; // 同步容差与超时阈值
-   double goal_reach_xy_ = 0.55, progress_distance_ = 0.35, progress_timeout_ = 12.0; // 目标达成阈值与进度检测
-   double goal_timeout_ = 90.0, forward_timeout_ = 3.0, cooldown_ = 45.0; // 各类超时与清除冷却
+   double goal_reach_xy_ = 0.55, cooldown_ = 45.0;
+   double low_yield_retry_cooldown_ = 8.0;
+   std::size_t min_new_cells_ = 8;
    double no_frontier_hold_ = 8.0; // 前沿缺失时的保持时间阈值
    double occupancy_timeout_ = 2.0, occupancy_height_tolerance_ = 0.5; // SCAN 障碍数据有效期与高度筛选距离
    bool require_planner_occupancy_ = false; // true 时没有新鲜 SCAN 障碍图就不发新目标
-   double near_goal_dwell_ = 1.5, blocked_goal_dwell_ = 2.0; // 接近目标或目标被障碍占据的持续时间门槛
    bool observation_only_ = true, ready_ = false, paused_ = false; // 运行模式标志
    bool bounds_relative_to_start_ = false, bounds_initialized_ = false; // 是否把探索边界平移到起始机体坐标
-   bool clearing_ = false, clear_inflight_ = false; // 清除状态标志
-   double base_wall_ = 0.0, cloud_wall_ = 0.0, last_clear_wall_ = 0.0; // 时间戳记录
+   double base_wall_ = 0.0, cloud_wall_ = 0.0; // 时间戳记录
    double occupancy_wall_ = 0.0; // 最近收到规划器障碍图的本机时间
+   double raw_occupancy_wall_ = 0.0;
    double layer_wall_ = 0.0;
    double layer_resolution_ = 0.10, layer_body_height_ = 0.32;
    double layer_timeout_ = 2.5, route_segment_length_ = 3.0;
-   bool startup_scan_enabled_ = true;
-   double startup_yaw_rate_ = 0.35, startup_turn_timeout_ = 30.0;
-   double startup_goal_min_distance_ = 0.65, startup_goal_max_distance_ = 2.0;
-   BootstrapState bootstrap_state_ = BootstrapState::pending;
-   std::string bootstrap_failure_reason_;
-   double bootstrap_rotation_ = 0.0, bootstrap_started_ = 0.0;
+   double recovery_yaw_rate_ = 0.35, recovery_turn_step_ = 0.70;
+   double recovery_turn_timeout_ = 8.0, recovery_retry_interval_ = 10.0;
+   double recovery_goal_min_distance_ = 0.65, recovery_goal_max_distance_ = 2.0;
+   double recovery_reverse_distance_ = 0.35;
+   double recovery_reverse_last_distance_ = 0.0;
+   std::size_t recovery_reverse_next_index_ = 0;
+   std::size_t recovery_reverse_map_version_ = 0;
+   bool recovery_reverse_refresh_pending_ = false;
+   bool recovery_reverse_attempted_ = false;
+   bool recovery_reverse_sent_ = false;
+   int recovery_max_turn_steps_ = 4, recovery_turn_steps_ = 0;
+   int recovery_nearby_attempts_ = 0, recovery_history_attempts_ = 0;
+   double recovery_rotation_ = 0.0, recovery_turn_started_ = 0.0;
+   double recovery_blocked_wall_ = 0.0;
    double yaw_wall_ = 0.0;
-   le::XY bootstrap_start_{0.0, 0.0};
+   std::size_t recovery_blocked_observed_ = 0;
+   std::string recovery_last_failure_;
+   std::string recovery_reverse_last_failure_;
+   std::string recovery_turn_block_reason_;
+   double recovery_last_target_distance_ = 0.0;
+   std::map<std::string, int> recovery_strict_rejections_;
+   std::map<std::string, int> recovery_direct_rejections_;
+   std::map<std::string, int> recovery_reverse_rejections_;
+   le::XY recovery_turn_origin_{0.0, 0.0};
    std::optional<double> base_yaw_;
-   std::string clearing_reason_; // 清空航点的原因，例如超时或无进度
-   std::string route_source_ = "none";
-   std::vector<le::XY> route_stages_;
-   std::size_t route_index_ = 0;
-   bool route_is_recovery_ = false;
+   le::PathProcessor path_processor_;
+   std::optional<le::XY> route_selection_target_; // 本轮选中的探索目标，而非分段路点。
+   std::size_t route_skipped_nearby_ = 0;
+   le::ExplorationMode control_mode_ = le::ExplorationMode::waiting_initial_data;
+   std::uint64_t goal_id_ = 0, planning_attempt_id_ = 0;
+   std::size_t layer_version_ = 0;
    std::vector<le::LayerSurface> layer_surfaces_;
    std::optional<le::Point> base_; // 基座位置（x,y,z）
    std::optional<Active> active_; // 当前活动目标信息
+   std::optional<scan_planner::msg::Bspline> active_scan_bspline_;
+   std::optional<std::pair<std::int64_t, std::string>> pending_scan_failure_;
+   std::size_t scan_failure_count_ = 0;
+   std::string scan_last_failure_;
    std::optional<double> empty_since_; // 空前沿持续时间记录
    std::optional<double> residual_since_; // 零散前沿持续出现的起始时间；空值表示尚未开始计时
    std::size_t last_frontier_cells_ = 0, last_frontier_clusters_ = 0; // 上轮原始前沿格数与有效簇数
@@ -1460,35 +2020,57 @@ class Explorer : public rclcpp::Node {
    std::size_t last_suppressed_goals_ = 0, last_open_start_neighbors_ = 0; // 上轮被屏蔽目标与起点开放邻格数
    le::Coverage coverage_; // 全局边界内逐格验收统计
    le::GlobalFrontiers global_frontiers_; // 完整累计地图的原始前沿验收
+   le::FrontierIndex frontier_index_; // 随二维占据状态增删的当前原始前沿。
+   bool frontier_index_initialized_ = false;
+   std::size_t frontier_index_repairs_ = 0;
    std::size_t unresolved_unknown_cells_ = 0; // 当前没有可用目标时尚未覆盖的格数
    nav_msgs::msg::Path trajectory_; // 积累的机体行走轨迹，发布到 RViz
    std::deque<std::pair<int64_t, le::Point>> sensor_poses_; // 里程计姿态缓存
    std::deque<std::pair<int64_t, le::Point>> base_poses_; // 带时间戳的近期机体位姿缓存
    std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> pending_clouds_; // 点云缓存
    std::vector<le::XY> external_obstacles_; // SCAN 膨胀障碍点的水平坐标
+   std::vector<le::XY> raw_obstacles_;
    std::vector<Suppressed> suppressed_; // 被抑制的前沿列表（冷却）
-   le::RecoveryGate recovery_gate_{8}; // 限制无新地图收益的反复轨迹回退
+   le::RecoveryPlanner recovery_{3, 2.0}; // 同一物理区域连续失败的脱困状态
    le::GoalProgressGate goal_progress_gate_{8}; // 屏蔽到达后无地图收益的目标
 
    // ROS 接口句柄
    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr waypoint_pub_; // 探索目标发布者
    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_pub_; // RViz 前沿标记发布者
    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_; // JSON 状态发布者
+   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr goal_diagnostic_pub_;
+   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr diagnostic_reference_pub_;
+   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr diagnostic_actual_pub_;
+   rclcpp::Publisher<scan_planner::msg::Bspline>::SharedPtr diagnostic_bspline_pub_;
+   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr planning_goal_pub_;
+   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr planning_result_pub_;
+   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr execution_result_pub_;
    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr coverage_pub_; // 全局验收网格
    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr trajectory_pub_; // 行走轨迹发布者
    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr planned_path_pub_;
-   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr bootstrap_turn_pub_;
+   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr selected_occupancy_path_pub_;
+   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr selected_layer_path_pub_;
+   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr selected_recovery_path_pub_;
+   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr occupancy_plan_pub_;
+   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr layer_plan_pub_;
+   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr recovery_plan_pub_;
+   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr recovery_turn_pub_;
+   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr recovery_reverse_pub_;
    rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr control_mode_pub_;
    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_; // 已配准点云订阅者
    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr occupancy_sub_; // SCAN 障碍图订阅者
+   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr raw_occupancy_sub_;
+   rclcpp::Subscription<scan_planner::msg::Bspline>::SharedPtr scan_bspline_sub_;
    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr layer_sub_;
    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sensor_sub_, base_sub_; // 雷达与机体位姿订阅者
-   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr ready_sub_, complete_sub_; // 就绪与完成信号订阅者
+   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr ready_sub_, complete_sub_, plan_ready_sub_; // 就绪与完成信号订阅者
+   bool scan_plan_ready_ = false;
+   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr scan_failure_sub_;
+   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr recovery_reverse_result_sub_;
    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr input_sub_, goal_sub_, ack_sub_; // 输入、转发、停车回执订阅者
    rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr pause_service_; // 手动暂停/恢复服务
-   rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr clear_client_; // 清空 SCAN 航点的服务客户端
    rclcpp::TimerBase::SharedPtr timer_; // 每秒执行 tick 的 ROS 计时器
-   rclcpp::TimerBase::SharedPtr bootstrap_motion_timer_;
+   rclcpp::TimerBase::SharedPtr motion_timer_;
 };
 
 int main(int argc, char **argv) { // 程序入口，接受命令行参数（ROS2 会通过它解析 remap、参数等）

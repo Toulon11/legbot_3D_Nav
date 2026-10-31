@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstdint>
 
 namespace scan_planner
 {
@@ -81,6 +82,7 @@ namespace scan_planner
     go2_execution_frozen_sub_ = nh.subscribe("/planning/go2_execution_frozen", 10, &SCANReplanFSM::go2ExecutionFrozenCallback, this);
 
     bspline_pub_ = nh.advertise<scan_planner::msg::Bspline>("/planning/bspline", 10);
+    goal_failure_pub_ = nh.advertise<std_msgs::msg::String>("/scan/goal_plan_failed", 10);
     data_disp_pub_ = nh.advertise<scan_planner::msg::DataDisp>("/planning/data_display", 100);
     self_inflation_pub_ = nh.advertise<visualization_msgs::msg::Marker>("self_inflation", 10, true);
 
@@ -129,9 +131,14 @@ namespace scan_planner
     if (!msg)
       return;
 
+    active_goal_stamp_ns_ = static_cast<std::uint64_t>(msg->header.stamp.sec) * 1000000000ULL +
+                            msg->header.stamp.nanosec;
+    active_goal_failure_sent_ = false;
+
     if (!rviz_height_ready_)
     {
       ROS_WARN("[SCANReplanFSM] Ignore RViz goal before receiving initial body pose.");
+      publishGoalFailure("no_body_pose");
       return;
     }
 
@@ -184,6 +191,7 @@ namespace scan_planner
     // overshoot for a short next segment.  Start every fresh manual segment
     // from rest and use measured/planned velocity only for in-flight replans.
     success = planner_manager_->planGlobalTraj(odom_pos_, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), end_pt_, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    const char *failure_reason = success ? "global_target_occupied" : "global_reference_failed";
 
     if (success)
     {
@@ -237,7 +245,28 @@ namespace scan_planner
     else
     {
       ROS_ERROR("Unable to generate global trajectory!");
+      if (have_target_ && have_odom_)
+        callEmergencyStop(odom_pos_);
+      have_target_ = false;
+      have_new_target_ = false;
+      trigger_ = false;
+      replan_fail_count_ = 0;
+      changeFSMExecState(WAIT_TARGET, "GLOBAL_PLAN_FAILURE");
+      publishGoalFailure(failure_reason);
     }
+  }
+
+  void SCANReplanFSM::publishGoalFailure(const char *reason)
+  {
+    if (navi_mode_ != NAVI_MODE::MANUAL_TARGET || active_goal_stamp_ns_ == 0 ||
+        active_goal_failure_sent_)
+      return;
+    active_goal_failure_sent_ = true;
+    std_msgs::msg::String event;
+    event.data = std::to_string(active_goal_stamp_ns_) + "|" + reason;
+    goal_failure_pub_.publish(event);
+    ROS_WARN("SCAN terminal goal failure: %s (stamp=%llu)", reason,
+             static_cast<unsigned long long>(active_goal_stamp_ns_));
   }
 
   bool SCANReplanFSM::planGlobalTrajByWaypoints(const std::vector<Eigen::Vector3d> &waypoints)
@@ -931,6 +960,19 @@ namespace scan_planner
   {
     if (replan_fail_count_ >= max_replan_fail_count_)
     {
+      if (navi_mode_ == NAVI_MODE::MANUAL_TARGET && active_goal_stamp_ns_ != 0 &&
+          !active_goal_failure_sent_)
+      {
+        ROS_WARN("Replan failed %d times; ending the current manual goal.", replan_fail_count_);
+        callEmergencyStop(odom_pos_);
+        have_target_ = false;
+        trigger_ = false;
+        need_hover_stop_ = false;
+        replan_fail_count_ = 0;
+        changeFSMExecState(WAIT_TARGET, "TERMINAL_PLAN_FAILURE");
+        publishGoalFailure("local_replan_exhausted");
+        return;
+      }
       ROS_WARN("Replan failed %d times. Stop, keep the current target, and retry after %.2fs.",
                replan_fail_count_, replan_retry_delay_);
       replan_fail_count_ = 0;

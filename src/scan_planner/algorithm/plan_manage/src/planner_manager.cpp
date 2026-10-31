@@ -251,6 +251,12 @@ namespace scan_planner
 
     vector<vector<Eigen::Vector3d>> a_star_paths;
     a_star_paths = bspline_optimizer_rebound_->initControlPoints(ctrl_pts, true);
+    if (!bspline_optimizer_rebound_->initialPathValid())
+    {
+      ROS_WARN("Initial A-star collision segment has no valid bypass; skip this trajectory.");
+      continuous_failures_count_++;
+      return false;
+    }
 
     t_init = legbot::Time::now() - t_start;
 

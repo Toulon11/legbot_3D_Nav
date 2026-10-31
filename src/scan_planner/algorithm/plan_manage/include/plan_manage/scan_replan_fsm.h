@@ -3,6 +3,7 @@
 
 #include <Eigen/Eigen>
 #include <algorithm>
+#include <cstdint>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <iostream>
 #include <nav_msgs/msg/odometry.hpp>
@@ -11,6 +12,7 @@
 #include <legbot_runtime/runtime.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/empty.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <vector>
 #include <visualization_msgs/msg/marker.hpp>
 
@@ -103,7 +105,10 @@ namespace scan_planner
     legbot::NodeHandle node_;
     legbot::Timer exec_timer_, safety_timer_;
     legbot::Subscriber goal_sub_, odom_sub_, path_sub_, go2_execution_frozen_sub_;
-    legbot::Publisher replan_pub_, new_pub_, bspline_pub_, data_disp_pub_, self_inflation_pub_;
+    legbot::Publisher replan_pub_, new_pub_, bspline_pub_, data_disp_pub_, self_inflation_pub_, goal_failure_pub_;
+    std::uint64_t active_goal_stamp_ns_{0};
+    bool active_goal_failure_sent_{false};
+    void publishGoalFailure(const char *reason);
 
     /* helper functions */
     bool callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj); // front-end and back-end method

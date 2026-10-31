@@ -7,6 +7,38 @@ Gazebo 真值覆盖率验收工具，通过 `ament_cmake_python` 安装。
 旧 Python 探索器已移至项目根目录 `tmp/legacy_python_explorer_2026-10-29/`，
 不参与当前构建或运行。
 
+## 探索控制与路径规划的第一步拆分
+
+`explorer_cpp` 仍是唯一向 `/scan/waypoint_input` 发送探索路点的节点。
+选定前沿目标后，它给本次请求分配 `goal_id`、`attempt_id`、二维累计地图版本和
+层析图快照版本。`route_orchestrator.cpp` 根据同一地图快照计算二维占据候选、
+同层表面图候选或回退候选；路径选择只接受编号和版本均匹配的结果。
+普通平层目标优先采用合格的层析图路线，失败时采用二维路线；回退目标只使用
+回退规划。跨层状态已预留，但此入口不会据此向 SCAN 下发跨层路点。
+地图产生新版本不会取消已下发目标；后续路点按本次规划结果依次下发，
+只有 SCAN 完成当前路点后才推进。普通二维 A* 断连时返回失败；只有脱困规划可提出
+“起始连通性未验证”的短距离安全终点，由 SCAN 判断能否执行。
+
+`/exploration/planning_goal` 和 `/exploration/planning_results` 发布带编号、
+版本及规划原因的 JSON 诊断；`/exploration/plans/occupancy`、
+`/exploration/plans/layer`、`/exploration/plans/recovery` 发布各候选路径，
+`/exploration/planned_path` 是最终选中、将分段交给 SCAN 的路点。
+当前规划模块通过包内 C++ 接口共享一次地图快照，这些话题用于观察和核对，
+尚未作为独立进程之间的请求与结果传输接口。
+
+SCAN 在直达目标的全局参考路径生成失败，或当前目标的局部规划连续失败达到
+`fsm.max_replan_fail_count` 时，向 `/scan/goal_plan_failed` 发布一次终态回执。
+消息是 `std_msgs/String`，内容为 `转发目标时间戳纳秒|原因`；原因包括
+`no_body_pose`、`global_reference_failed`、`global_target_occupied` 和
+`local_replan_exhausted`。单次局部重规划失败不会结束目标。
+路径处理模块只接收与当前路点 `/scan/goal` 时间戳一致的回执，忽略旧目标消息；
+成功仍需匹配的停车应答和任务完成信号。它把成功或失败统一发布到
+`/exploration/execution_feedback`，附带 `goal_id`、`attempt_id`、
+`stage_index`、`scan_goal_stamp`、规划来源及原因。收到终态失败后，探索控制
+才结束当前路线，并按同一区域失败次数选择新目标或进入脱困。
+`/exploration/status` 同时记录 `scan_failure_count` 和最近一次失败原因。
+航点协调器保持原样。
+
 ## 第一阶段：在线多层地形图（独立观察节点）
 
 新增的 `online_layer_map_cpp` 与原有单层探索节点并行工作。它读取同一套适配器话题：
@@ -69,6 +101,8 @@ ros2 launch legbot_exploration multi_layer_exploration_demo.launch.py
 
 默认使用 Building 场景和 Gazebo 真值定位；可用
 `localization_source:=fastlio|fastlivo` 选择估计定位，或用 `world:=...` 指定场景。
+Building 场景的二维覆盖栅格显示范围为 `x∈[-31.5,31.5]`、
+`y∈[-15.5,15.5]` 米，包含东侧建筑；纯平面入口仍使用它自己的相对边界。
 `control_start_delay:=12.0` 控制 GO2 高层控制的启动延时，
 `show_layer_rviz:=false` 可关闭默认打开的地图 RViz。此入口会自动发送探索目标，
 与上面的纯地图观察命令不同。启动前先关闭之前的仿真与探索进程，避免话题重复发布。
@@ -83,16 +117,19 @@ ros2 launch legbot_exploration multi_layer_exploration_demo.launch.py
 启动后可用 `ros2 topic info /exploration/status -v` 确认探索状态发布者存在，
 再用 `ros2 topic echo /exploration/status std_msgs/msg/String --once --qos-durability transient_local --full-length` 读取完整状态。
 
-起步时如果机器人脚下仍有点云盲区，探索器进入“起步建图”状态。GO2 站稳且
-里程计、点云和 SCAN 障碍图就绪后，机器人以 0.35 rad/s 原地转一圈；完成后
-只发零角速度，不再重复发送模式 2，以免已站立的机器狗切换成趴下。等待运动
-停止后，从附近 0.65–2.0 m 的已观测空闲格里选一个机体膨胀范围也空闲的
-目标，交给现有 SCAN 航点接口。已知障碍不能穿过；起点至目标之间仍有未知
-部分时，由 SCAN 检查并规划实际短距离运动。目标点本身还须通过新鲜层析图
-的支撑和净空检查。若没有安全目标、转向超时或位姿失效，节点停车并在
-`/exploration/status` 报告 `bootstrap_failed`。参数 `startup_scan_enabled`、
-`startup_yaw_rate`、`startup_turn_timeout` 和起步目标距离范围见
-`config/exploration.yaml`。
+起步时只等待里程计、点云和 GO2 控制就绪，不自动转圈。若脚下盲区使正常规划失败，
+或同一位置附近反复选点、规划失败，探索控制进入脱困状态：先尝试附近已观测且机体圆盘
+安全的短目标；随后依次尝试 0.22～0.60 米的保持朝向直退，必要时分步原地转向，
+最后尝试本次行驶轨迹上的安全回退位置。每一步都有次数和超时限制。脱困目标
+可以从脚下盲区或膨胀区起步，但新扫过的未知格与障碍不可进入，已有障碍的距离
+必须增加。直退一次后等待新地图，仍在膨胀区则继续脱困。直达路线标记为
+`recovery_unverified`，由 SCAN 决定实际运动。所有方法均失败时
+报告 `recovery_blocked`，保留未解决前沿，停车等待地图更新或人工处理。
+
+`/exploration/diagnostics/goal_event` 在目标下发和 SCAN 失败时记录目标、起始与
+当前位姿、地图版本、路线来源及到原始/膨胀障碍的距离。失败时另保留
+`/exploration/diagnostics/last_reference_path`、`last_actual_path` 和
+`last_scan_bspline`，分别对应探索参考路点、机体实走里程计与 SCAN 最新 B 样条。
 
 在线多层地图节点本身只建立、更新和显示地图，不发布导航目标；一键组合入口中的
 导航目标仍由原有单层探索节点产生，SCAN 负责执行。原有单层探索入口不启动此地图节点，
@@ -135,12 +172,10 @@ RViz 中浅灰点是抽样显示的图节点，浅绿细线是抽样显示的相
 - 自动导航时，目标发到 `/scan/waypoint_input`，由既有
   `scan_waypoint_mission` 以 `direct` 模式转发到 `/scan/goal`。节点根据转发目标的
   时间戳、`/scan/goal_stop_ack` 和 `/scan/mission_complete` 判断本次路点完成；
-  探索节点随后复查并发送所选路径的下一路点。
-  若机器人已在 `goal_reach_xy` 内停留 `near_goal_dwell` 秒而 SCAN 未回执，
-  探索节点先请求清除旧路点，成功后以 `goal_reached`、
-  `detail=proximity_fallback` 记录到达，避免反复记为 `no_progress`。
-- `/exploration/set_paused` 是 `std_srvs/SetBool`：`true` 暂停且清除自动目标，
-  `false` 继续。手工在路点输入话题发目标时也会自动暂停探索。
+  完成后发送所选路径的下一路点。目标发出后，exploration 不按地图变化、
+  距离或计时器撤销 SCAN 目标；未收到完成回执时保持等待。
+- `/exploration/set_paused` 是 `std_srvs/SetBool`：`true` 暂停后续自动选点，
+  不撤销已下发目标；`false` 继续。手工在路点输入话题发目标时会接管当前任务并暂停自动探索。
 
 ## 探索方案、公式与策略
 
@@ -228,18 +263,17 @@ $$
 其中 $w_g=$ `frontier_gain_weight`，$w_d=$ `path_cost_weight`。
 各簇比较 $J$，选择得分最高的候选。若 $f_C$ 超过 `max_goal_distance`，
 沿最短路径回溯，选择距离合适的**已观察空闲格** $g_C$ 作候选观察目标；
-此时评分中的 $D(f_C)$ 仍是原前沿格的路径代价。C++ 执行器再为候选目标生成
-一条经过已观察空闲格的路线：优先尝试同层层析表面图 A*；若没有可用表面路径，
-则使用二维占据图 A*。两种路径只用于选择参考目标点，不替 SCAN 决定具体走法。
-按路径长度每约 `route_segment_length`（默认 3 m）选一个已知空闲且膨胀安全的目标点，
-整条路线最多选 3 个，通过 `/exploration/planned_path` 显示，并依次发送到
-`/scan/waypoint_input`。地图更新后只复查尚未发送的目标点及当前目标点；
-目标点失去安全余量时清除该目标并重新选点。两类规划共用同一个执行接口。
-两种路线共用下发前的机体占用圆盘检查：以 `robot_radius + waypoint_safety_margin`
-为半径，圆盘覆盖的每个二维格都必须已有空闲观测；未知格和已知障碍都拒绝该路点。
-还会复核新鲜 SCAN 膨胀障碍图；层析图新鲜时，检查路点的地面支撑和已知净空障碍。
-地图更新后，活动路点和下一个路点都会重新检查。机器人当前所在格不作为
-目标点安全门槛；路点之间的实际运动路线由 SCAN 根据实时障碍规划。
+此时评分中的 $D(f_C)$ 仍是原前沿格的路径代价。探索控制先在前沿附近
+选出同一个已观测、膨胀安全的观察位置。二维占据 A* 和
+同层表面 A* 在同一份地图快照上分别规划到它；层析路线合格时优先选择，失败时
+使用二维路线。二维 A* 的节点和边检查完整机体圆盘及 SCAN 膨胀障碍，未知格不能
+作为普通路径的中间格；层析 A* 同时检查支撑、净空和占据走廊。两条规划路线
+分别简化：只有整段走廊继续安全，才把共线密集格合并为长直段；超过
+`route_segment_length` 的路段保留中间点，路点数由地形决定。最终路点显示在
+`/exploration/planned_path`，按次序通过 `/scan/waypoint_input` 交给 SCAN。
+正常规划不会生成未验证的直达线。执行期间的地图或机体位置变化不会使探索器
+清除已选路线；所有规划出的目标点须在已观察空闲区，
+机体圆盘覆盖的未知格或障碍使其不合格。
 对于未知前沿，执行终点还须能从已知空闲格直视该前沿，并比基本机体半径多留
 `0.15 m` 的已知障碍余量。
 
@@ -256,14 +290,13 @@ $$
 
 这里 $s$ 是机体当前水平位置。$V(g)$ 只是二维遮挡近似，不是完整的雷达视场或
 信息熵计算。若还存在零散前沿但没有簇达到 $m$，持续 `no_frontier_hold` 后把
-最小簇规模暂时降到一格再尝试。若有合格前沿簇，
-但 `reachable_frontier_cells` 和 `candidate_goals` 都为零，节点可从
-**本次真实行驶轨迹**中寻找已知空闲的回退点；回退未带来足够新观测时，会暂缓重复回退。
+最小簇规模暂时降到一格再尝试。若有前沿但持续选不出可规划目标，
+控制模块进入脱困。脱困规划集中负责附近安全短目标、
+分步转向补观测和历史轨迹回退；普通选点和两路平层 A* 不再包含历史回退分支。
 
-目标发出后，节点等待 SCAN 转发确认和到达回执。转发超时、目标持续落入新鲜的
-SCAN 障碍图、长时间无有效前进或超过目标总时限时，先请求清除旧航点，再重新选点；
-失败目标按 `failed_frontier_cooldown` 暂时屏蔽。已接近目标且持续停留时，
-使用 `near_goal_dwell` 的近距离到达兜底。手动目标会暂停自动探索。
+目标发出后，节点只根据 SCAN 转发目标、停车回执和任务完成信号推进路线。
+规划阶段无法形成路径的候选目标按 `failed_frontier_cooldown` 暂时屏蔽。
+SCAN 未完成时，exploration 不重新选点或清除航点；手动目标可以接管自动探索。
 
 ### 5. 全局原始前沿与完成判定
 
@@ -283,12 +316,23 @@ $$
 已知空闲格及其四个邻格，不需要预先枚举无限大的未知区域。原始前沿不受
 最小簇规模、路径距离、目标冷却及瞬时 SCAN 障碍筛选影响。
 
+实现时，累计体素证据同步维护二维列状态；某格在“空闲、障碍、未知”之间变化时，
+只重算该格及四邻格的前沿资格。索引保存当前所有原始前沿，新增观测会移除旧前沿、
+生成新前沿；障碍证据被后续空闲射线抵消时也会更新。每轮仍从机器人所在的已知
+空闲连通区搜索，得到其中可达的原始前沿。前沿容器不受失败目标冷却影响；
+选点继续使用 Dijkstra 评分；观察位置由控制模块统一选择，再由二维和层析 A*
+独立规划。普通规划断连会失败并计入脱困触发条件。
+
 `global_frontier_valid` 表示机器人附近找到了已知空闲起点；
 `global_reachable_free_cells` 是 $|R_{\mathrm{free}}|$；
 `global_frontier_cells` 是 $|F_{\mathrm{raw}}|$。
 只有起点有效、原始前沿数持续为零、点云与位姿新鲜、地图未满、没有活动目标，
 且配置要求的 SCAN 障碍图新鲜，持续 `no_frontier_hold` 秒后，才报告
-`exploration_complete`。出现新前沿时立即取消完成计时。
+`exploration_complete`。计时结束时会不依赖索引再扫描一次完整累计地图；
+若发现遗漏前沿，就修复索引并继续探索，不报告完成。出现新前沿时立即取消完成计时。
+`indexed_frontier_cells` 是容器内全部原始前沿格数，`frontier_index_repairs`
+是完成前独立复核发现并修正索引遗漏的次数；`global_frontier_cells` 仍只统计
+机器人当前已知空闲连通区外缘的原始前沿。
 
 作为辅助诊断，原有矩形统计仍计算 $U$、累计障碍膨胀后的潜在连通区域 $R$
 及其未知格数量；此处未知格仍可作为潜在通路：
@@ -375,7 +419,7 @@ ros2 launch legbot_exploration exploration.launch.py observation_only:=false
 把早期观测从当前投影中排除。路径中间格限定为已观察空闲格；前沿未知格
 只用于选取观察方向，执行目标落在其附近的已观察空闲格。候选前沿仍是 Frontier 簇里的实际未知格，
 而非可能落在障碍内的几何质心。已观察的障碍和新近收到的 SCAN 膨胀障碍都会
-参与筛选；活动目标若持续落入 SCAN 障碍，会提前撤销并暂时抑制。
+参与规划前的筛选；已下发目标的执行交由 SCAN 负责。
 
 高度归一化面向**同层探索**。跨层时相同 XY 的不同楼层可能重叠，需要独立的
 楼层子图及楼层切换逻辑，不能直接把此模式用于跨层完成判定。若 SCAN 占据话题
@@ -407,21 +451,27 @@ SCAN 障碍等筛选后没有可选前沿格；此状态不会宣布完成。
 候选前沿格数和通过规模门槛的簇数；它们与完成验收用的
 `global_frontier_cells` 不是同一个计数。
 `reachable_frontier_cells`、`candidate_goals`、`suppressed_goals`、`open_start_neighbors`
-用于区分地图断连、目标冷却与起点周围已观察空闲格的数量。只有存在合格前沿簇、
-却没有可达前沿格和候选目标时，全图模式才会从本次实际行驶轨迹里选择约 2–4 m
-的已观察空闲回退点；状态的 `detail=recovery_backtrack` 表示正在执行这一步。
-回退后若新增已观测 XY 格少于 `recovery_min_new_cells`，暂不重复回退；到达目标后
-若观测增长不足，也暂不重复选择同一目标。地图新增足够格子后解除这两项抑制。
+用于区分地图断连、目标冷却与起点周围已观察空闲格的数量。无可选前沿，或同一
+同一物理区域反复出现选点或规划失败时，状态机进入 `recovery`。
+`recovery_phase` 依次显示 `nearby`、`turning`、`history` 或 `blocked`；
+`recovery_failures` 显示当前区域失败次数。脱困不会因暂无新增观测而重复选择
+同一个失败位置，也不会把仍存在的原始前沿误报为已探索完成。
+到达目标后若观测增长不足，该目标进入低收益集合：先选其他正常候选；没有正常候选时，立即
+从低收益前沿按前沿簇规模与路径代价重新评分选点，不等待地图新增格子。
+刚到达的低收益目标仅按 `low_yield_retry_cooldown` 短暂冷却，以免原地重复选择；
+规划或执行失败的目标仍按 `failed_frontier_cooldown` 冷却。使用低收益目标时，
+发送状态的 `detail` 带 `low_yield`。
 因此仍有前沿但都不可用时，节点会报告未解决的前沿状态，不会宣布探索完成。
 没有普通前沿但可达范围内还有未知格时，节点尝试在已观测、连通的空闲格上选择补充观测点；
-发送时状态的 `detail=supplemental_observation`。若当前找不到可用观测位置，状态为
-`unknown_regions_unobservable_or_unreachable`，`unresolved_unknown_cells` 给出本轮
-没有可用目标时尚未覆盖的可达未知格数；它不等于永久不可达格数，也不会触发误报完成。
+若当前找不到可用观测位置，状态进入脱困或报告未解决前沿；
+`unresolved_unknown_cells` 给出本轮尚未覆盖的可达未知格数。
+它不等于永久不可达格数，也不会触发误报完成。
 `excluded_unknown_cells` 是配置矩形内、不属于当前潜在连通区域的未知格数量；
 其中可能包含障碍膨胀覆盖或已知障碍隔开的格子，不能仅凭这一计数逐格判定
 未知格的物理成因。
 `map_capacity_reached` 表示体素上限已到，需增大容量或重启探索。
-`route_source` 表示当前选用了 `layer` 或 `occupancy` 参考路线，`route_stages` 和
+`route_source` 表示当前选用了 `layer`、`occupancy`、`recovery` 或
+`recovery_unverified` 路线，`route_stages` 和
 `route_stage_index` 表示待发送目标点总数和当前序号。二维图即使在机器人当前
 位置附近尚未形成连通参考路径，也只按已知空闲及膨胀余量寻找安全观察目标；
 是否能到达该目标由 SCAN 的实时规划决定。
@@ -449,7 +499,25 @@ ros2 run legbot_exploration verify_flat_coverage.py
 ## 核心测试
 
 ```bash
-g++ -std=c++17 -Icpp/include cpp/src/exploration_core.cpp test/test_core.cpp -o /tmp/legbot_exploration_core_test
+g++ -std=c++17 -Icpp/include cpp/src/single_floor_exploration.cpp test/test_single_floor_exploration.cpp -o /tmp/legbot_exploration_core_test
 /tmp/legbot_exploration_core_test
 PYTHONPATH=python python3 -m unittest discover -s test -p test_truth_coverage.py
+```
+
+## rviz路径颜色显示
+[exploration 路径发布](/home/likai/legbot_3D_Nav/src/legbot_exploration/cpp/src/single_floor_explorer_node.cpp:912)现在按**实际选中的规划来源**分别发布路线；[RViz 配置](/home/likai/legbot_3D_Nav/src/legbot_exploration/rviz/multi_layer_map.rviz:267)显示二维 A* 为蓝色、层析图为橙色、脱困为黄色。切换或清除路线时，旧颜色的路径也会清空。原有候选路径话题仍可用于诊断。
+
+
+## 清除残留进程
+```
+# 查找残留进程
+legbot_3D_Nav$ pgrep -af 'gz sim|controller_manager|multi_layer_exploration_demo'
+
+125314 gz sim server
+161365 gz sim -r -v 3 /home/likai/legbot_3D_Nav/install/legbot_bringup/share/legbot_bringup/worlds/Building.sdf
+161501 gz sim server
+161503 gz sim gui
+
+#删除查找到的进程
+kill -TERM 125314 161365 161501 161503
 ```
