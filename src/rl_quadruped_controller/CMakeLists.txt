@@ -103,6 +103,14 @@ ament_export_dependencies(${dependencies})
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 
 if (BUILD_TESTING)
+    find_package(hardware_interface REQUIRED)
+    find_package(rclcpp REQUIRED)
+    add_executable(test_go2_stand_transition
+        test/test_stand_transition.cpp src/FSM/StateFixedStand.cpp)
+    target_include_directories(test_go2_stand_transition PRIVATE include)
+    ament_target_dependencies(test_go2_stand_transition
+        controller_common hardware_interface control_input_msgs rclcpp)
+    add_test(NAME go2_stand_command_transition COMMAND test_go2_stand_transition)
     find_package(ament_lint_auto REQUIRED)
     # the following line skips the linter which checks for copyrights
     # comment the line when a copyright and license is added to all source files

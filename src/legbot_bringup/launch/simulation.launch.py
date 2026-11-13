@@ -1,6 +1,7 @@
 """GO2/HIMLoco on Gazebo Harmonic. Launching this file starts simulation."""
 import os
 import xacro
+import yaml
 from ament_index_python.packages import get_package_share_directory as share
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, IncludeLaunchDescription, RegisterEventHandler, SetEnvironmentVariable, EmitEvent
@@ -38,9 +39,13 @@ def setup(context):
         'moe_cts_77k': 'moe_cts_77k_controller.yaml',
     }
     controller_file = controller_files[cfg('policy_profile')]
+    with open(os.path.join(share('legbot_bringup'), 'config', 'robot_geometry.yaml')) as stream:
+        geometry = yaml.safe_load(stream)['/**']['ros__parameters']
+    sensor_mappings = {key: str(value) for key, value in geometry.items() if key.startswith('ground_lidar_')}
     description = xacro.process_file(os.path.join(share('go2_description'), 'xacro/robot.xacro'),
-                                     mappings={'GAZEBO': 'true', 'CLASSIC': 'false',
+                                     mappings={**sensor_mappings, 'GAZEBO': 'true', 'CLASSIC': 'false',
                                                'ENABLE_LIDAR': cfg('enable_lidar'),
+                                               'ENABLE_GROUND_LIDAR': cfg('enable_ground_lidar'),
                                                'ENABLE_CAMERA': cfg('enable_camera'),
                                                'controller_config': os.path.join(share('go2_description'), 'config', controller_file)}).toxml()
     world = cfg('world')
@@ -69,6 +74,9 @@ def setup(context):
         '/livox/imu@sensor_msgs/msg/Imu[gz.msgs.IMU',
     ]
     bridge_remappings = [('/livox/scan/points', '/livox/points_raw')]
+    if cfg('enable_ground_lidar') == 'true':
+        bridge_arguments.append('/ground_lidar/scan/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked')
+        bridge_remappings.append(('/ground_lidar/scan/points', '/ground_lidar/points_raw'))
     if publish_ground_truth:
         bridge_arguments.append('/go2/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry')
         bridge_remappings.append(('/go2/odometry', '/Odometry_gazebo'))
@@ -85,6 +93,7 @@ def setup(context):
     if os.environ.get('GZ_SIM_RESOURCE_PATH'):
         resource_path += os.pathsep + os.environ['GZ_SIM_RESOURCE_PATH']
     package_share = share('legbot_bringup')
+    robot_geometry = os.path.join(package_share, 'config', 'robot_geometry.yaml')
     workspace_root = os.path.abspath(os.path.join(package_share, '..', '..', '..', '..'))
     diagnostic_overlay = os.path.join(
         workspace_root, '.deps', 'diagnostic_updater_4.2.7', 'opt', 'ros', 'jazzy', 'lib')
@@ -111,8 +120,15 @@ def setup(context):
         RegisterEventHandler(OnProcessExit(target_action=spawners[1], on_exit=next_on_success([spawners[2]]))),
         spawn,
         *([Node(package='legbot_bringup', executable='cloud_transform',
-                parameters=[{'use_sim_time': True, 'target_frame': 'odom'}])]
+                parameters=[robot_geometry, {'use_sim_time': True, 'target_frame': 'odom'}])]
           if use_ground_truth else []),
+        *([Node(package='legbot_bringup', executable='cloud_transform',
+                name='ground_lidar_transform', parameters=[robot_geometry, {
+                    'use_sim_time': True, 'target_frame': 'map' if global_interface else 'odom',
+                    'input_topic': '/ground_lidar/points_raw',
+                    'output_topic': '/ground_lidar/points_registered',
+                    'pose_topic': '/ground_lidar/odometry_lidar',
+                }])] if cfg('enable_ground_lidar') == 'true' else []),
         Node(package='legbot_bringup', executable='go2_command_adapter', parameters=[{
             'use_sim_time': True,
             'odom_topic': '/slam/global_odometry_base' if global_interface else (
@@ -155,6 +171,8 @@ def generate_launch_description():
         DeclareLaunchArgument('gui', default_value='false', choices=['true', 'false']),
         DeclareLaunchArgument('headless_rendering', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('enable_lidar', default_value='true', choices=['true', 'false']),
+        DeclareLaunchArgument('enable_ground_lidar', default_value='false', choices=['true', 'false'],
+                              description='Add the optional downward-facing simulation LiDAR.'),
         DeclareLaunchArgument('enable_camera', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('require_navigation_data', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('synthetic_stair_cloud', default_value='false', choices=['true', 'false']),

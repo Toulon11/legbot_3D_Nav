@@ -15,7 +15,8 @@ PYBIND11_MODULE(ele_planner, m) {
       .def("debug", &OfflineElePlanner::Debug)
       .def("set_reference_height", &OfflineElePlanner::SetReferenceHeight)
       .def("set_max_iterations", &OfflineElePlanner::set_max_iterations)
-      .def("get_path_finder", &OfflineElePlanner::get_path_finder)
+      .def("get_path_finder", &OfflineElePlanner::get_path_finder,
+           py::return_value_policy::reference_internal)
       .def("get_map", &OfflineElePlanner::get_map)
       .def("get_trajectory_optimizer",
            &OfflineElePlanner::get_trajectory_optimizer)

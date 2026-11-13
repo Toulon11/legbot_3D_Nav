@@ -7,7 +7,7 @@
     sensor_odom_topic: /slam/odometry_lidar # 雷达位姿输入，用于确定每条射线从哪里发出。
     base_odom_topic: /slam/global_odometry_base # 机体位姿输入，用于确定机器人所在位置和高度。
     planner_occupancy_topic: /local_planner/grid_map/occupancy_inflate # SCAN 膨胀后的障碍点云。
-    waypoint_topic: /scan/waypoint_input   # 探索器把新目标发到这里。
+    waypoint_topic: /scan/waypoint_request   # 探索器把新目标发到这里。
     scan_goal_topic: /scan/goal            # SCAN 转发目标后，探索器从这里确认。
     ready_topic: /go2/demo_ready           # GO2 控制器就绪信号。
     resolution: 0.25                       # 每个体素边长，单位米；越小越精细、越占内存。
@@ -21,33 +21,30 @@
     obstacle_min_relative_z: -0.15        # 相对机体高度的障碍判定下界，单位米。
     obstacle_max_relative_z: 0.85         # 相对机体高度的障碍判定上界，单位米。
     free_min_relative_z: -0.45            # 二维投影纳入的最低高度，单位米。
-    robot_radius: 0.35                    # 机器人避障膨胀半径，单位米。
     planner_occupancy_radius: 0.0        # SCAN 输入障碍图已膨胀半径；0 保持独立启动时的旧行为。
     planner_occupancy_resolution: 0.10   # SCAN 障碍格边长；须与 scan.yaml 一致。
-    waypoint_safety_margin: 0.05         # 下发路点时机体膨胀圆盘外额外留出的距离，单位米。
     local_search_radius: 10.0             # 局部搜索时的半径，单位米。
-    global_search: true                   # 默认全图搜索：先在矩形内选点，再查完整累计地图的前沿。
-    layer_surface_resolution: 0.10        # 在线层析图的水平栅格边长；同层路径优先由它规划。
-    layer_nominal_body_height: 0.32       # 机体到支撑面的名义高度，单位米。
-    layer_surface_timeout: 2.5           # 超过此时间未收到层析图，回退到二维占据路径。
-    layer_planning_timeout_ms: 2000.0    # 同进程层析规划的耗时上限；超时改用二维候选。
-    recovery_direct_max_distance: 3.0    # 仅限连通性未证实的短距离脱困直达。
-    recovery_failure_limit: 3            # 同一物理区域连续失败达到此次数后进入脱困。
-    recovery_area_radius: 2.0            # 失败区域的水平合并半径，单位米。
-    recovery_goal_min_distance: 0.65     # 脱困附近安全目标的最小距离，单位米。
-    recovery_goal_max_distance: 2.0      # 脱困附近安全目标的最大距离，单位米。
-    recovery_reverse_distance: 0.35      # 附近目标失败后，保持朝向直退的单次距离，单位米。
-    recovery_yaw_rate: 0.35              # 仅脱困时转向的角速度，单位弧度/秒。
-    recovery_turn_step: 0.70             # 每次补观测小角度转向量，单位弧度。
-    recovery_turn_timeout: 8.0           # 单步转向超时，单位秒。
-    recovery_max_turn_steps: 4           # 转向尝试上限；之后尝试历史轨迹回退。
-    recovery_retry_interval: 10.0        # 脱困受阻后定期重查安全路线，兼容地图状态变化但不强制运动。
+    pct_local_height_above: 3.5            # 三维选点窗口：相对当前支撑表面向上的米数。
+    pct_local_height_below: 1.5            # 向下高度；水平为±local_search_radius，不裁剪规划图。
+    pct_direction_weight: 0.5             # PCT目标方向变化的软惩罚，0关闭。
+    cross_layer_enabled: true
+    pct_floor_exploration: true          # 当前层收尾后跨层，以连通实测平台确认新层 G。
+    skip_start_floor_exploration: false  # 跨层测试。共用普通探索识别楼梯，确认可上行后提前结束起始层；新层正常探索。
+    pct_floor_height_tolerance: 0.08     # 同层前沿及路径节点的高度带半宽，单位米。
+    pct_foot_contact_force: 12.0        # 用于判定足端接地的受力，单位牛顿。
+    cross_layer_height_slack: 0.05        # 上行进度允许的高度误差，单位米。
+    cross_layer_corridor_radius: 1.5      # 后续观察位置与当前路线方向的侧向范围，单位米。
+    global_search: true                   # 二维选点范围；PCT独立采用三维局部优先、全局后备。
+    frontier_source: pct                 # occupancy / pct；PCT 选点要求同进程在线 PCT，第一阶段只交给层析规划。
+    planner_mode: layer                  # both / occupancy / layer；脱困沿用同一规划器选择。
+    layer_surface_timeout: 2.5           # 共享 PCT 超过此时间未刷新时不可用；仅双规划可选二维结果。
+    recovery_goal_xy_tolerance: 0.15    # 脱困最终位置目标的水平到达容差；普通探索不指定，沿用 SCAN 默认。
     bounds_relative_to_start: false       # true 时把边界坐标加到起始机体位置上。
     exploration_min_x: -31.5              # 全图搜索区域的最小 X，单位米。
     exploration_max_x: 31.5               # 覆盖 Building 场景的东侧建筑区域，单位米。
     exploration_min_y: -15.5              # 全图搜索区域的最小 Y，单位米。
     exploration_max_y: 15.5               # 全图搜索区域的最大 Y，单位米。
-    min_frontier_cells: 3                 # 至少 3 个相连前沿格才算一个有效簇。
+    min_frontier_cells: 3                 # 仅二维占据图；PCT 普通层探索允许单格簇。
     frontier_gain_weight: 1.0             # 簇规模收益在评分中的权重。
     path_cost_weight: 1.0                 # 路径代价在评分中的权重。
     unknown_path_multiplier: 1.5         # 仅前沿终点未知格的评分成本倍率；中间路径不走未知格。
@@ -55,10 +52,24 @@
     low_evidence_cost_weight: 0.7        # 只有一帧空闲观测时二维 A* 的额外代价；三帧后不再加罚。
     shortcut_cost_tolerance: 0.05       # 二维路线简化后允许的最大观测代价增幅比例。
     goal_reach_xy: 0.55                   # 校验 SCAN 停车回执位置及过滤首次下发前的近距离路点。
+    observation_min_distance: 0.50       # 普通探索观察位置的最小水平距离。跨层使用到达容差加 PCT 格宽。
+    observation_goal_xy_tolerance: 0.15  # 最终观察路点显式传给 SCAN；中间路点保留默认容差。
     failed_frontier_cooldown: 45.0       # 失败目标附近暂不重选的时长，单位秒。
+    pct_candidate_round_budget: 1.0     # Yield between candidates after this search budget; no distance cutoff.
     low_yield_retry_cooldown: 8.0        # 低观测收益目标刚到达后的短暂冷却；无高收益目标时可重选其他低收益目标。
-    no_frontier_hold: 8.0                # 连续 8 秒找不到前沿，才判定区域探索完成。
+    no_frontier_hold: 8.0                # 区域探索完成的等待时间。PCT 按楼层探索时，清空队列后直接找楼梯。
     recovery_min_new_cells: 8            # 到达后新增观测低于该数量时按低收益目标处理。
     planner_occupancy_timeout: 2.0       # SCAN 障碍点云的有效时长，单位秒。
     planner_occupancy_height_tolerance: 0.5 # 只考虑与机体高度差不超过此值的障碍。
     observation_only: true               # true 只计算和显示，不发送运动目标。
+    # Position arrival starts a yaw alignment / observation task. Seconds use wall time.
+    observation_frame_wait: 2.0          # 楼梯入口和跨层补扫每个视角的等待时间，单位秒。
+    observation_flat_frame_wait: 1.0     # 普通观察点每个视角的等待时间，单位秒。
+    observation_task_timeout: 60.0
+    observation_sweep_half_angle: 0.35
+    observation_full_sweep_fallback: false
+    pct_query_budget_seconds: 0.20      # Per-batch compute slice; total budgets remain 2s/4s.
+    pct_query_resume_delay_seconds: 0.10 # Release map locks between unfinished batches.
+    pct_floor_view_budget_seconds: 2.0 # Cumulative search time for an ordinary cluster attempt.
+    pct_floor_review_view_budget_seconds: 4.0 # Cumulative search time for a global review attempt.
+    pct_floor_review_query_budget_seconds: 0.40 # Map read slice while reviewing a floor cluster.

@@ -1,0 +1,21 @@
+go2_demo_sequencer:
+  ros__parameters:
+    # Idle duration remains the launch argument goal_settle_seconds (1.5s).
+    # Physical settling is required in addition to that wait.
+    stand_stable_seconds: 0.5
+    stand_motion_window: 0.2
+    stand_feedback_timeout: 0.3
+    stand_max_linear_speed: 0.03     # m/s, derived from successive body poses (XYZ)
+    stand_max_angular_speed: 0.10    # rad/s, derived from successive orientations
+    stand_max_tilt: 0.1745329252     # rad (10 degrees from world-up); tune for terrain
+    stand_cmd_epsilon: 0.001        # all six Twist components must be near zero
+
+scan_go2_cmd_adapter:
+  ros__parameters:
+    # Normal arrival/action completion ramps to zero before reporting success.
+    stop_deceleration: 0.35           # m/s^2, vector magnitude
+    stop_yaw_deceleration: 1.0        # rad/s^2
+    stop_stable_seconds: 0.30
+    stop_max_linear_speed: 0.03       # measured from 0.2 s body-pose history
+    stop_max_angular_speed: 0.10
+    stop_timeout: 5.0

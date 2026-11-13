@@ -5,7 +5,7 @@ Panels:
     Property Tree Widget:
       Expanded: ~
       Splitter Ratio: 0.5
-    Tree Height: 783
+    Tree Height: 369
 Visualization Manager:
   Class: ""
   Displays:
@@ -120,6 +120,10 @@ Visualization Manager:
           Alpha: 1
           Show Axes: false
           Show Trail: false
+        ground_lidar_link:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
         imu_link:
           Alpha: 1
           Show Axes: false
@@ -176,7 +180,7 @@ Visualization Manager:
       Max Intensity: 4096
       Min Color: 0; 0; 0
       Min Intensity: 0
-      Name: Online multi-layer surfaces
+      Name: Online PCT surfaces (planner map)
       Position Transformer: XYZ
       Selectable: true
       Size (Pixels): 3
@@ -224,6 +228,39 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
+    - Alpha: 0.6000000238418579
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 100; 80
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 4096
+      Min Color: 0; 0; 0
+      Min Intensity: 0
+      Name: PCT measured returns (all heights)
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.05000000074505806
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /exploration/layers/measured_returns
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
     - Alpha: 1
       Buffer Length: 1
       Class: rviz_default_plugins/Path
@@ -254,9 +291,23 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Name: Surface graph and A* preview
+      Name: PCT frontier clusters and XYZ observations
       Namespaces:
-        surface_graph_preview: true
+        pct_observations: true
+        pct_selected_observation: true
+        pct_surface_frontiers: true
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /exploration/pct/frontiers
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: PCT native A* ascent preview
+      Namespaces:
+        pct_ascent_preview: true
       Topic:
         Depth: 1
         Durability Policy: Transient Local
@@ -382,10 +433,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.6697976589202881
+      Pitch: 0.6997979283332825
       Target Frame: map
       Value: Orbit (rviz_default_plugins)
-      Yaw: 4.644540786743164
+      Yaw: 1.469511866569519
     Saved: ~
 Window Geometry:
   Displays:

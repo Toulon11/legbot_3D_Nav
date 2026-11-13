@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -16,20 +17,21 @@
 
 #include "bspline_opt/uniform_bspline.h"
 #include <scan_planner/msg/bspline.hpp>
+#include <plan_manage/goal_tolerance.h>
 
 namespace
 {
 using scan_planner::UniformBspline;
 
-legbot::Publisher cmd_vel_pub;
+legbot::Publisher cmd_vel_pub, stop_status_pub;
 legbot::Publisher execution_frozen_pub;
 legbot::Publisher goal_stop_ack_pub;
-legbot::Publisher goal_failure_pub;
-legbot::Publisher reverse_result_pub;
+legbot::Publisher goal_failure_pub, tolerance_status_pub;
+legbot::Publisher reverse_result_pub, turn_result_pub, recovery_state_pub;
 legbot::Subscriber bspline_sub;
 legbot::Subscriber odom_sub;
-legbot::Subscriber goal_sub;
-legbot::Subscriber bootstrap_turn_sub;
+legbot::Subscriber goal_sub, goal_request_sub;
+legbot::Subscriber turn_request_sub, action_cancel_sub, action_enabled_sub;
 legbot::Subscriber reverse_request_sub;
 legbot::Timer cmd_timer;
 
@@ -47,8 +49,15 @@ bool have_goal_position = false;
 bool goal_stop_latched = false;
 bool goal_ack_sent = false;
 bool execution_failure_sent = false;
-double best_terminal_distance = std::numeric_limits<double>::infinity();
-legbot::Time terminal_progress_time;
+enum class NavigationPhase { waiting, translating, rotating };
+NavigationPhase navigation_phase = NavigationPhase::waiting;
+bool navigation_started = false;
+bool trajectory_has_motion = false;
+legbot::Time navigation_started_at, navigation_progress_at;
+double best_navigation_distance = std::numeric_limits<double>::infinity();
+double best_navigation_yaw_error = std::numeric_limits<double>::infinity();
+Eigen::Vector2d navigation_progress_position = Eigen::Vector2d::Zero();
+double navigation_progress_yaw = 0.0;
 geometry_msgs::msg::PoseStamped latest_goal_msg;
 Eigen::Vector3d latest_goal_pos = Eigen::Vector3d::Zero();
 
@@ -64,6 +73,8 @@ double max_vx;
 double max_vy;
 double max_vyaw;
 double finish_dist;
+double default_finish_dist;
+scan_planner::msg::GoalRequest current_goal_request;
 double finish_dist_z;
 bool use_goal_z;
 double tracking_z_weight;
@@ -75,9 +86,10 @@ double stair_speed_scale;
 double min_stair_speed;
 double min_walk_speed;
 double goal_slowdown_distance;
-double terminal_stall_speed;
-double terminal_stall_seconds;
 double terminal_failure_seconds;
+double terminal_rotate_enter;
+double terminal_rotate_exit;
+double execution_timeout;
 double turn_slowdown_angle;
 double min_turn_speed_scale;
 double cmd_accel_limit;
@@ -85,19 +97,41 @@ double cmd_yaw_accel_limit;
 std::string body_pose_topic;
 geometry_msgs::msg::Twist last_motion_cmd;
 legbot::Time last_motion_cmd_time;
+enum class StopOwner { none, goal, turn, reverse };
+StopOwner stop_owner=StopOwner::none;
+legbot::Time stop_started, stop_stable_since, stop_status_at;
+double stop_deceleration=.35,stop_yaw_deceleration=1.,stop_stable_seconds=.30;
+double stop_linear_threshold=.03,stop_angular_threshold=.10,stop_timeout=5.;
+constexpr double kTerminalProgressDistance=.01;
+struct MotionSample {double t;Eigen::Vector3d p;Eigen::Quaterniond q;};
+std::deque<MotionSample> motion_samples;
+double measured_linear_speed=std::numeric_limits<double>::infinity();
+double measured_angular_speed=std::numeric_limits<double>::infinity();
 bool rotate_only = false;
 int rotate_direction = 0;
-double bootstrap_yaw_rate = 0.0;
-legbot::Time last_bootstrap_turn;
+// Recovery actions own their execution watchdogs. The gait coordinator is the
+// only mode publisher; a matching, fresh enable lease gates all action motion.
+bool turn_active = false, action_enabled = false;
+std::uint64_t turn_stamp = 0, last_action_stamp = 0;
+Eigen::Vector2d turn_start = Eigen::Vector2d::Zero();
+double turn_angle = 0.0, turn_progress = 0.0;
+double turn_speed = 0.35, turn_timeout = 8.0;
+legbot::Time turn_started_at, action_requested_at, action_enable_at;
+bool action_started = false;
+
 bool reverse_active = false;
 std::uint64_t reverse_stamp = 0;
 Eigen::Vector2d reverse_start = Eigen::Vector2d::Zero();
+Eigen::Vector2d reverse_direction = Eigen::Vector2d::Zero();
+bool recovery_shift = false;
 double reverse_yaw = 0.0;
 double reverse_distance = 0.0;
 double reverse_best_progress = 0.0;
 legbot::Time reverse_started_at;
 legbot::Time reverse_progress_at;
 double reverse_speed = 0.12;
+double shift_speed = 0.22;
+constexpr double shift_stop_lead = 0.07;
 
 double normalizeAngle(double angle)
 {
@@ -131,7 +165,8 @@ void loadParams(const legbot::NodeHandle &nh)
   nh.param("max_vx", max_vx, 0.50);
   nh.param("max_vy", max_vy, 0.25);
   nh.param("max_vyaw", max_vyaw, 1.00);
-  nh.param("finish_dist", finish_dist, 0.25);
+  nh.param("finish_dist", default_finish_dist, 0.25);
+  finish_dist=default_finish_dist;
   nh.param("finish_dist_z", finish_dist_z, 0.20);
   nh.param("use_goal_z", use_goal_z, false);
   // A local B-spline spans only one short, monotonic route segment.  Its
@@ -147,23 +182,40 @@ void loadParams(const legbot::NodeHandle &nh)
   nh.param("min_stair_speed", min_stair_speed, 0.30);
   nh.param("min_walk_speed", min_walk_speed, 0.0);
   nh.param("goal_slowdown_distance", goal_slowdown_distance, 0.80);
-  nh.param("terminal_stall_speed", terminal_stall_speed, 0.15);
-  nh.param("terminal_stall_seconds", terminal_stall_seconds, 1.0);
   nh.param("terminal_failure_seconds", terminal_failure_seconds, 8.0);
+  nh.param("terminal_rotate_enter", terminal_rotate_enter, 0.50);
+  nh.param("terminal_rotate_exit", terminal_rotate_exit, 0.30);
+  nh.param("execution_timeout", execution_timeout, 600.0);
   nh.param("recovery_reverse_speed", reverse_speed, 0.12);
+  nh.param("recovery_shift_speed", shift_speed, 0.22);
+  nh.param("recovery_turn_speed", turn_speed, 0.35);
+  nh.param("recovery_turn_timeout", turn_timeout, 8.0);
   nh.param("turn_slowdown_angle", turn_slowdown_angle, 0.30);
   nh.param("min_turn_speed_scale", min_turn_speed_scale, 0.30);
   nh.param("cmd_accel_limit", cmd_accel_limit, 0.75);
   nh.param("cmd_yaw_accel_limit", cmd_yaw_accel_limit, 2.00);
+  nh.param("stop_deceleration",stop_deceleration,.35);
+  nh.param("stop_yaw_deceleration",stop_yaw_deceleration,1.);
+  nh.param("stop_stable_seconds",stop_stable_seconds,.30);
+  nh.param("stop_max_linear_speed",stop_linear_threshold,.03);
+  nh.param("stop_max_angular_speed",stop_angular_threshold,.10);
+  nh.param("stop_timeout",stop_timeout,5.);
+  if(!std::isfinite(min_walk_speed)||min_walk_speed<0)throw std::invalid_argument("invalid minimum walk speed");
+  for(double value:{stop_deceleration,stop_yaw_deceleration,stop_stable_seconds,stop_linear_threshold,
+                    stop_angular_threshold,stop_timeout})
+    if(!std::isfinite(value)||value<=0)throw std::invalid_argument("invalid controlled stop configuration");
   legbot::param::param<std::string>("/body_pose_topic", body_pose_topic, std::string("/Odometry_gazebo"));
 
   max_vyaw = std::min(std::max(max_vyaw, 0.0), 1.0);
   max_vx = std::min(std::max(max_vx, 0.0), 0.75);
-  terminal_stall_speed = clamp(terminal_stall_speed, 0.0, 0.20);
-  terminal_stall_seconds = clamp(terminal_stall_seconds, 0.5, 10.0);
-  terminal_failure_seconds = std::max(terminal_stall_seconds + 1.0,
-                                      clamp(terminal_failure_seconds, 2.0, 60.0));
+  terminal_failure_seconds = clamp(terminal_failure_seconds, 2.0, 60.0);
+  terminal_rotate_enter = clamp(terminal_rotate_enter, 0.05, M_PI);
+  terminal_rotate_exit = clamp(terminal_rotate_exit, 0.01, terminal_rotate_enter - 0.01);
+  execution_timeout = clamp(execution_timeout, 2.0, 3600.0);
   reverse_speed = clamp(reverse_speed, 0.05, 0.18);
+  shift_speed = clamp(shift_speed, 0.10, 0.25);
+  turn_speed = clamp(turn_speed, 0.05, 0.60);
+  turn_timeout = clamp(turn_timeout, 2.0, 60.0);
   heading_error_threshold = clamp(heading_error_threshold, 0.10, M_PI);
   min_turn_speed_scale = clamp(min_turn_speed_scale, 0.0, 1.0);
   rotate_exit_ratio = clamp(rotate_exit_ratio, 0.0, 1.0);
@@ -236,16 +288,21 @@ double approach(double current, double target, double maximum_delta)
   return current + clamp(target - current, -maximum_delta, maximum_delta);
 }
 
-void publishSmooth(const geometry_msgs::msg::Twist &target)
+void publishSmooth(const geometry_msgs::msg::Twist &target,double linear_limit=-1.,double yaw_limit=-1.)
 {
   const legbot::Time now = legbot::Time::now();
   double dt = last_motion_cmd_time.isZero() ? 0.01 : (now - last_motion_cmd_time).toSec();
   dt = clamp(dt, 0.001, 0.05);
   geometry_msgs::msg::Twist cmd = target;
-  const double linear_delta = std::max(0.0, cmd_accel_limit) * dt;
-  const double yaw_delta = std::max(0.0, cmd_yaw_accel_limit) * dt;
-  cmd.linear.x = approach(last_motion_cmd.linear.x, target.linear.x, linear_delta);
-  cmd.linear.y = approach(last_motion_cmd.linear.y, target.linear.y, linear_delta);
+  // Use the same braking limits before and inside the arrival circle.
+  const Eigen::Vector2d previous(last_motion_cmd.linear.x,last_motion_cmd.linear.y);
+  const Eigen::Vector2d desired(target.linear.x,target.linear.y);
+  const bool braking=desired.norm()<previous.norm() || desired.dot(previous)<0.;
+  const bool yaw_braking=std::abs(target.angular.z)<std::abs(last_motion_cmd.angular.z) || target.angular.z*last_motion_cmd.angular.z<0.;
+  const double linear_delta=std::max(0.,linear_limit<0?(braking?std::min(cmd_accel_limit,stop_deceleration):cmd_accel_limit):linear_limit)*dt;
+  const double yaw_delta=std::max(0.,yaw_limit<0?(yaw_braking?std::min(cmd_yaw_accel_limit,stop_yaw_deceleration):cmd_yaw_accel_limit):yaw_limit)*dt;
+  const Eigen::Vector2d delta=clampNorm(Eigen::Vector2d(desired-previous),linear_delta);
+  cmd.linear.x=last_motion_cmd.linear.x+delta.x();cmd.linear.y=last_motion_cmd.linear.y+delta.y();
   cmd.angular.z = approach(last_motion_cmd.angular.z, target.angular.z, yaw_delta);
   cmd_vel_pub.publish(cmd);
   last_motion_cmd = cmd;
@@ -259,10 +316,92 @@ void publishExecutionFrozen(bool frozen)
   execution_frozen_pub.publish(msg);
 }
 
+void failNavigation(const std::string &reason)
+{
+  if (execution_failure_sent) return;
+  execution_failure_sent = true;
+  stop_owner=StopOwner::none;
+  publishExecutionFrozen(false);
+  publishStop();
+  const auto &stamp = latest_goal_msg.header.stamp;
+  const std::uint64_t stamp_ns = static_cast<std::uint64_t>(stamp.sec) * 1000000000ULL +
+                                 stamp.nanosec;
+  if (stamp_ns != 0) {
+    std_msgs::msg::String failure;
+    failure.data = std::to_string(stamp_ns) + "|" + reason;
+    goal_failure_pub.publish(failure);
+  }
+  ROS_WARN("[scan_go2_cmd_adapter] Navigation stopped: %s.", reason.c_str());
+}
+
+bool navigationMakingProgress(bool rotating, bool terminal, double distance,
+                              double yaw_error)
+{
+  if (!have_goal_position) return true;
+  const auto now = legbot::Time::now();
+  const auto phase = rotating ? NavigationPhase::rotating : NavigationPhase::translating;
+  if (navigation_phase != phase) {
+    navigation_phase = phase;
+    navigation_progress_at = now;
+    best_navigation_distance = distance;
+    best_navigation_yaw_error = yaw_error;
+    navigation_progress_position = odom_pos.head<2>();
+    navigation_progress_yaw = odom_yaw;
+  }
+  bool progress = false;
+  if (rotating) {
+    // A replacement spline alone must not count as physical yaw progress.
+    progress = yaw_error <= best_navigation_yaw_error - 0.02 &&
+        std::abs(normalizeAngle(odom_yaw - navigation_progress_yaw)) >= 0.01;
+  } else if (terminal) {
+    progress = distance <= best_navigation_distance - kTerminalProgressDistance;
+  } else {
+    // A valid detour can temporarily increase distance to the final goal.
+    progress = (odom_pos.head<2>() - navigation_progress_position).norm() >= 0.02;
+  }
+  if (progress) {
+    navigation_progress_at = now;
+    best_navigation_distance = distance;
+    best_navigation_yaw_error = yaw_error;
+    navigation_progress_position = odom_pos.head<2>();
+    navigation_progress_yaw = odom_yaw;
+  }
+  if ((now - navigation_progress_at).toSec() >= terminal_failure_seconds) {
+    failNavigation(rotating ? "execution_heading_no_progress" : "execution_no_progress");
+    return false;
+  }
+  return true;
+}
+
+void publishActionState(std::uint64_t stamp, const std::string &state)
+{
+  std_msgs::msg::String msg;
+  msg.data = std::to_string(stamp) + "|" + state;
+  recovery_state_pub.publish(msg);
+}
+
+void finishTurn(const std::string &reason, bool success)
+{
+  if (!turn_active) return;
+  turn_active = false;
+  stop_owner=StopOwner::none;
+  action_enabled = false;
+  publishExecutionFrozen(false);
+  publishStop();
+  publishActionState(turn_stamp, "finished");
+  std_msgs::msg::String result;
+  result.data = std::to_string(turn_stamp) + "|" + reason;
+  if (success) turn_result_pub.publish(result);
+  else goal_failure_pub.publish(result);
+}
+
 void finishReverse(const std::string &reason, bool success)
 {
   if (!reverse_active) return;
   reverse_active = false;
+  stop_owner=StopOwner::none;
+  action_enabled = false;
+  publishActionState(reverse_stamp, "finished");
   publishExecutionFrozen(false);
   publishStop();
   std_msgs::msg::String result;
@@ -285,35 +424,53 @@ void reverseRequestCallback(const std_msgs::msg::String::ConstSharedPtr &msg)
       stamp == 0 || !std::isfinite(sx) || !std::isfinite(sy) ||
       !std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(yaw)) return;
   input >> std::ws;
-  if (!input.eof()) return;
+  bool shift=false;
+  if (!input.eof()) {
+    char separator;
+    std::string kind;
+    if(!(input >> separator >> kind) || separator!='|' || kind!="shift") return;
+    input >> std::ws;
+    if(!input.eof()) return;
+    shift=true;
+  }
+  if (stamp <= last_action_stamp ||
+      (have_goal_time && stamp < static_cast<std::uint64_t>(latest_goal_time.value.nanoseconds()))) return;
+  last_action_stamp = stamp;
   if (reverse_active) finishReverse("reverse_preempted", false);
+  if (turn_active) finishTurn("turn_preempted", false);
+  stop_owner=StopOwner::none;
   reverse_stamp = stamp;
   const Eigen::Vector2d start(sx, sy), target(tx, ty);
   const Eigen::Vector2d rear(-std::cos(yaw), -std::sin(yaw));
   const Eigen::Vector2d displacement = target - start;
-  const double planned_distance = displacement.dot(rear);
+  const double planned_distance = shift?displacement.norm():displacement.dot(rear);
   const legbot::Time now = legbot::Time::now();
   if (!have_odom || (now - last_odom_time).toSec() > odom_timeout ||
-      (odom_pos.head<2>() - start).norm() > 0.15 ||
+      (odom_pos.head<2>() - start).norm() > (shift?.04:.15) ||
       std::abs(normalizeAngle(odom_yaw - yaw)) > 0.25 ||
-      planned_distance < 0.20 || planned_distance > 0.60 ||
-      (displacement - planned_distance * rear).norm() > 0.05) {
+      planned_distance < 0.20-1e-6 || planned_distance > 0.60+1e-6 ||
+      (!shift && (displacement - planned_distance * rear).norm() > 0.05)) {
     receive_traj = false;
     execution_failure_sent = true;
     publishExecutionFrozen(false);
     publishStop();
     std_msgs::msg::String failure;
-    failure.data = std::to_string(stamp) + "|reverse_request_invalid";
+    failure.data = std::to_string(stamp) + (shift?"|shift_request_invalid":"|reverse_request_invalid");
     goal_failure_pub.publish(failure);
     return;
   }
   reverse_start = start;
+  reverse_direction = shift?Eigen::Vector2d(displacement/planned_distance):rear;
+  recovery_shift=shift;
   reverse_yaw = yaw;
   reverse_distance = planned_distance;
   reverse_best_progress = 0.0;
   reverse_started_at = now;
   reverse_progress_at = now;
   reverse_active = true;
+  action_requested_at = now;
+  action_enabled = action_started = false;
+  publishActionState(stamp, "accepted");
   // The previous spline must not resume after this short recovery manoeuvre.
   receive_traj = false;
   execution_failure_sent = true;
@@ -321,18 +478,97 @@ void reverseRequestCallback(const std_msgs::msg::String::ConstSharedPtr &msg)
   publishStop();
 }
 
-void bootstrapTurnCallback(const geometry_msgs::msg::Twist::ConstSharedPtr &msg)
+void turnRequestCallback(const std_msgs::msg::String::ConstSharedPtr &msg)
 {
-  if (!msg || !std::isfinite(msg->angular.z)) return;
-  bootstrap_yaw_rate = clamp(msg->angular.z, -max_vyaw, max_vyaw);
-  last_bootstrap_turn = legbot::Time::now();
+  if (!msg) return;
+  std::istringstream input(msg->data);
+  std::uint64_t stamp = 0;
+  char separator = 0;
+  double angle = 0.0;
+  if (!(input >> stamp >> separator >> angle) || separator != '|' ||
+      stamp == 0 || !std::isfinite(angle)) return;
+  input >> std::ws;
+  if (!input.eof() || stamp <= last_action_stamp ||
+      (have_goal_time && stamp < static_cast<std::uint64_t>(latest_goal_time.value.nanoseconds()))) return;
+  last_action_stamp = stamp;
+  if (reverse_active) finishReverse("reverse_preempted", false);
+  if (turn_active) finishTurn("turn_preempted", false);
+  stop_owner=StopOwner::none;
+  turn_stamp = stamp;
+  turn_active = true;
+  receive_traj = false;
+  execution_failure_sent = true;
+  publishStop();
+  const auto now = legbot::Time::now();
+  if (!have_odom || (now-last_odom_time).toSec()>odom_timeout ||
+      std::abs(angle)<0.01 || std::abs(angle)>2.0*M_PI) {
+    finishTurn("turn_request_invalid", false);
+    return;
+  }
+  turn_start = odom_pos.head<2>();
+  turn_angle = angle;
+  turn_progress = 0.0;
+  action_requested_at = now;
+  action_enabled = action_started = false;
+  publishActionState(stamp, "accepted");
 }
 
-void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
+void actionEnabledCallback(const std_msgs::msg::String::ConstSharedPtr &msg)
 {
+  if (!msg) return;
+  const auto stamp = turn_active ? turn_stamp : (reverse_active ? reverse_stamp : 0);
+  if (stamp == 0 || msg->data != std::to_string(stamp)) return;
+  action_enabled = true;
+  action_enable_at = legbot::Time::now();
+}
+
+void actionCancelCallback(const std_msgs::msg::String::ConstSharedPtr &msg)
+{
+  if (!msg) return;
+  if (turn_active && msg->data == std::to_string(turn_stamp))
+    finishTurn("turn_cancelled", false);
+  if (reverse_active && msg->data == std::to_string(reverse_stamp))
+    finishReverse("reverse_cancelled", false);
+}
+
+// A coordinator must acknowledge this exact action after activating the gait.
+// No motion is published while it is absent or still issuing the mode pulse.
+bool recoveryEnabled()
+{
+  const auto now = legbot::Time::now();
+  const auto stamp = turn_active ? turn_stamp : reverse_stamp;
+  if (!action_enabled) {
+    publishStop();
+    publishActionState(stamp, "accepted");
+    if ((now-action_requested_at).toSec()>4.0) {
+      if (turn_active) finishTurn("turn_activation_timeout", false);
+      else finishReverse("reverse_activation_timeout", false);
+    }
+    return false;
+  }
+  if ((now-action_enable_at).toSec()>0.5) {
+    if (turn_active) finishTurn("turn_activation_lost", false);
+    else finishReverse("reverse_activation_lost", false);
+    return false;
+  }
+  if (!action_started) {
+    action_started = true;
+    turn_started_at = reverse_started_at = reverse_progress_at = now;
+    // Displacement/yaw acquired before gait activation is never progress.
+    turn_progress = 0.0;
+  }
+  return true;
+}
+
+void acceptGoal(const scan_planner::msg::GoalRequest &request)
+{
+  const auto msg=std::make_shared<geometry_msgs::msg::PoseStamped>(request.target);
+  const legbot::Time incoming(msg->header.stamp);
+  if(have_goal_time && !incoming.isZero() && incoming.value.nanoseconds() <= latest_goal_time.value.nanoseconds())return;
+  if ((turn_active || reverse_active) && !incoming.isZero() &&
+      incoming.value.nanoseconds() < static_cast<std::int64_t>(last_action_stamp)) return;
   if (reverse_active) finishReverse("reverse_preempted", false);
-  if (!msg)
-    return;
+  if (turn_active) finishTurn("turn_preempted", false);
 
   latest_goal_time = legbot::Time(msg->header.stamp);
   if (latest_goal_time.isZero())
@@ -340,12 +576,27 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
   have_goal_time = true;
   latest_goal_pos << msg->pose.position.x, msg->pose.position.y, msg->pose.position.z;
   have_goal_position = latest_goal_pos.allFinite();
+  stop_owner=StopOwner::none;
   goal_stop_latched = false;
   goal_ack_sent = false;
   execution_failure_sent = false;
-  best_terminal_distance = std::numeric_limits<double>::infinity();
-  terminal_progress_time = legbot::Time::now();
+  navigation_started = false;
+  navigation_phase = NavigationPhase::waiting;
   latest_goal_msg = *msg;
+  current_goal_request=request;
+  if(!scan_planner::validGoalReference(request)) {
+    receive_traj=false;have_goal_position=false;
+    failNavigation("invalid_goal_reference");return;
+  }
+  if(!scan_planner::validGoalTolerance(request)) {
+    receive_traj=false;have_goal_position=false;
+    tolerance_status_pub.publish(std_msgs::msg::String().set__data(
+        scan_planner::goalToleranceStatus(request,"executor","rejected",0)));
+    failNavigation("invalid_goal_tolerance");return;
+  }
+  finish_dist=request.has_xy_tolerance?request.xy_tolerance:default_finish_dist;
+  tolerance_status_pub.publish(std_msgs::msg::String().set__data(
+      scan_planner::goalToleranceStatus(request,"executor","accepted",finish_dist)));
   // A new point can be almost exactly behind the robot. Do not carry the
   // preceding goal's rotate hysteresis/direction into that U-turn.
   rotate_only = false;
@@ -363,6 +614,14 @@ void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
     publishStop();
     ROS_INFO("[scan_go2_cmd_adapter] new goal received; previous trajectory stopped.");
   }
+}
+
+void goalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg) {
+  if(!msg)return;
+  scan_planner::msg::GoalRequest request;request.target=*msg;acceptGoal(request);
+}
+void goalRequestCallback(const scan_planner::msg::GoalRequest::ConstSharedPtr &msg) {
+  if(msg)acceptGoal(*msg);
 }
 
 void bsplineCallback(const scan_planner::msg::Bspline::ConstSharedPtr &msg)
@@ -413,8 +672,26 @@ void bsplineCallback(const scan_planner::msg::Bspline::ConstSharedPtr &msg)
   latest_traj_start = candidate_start;
   receive_traj = true;
   last_nearest_time = 0.0;
+  trajectory_has_motion = false;
+  for (Eigen::Index i = 1; i < pos_pts.cols(); ++i)
+    trajectory_has_motion |= (pos_pts.col(i).head<2>() - pos_pts.col(0).head<2>()).norm() > 1e-4;
+  if (!navigation_started) {
+    navigation_started = true;
+    navigation_started_at = legbot::Time::now();
+  }
 
   ROS_INFO("[scan_go2_cmd_adapter] receive traj %d duration %.3fs", traj_id, traj_duration);
+}
+
+bool insideGoalTolerance(double xy_distance)
+{
+  return xy_distance<=finish_dist &&
+      (!use_goal_z || std::abs(latest_goal_pos.z()-odom_pos.z())<=finish_dist_z);
+}
+
+bool measuredMotionIsQuiet()
+{
+  return measured_linear_speed<=stop_linear_threshold && measured_angular_speed<=stop_angular_threshold;
 }
 
 void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg)
@@ -432,13 +709,124 @@ void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg)
   odom_pos(0) = msg->pose.pose.position.x;
   odom_pos(1) = msg->pose.pose.position.y;
   odom_pos(2) = msg->pose.pose.position.z;
-  odom_yaw = legbot_tf::getYaw(msg->pose.pose.orientation);
+  const double yaw = legbot_tf::getYaw(msg->pose.pose.orientation);
+  if (turn_active && action_started) {
+    const double delta = normalizeAngle(yaw-odom_yaw);
+    // Odometry jumps are not evidence of completing an action.
+    if (std::abs(delta)>0.5) finishTurn("turn_odometry_jump", false);
+    else turn_progress += delta;
+  }
+  const double sample_time=static_cast<double>(msg->header.stamp.sec)+msg->header.stamp.nanosec*1e-9;
+  if(!motion_samples.empty() && sample_time<motion_samples.back().t)motion_samples.clear();
+  if(sample_time>0 && (motion_samples.empty() || sample_time>motion_samples.back().t)) {
+    motion_samples.push_back({sample_time,odom_pos,Eigen::Quaterniond(q.w,q.x,q.y,q.z).normalized()});
+    while(motion_samples.size()>2 && motion_samples[1].t<=sample_time-.20)motion_samples.pop_front();
+    while(motion_samples.size()>200)motion_samples.pop_front();
+    const auto &first=motion_samples.front();const auto &last=motion_samples.back();
+    const double dt=last.t-first.t;
+    measured_linear_speed=measured_angular_speed=std::numeric_limits<double>::infinity();
+    if(dt>=.16 && dt<=.5) {
+      measured_linear_speed=(last.p-first.p).norm()/dt;
+      measured_angular_speed=2.*std::acos(clamp(std::abs(first.q.dot(last.q)),0.,1.))/dt;
+    }
+  }
+  odom_yaw = yaw;
   have_odom = true;
   last_odom_time = legbot::Time::now();
 }
 
+const char *stopName() {
+  return stop_owner==StopOwner::goal?"goal":(stop_owner==StopOwner::turn?"turn":"reverse");
+}
+void reportStop(const char *phase) {
+  const auto now=legbot::Time::now();
+  if(std::string(phase)!="settled" && !stop_status_at.isZero() && (now-stop_status_at).toSec()<.1)return;
+  stop_status_at=now;
+  std::ostringstream out;out<<"{\"owner\":\""<<stopName()<<"\",\"phase\":\""<<phase
+      <<"\",\"elapsed\":"<<(now-stop_started).toSec()<<",\"command_speed\":"<<std::hypot(last_motion_cmd.linear.x,last_motion_cmd.linear.y)
+      <<",\"command_yaw_speed\":"<<last_motion_cmd.angular.z;
+  if(std::isfinite(measured_linear_speed))out<<",\"actual_speed\":"<<measured_linear_speed;
+  if(std::isfinite(measured_angular_speed))out<<",\"actual_angular_speed\":"<<measured_angular_speed;
+  out<<'}';std_msgs::msg::String msg;msg.data=out.str();stop_status_pub.publish(msg);
+}
+void beginControlledStop(StopOwner owner) {
+  if(stop_owner==owner)return;
+  stop_owner=owner;stop_started=legbot::Time::now();stop_stable_since=stop_status_at=legbot::Time();
+}
+void processControlledStop() {
+  const auto now=legbot::Time::now();
+  if(!have_odom || (now-last_odom_time).toSec()>odom_timeout) {
+    if(stop_owner==StopOwner::goal)failNavigation("execution_stop_odometry_stale");
+    else if(stop_owner==StopOwner::turn)finishTurn("turn_odometry_stale",false);
+    else finishReverse("reverse_odometry_stale",false);
+    return;
+  }
+  if(stop_owner==StopOwner::goal && navigation_started &&
+      (now-navigation_started_at).toSec()>=execution_timeout) {
+    failNavigation("execution_timeout");return;
+  }
+  publishExecutionFrozen(false);
+  publishSmooth(geometry_msgs::msg::Twist(),stop_deceleration,stop_yaw_deceleration);
+  const bool quiet=std::hypot(last_motion_cmd.linear.x,last_motion_cmd.linear.y)<.001 &&
+      std::abs(last_motion_cmd.angular.z)<.001 && measuredMotionIsQuiet();
+  if(!quiet)stop_stable_since=legbot::Time();
+  else if(stop_stable_since.isZero())stop_stable_since=now;
+  if(quiet && (now-stop_stable_since).toSec()>=stop_stable_seconds) {
+    reportStop("settled");
+    const auto owner=stop_owner;stop_owner=StopOwner::none;
+    if(owner==StopOwner::turn){finishTurn("succeeded",true);return;}
+    if(owner==StopOwner::reverse){
+      if(recovery_shift &&
+         (odom_pos.head<2>()-(reverse_start+reverse_direction*reverse_distance)).norm()>.08) {
+        finishReverse("shift_stop_outside_tolerance",false);return;
+      }
+      finishReverse("succeeded",true);return;
+    }
+    const double distance=(latest_goal_pos.head<2>()-odom_pos.head<2>()).norm();
+    if(distance>finish_dist+1e-6 || (use_goal_z && std::abs(latest_goal_pos.z()-odom_pos.z())>finish_dist_z)) {
+      failNavigation("execution_stop_outside_tolerance");return;
+    }
+    if(!goal_ack_sent) {
+      auto ack=latest_goal_msg;ack.pose.position.x=odom_pos.x();ack.pose.position.y=odom_pos.y();ack.pose.position.z=odom_pos.z();
+      goal_stop_ack_pub.publish(ack);
+      tolerance_status_pub.publish(std_msgs::msg::String().set__data(
+          scan_planner::goalToleranceStatus(current_goal_request,"executor","arrived",finish_dist,odom_pos.x(),odom_pos.y(),odom_pos.z(),distance)));
+      goal_ack_sent=true;
+    }
+    return;
+  }
+  reportStop(quiet?"stabilizing":"braking");
+  if((now-stop_started).toSec()>stop_timeout) {
+    if(stop_owner==StopOwner::turn)finishTurn("turn_stop_timeout",false);
+    else if(stop_owner==StopOwner::reverse)finishReverse("reverse_stop_timeout",false);
+    else failNavigation("execution_stop_timeout");
+  }
+}
+
 void cmdCallback(const legbot::TimerEvent &)
 {
+  if ((turn_active || reverse_active) && !recoveryEnabled()) return;
+  if(stop_owner!=StopOwner::none){processControlledStop();return;}
+  if (turn_active) {
+    const auto now = legbot::Time::now();
+    if (!have_odom || (now-last_odom_time).toSec()>odom_timeout) {
+      finishTurn("turn_odometry_stale", false); return;
+    }
+    if ((odom_pos.head<2>()-turn_start).norm()>0.25) {
+      finishTurn("turn_position_deviation", false); return;
+    }
+    if (std::copysign(1.0,turn_angle)*turn_progress >= std::abs(turn_angle)-std::min(0.02,0.1*std::abs(turn_angle))) {
+      beginControlledStop(StopOwner::turn);processControlledStop();return;
+    }
+    if ((now-turn_started_at).toSec()>turn_timeout) {
+      finishTurn("turn_timeout", false); return;
+    }
+    geometry_msgs::msg::Twist cmd;
+    cmd.angular.z = std::copysign(std::min(max_vyaw,turn_speed),turn_angle);
+    publishExecutionFrozen(true);
+    publishSmooth(cmd);
+    return;
+  }
   if (reverse_active)
   {
     const legbot::Time now = legbot::Time::now();
@@ -447,20 +835,19 @@ void cmdCallback(const legbot::TimerEvent &)
       finishReverse("reverse_odometry_stale", false);
       return;
     }
-    const Eigen::Vector2d rear(-std::cos(reverse_yaw), -std::sin(reverse_yaw));
     const Eigen::Vector2d travelled = odom_pos.head<2>() - reverse_start;
-    const double progress = travelled.dot(rear);
-    const double lateral = (travelled - progress * rear).norm();
+    const double progress = travelled.dot(reverse_direction);
+    const Eigen::Vector2d lateral_error=travelled-progress*reverse_direction;
     const double yaw_error = normalizeAngle(reverse_yaw - odom_yaw);
-    if (lateral > 0.15 || std::abs(yaw_error) > 0.30 || progress < -0.08)
+    if (lateral_error.norm() > (recovery_shift?.06:.15) || std::abs(yaw_error) > 0.30 ||
+        progress < (recovery_shift?-.03:-.08))
     {
-      finishReverse("reverse_pose_deviation", false);
+      finishReverse(recovery_shift?"shift_pose_deviation":"reverse_pose_deviation", false);
       return;
     }
-    if (progress >= reverse_distance - 0.04)
+    if (progress >= reverse_distance - (recovery_shift?shift_stop_lead:.04))
     {
-      finishReverse("succeeded", true);
-      return;
+      beginControlledStop(StopOwner::reverse);processControlledStop();return;
     }
     if (progress > reverse_best_progress + 0.01)
     {
@@ -470,11 +857,16 @@ void cmdCallback(const legbot::TimerEvent &)
     if ((now - reverse_progress_at).toSec() > 3.0 ||
         (now - reverse_started_at).toSec() > 8.0)
     {
-      finishReverse("reverse_no_progress", false);
+      finishReverse(recovery_shift?"shift_no_progress":"reverse_no_progress", false);
       return;
     }
     geometry_msgs::msg::Twist cmd;
-    cmd.linear.x = -std::min(max_vx, reverse_speed);
+    if(recovery_shift) {
+      const auto velocity=clampNorm(shift_speed*reverse_direction-lateral_error,shift_speed);
+      const double c=std::cos(odom_yaw),s=std::sin(odom_yaw);
+      cmd.linear.x=clamp(c*velocity.x()+s*velocity.y(),-max_vx,max_vx);
+      cmd.linear.y=clamp(-s*velocity.x()+c*velocity.y(),-max_vy,max_vy);
+    } else cmd.linear.x = -std::min(max_vx, reverse_speed);
     cmd.angular.z = clamp(kp_yaw * yaw_error, -0.20, 0.20);
     publishExecutionFrozen(false);
     publishSmooth(cmd);
@@ -494,19 +886,6 @@ void cmdCallback(const legbot::TimerEvent &)
     return;
   }
 
-  // SCAN remains the only /cmd_vel publisher. A short startup turn is
-  // accepted only before any navigation goal or trajectory exists; a stale
-  // request expires automatically and the normal zero-command branch resumes.
-  if (!have_goal_position && !receive_traj && !last_bootstrap_turn.isZero() &&
-      (legbot::Time::now() - last_bootstrap_turn).toSec() <= 0.25)
-  {
-    geometry_msgs::msg::Twist turn;
-    turn.angular.z = bootstrap_yaw_rate;
-    publishExecutionFrozen(true);
-    publishSmooth(turn);
-    return;
-  }
-
   // The planner publishes short, repeatedly replaced local splines.  Their
   // endpoint/time is not a reliable indication that the mission goal has
   // been reached.  Latch the stop against the actual /scan/goal instead, so
@@ -518,31 +897,21 @@ void cmdCallback(const legbot::TimerEvent &)
     goal_xy_distance = (latest_goal_pos.head<2>() - odom_pos.head<2>()).norm();
     // XY decides arrival. Optional Z is a broad same-floor gate, not a
     // precision height target.
-    const bool inside_goal =
-        goal_xy_distance <= finish_dist &&
-        (!use_goal_z || std::abs(latest_goal_pos.z() - odom_pos.z()) <= finish_dist_z);
+    const bool inside_goal=insideGoalTolerance(goal_xy_distance);
     if (inside_goal && !goal_stop_latched)
-      ROS_INFO("[scan_go2_cmd_adapter] final goal reached; latching zero velocity until the next goal.");
+      ROS_INFO("[scan_go2_cmd_adapter] arrival tolerance entered; controlled stop and physical settling before acknowledgment.");
     goal_stop_latched = goal_stop_latched || inside_goal;
     if (goal_stop_latched)
     {
-      publishExecutionFrozen(false);
-      publishStop();
-      // A zero cmd_vel is not mission completion: the RL controller remains in
-      // walking mode until the waypoint coordinator hears an explicit arrival.
-      // Echo the exact goal stamp so an old acknowledgment cannot finish a
-      // newer RViz or queued goal.
-      if (!goal_ack_sent)
-      {
-        geometry_msgs::msg::PoseStamped ack = latest_goal_msg;
-        ack.pose.position.x = odom_pos.x();
-        ack.pose.position.y = odom_pos.y();
-        ack.pose.position.z = odom_pos.z();
-        goal_stop_ack_pub.publish(ack);
-        goal_ack_sent = true;
-      }
-      return;
+      if(goal_ack_sent){publishStop();return;}
+      beginControlledStop(StopOwner::goal);processControlledStop();return;
     }
+  }
+
+  if (navigation_started && have_goal_position &&
+      (legbot::Time::now() - navigation_started_at).toSec() >= execution_timeout) {
+    failNavigation("execution_timeout");
+    return;
   }
 
   // A goal clicked inside the arrival circle needs no new B-spline, but it
@@ -563,12 +932,18 @@ void cmdCallback(const legbot::TimerEvent &)
 
   const bool near_traj_end = t_near >= traj_duration - 0.05;
   const Eigen::Vector3d end_pt = traj[0].evaluateDeBoorT(traj_duration);
+  const bool final_local_endpoint=have_goal_position && (end_pt.head<2>()-latest_goal_pos.head<2>()).norm()<.01;
   const bool reached_end =
       (end_pt.head<2>() - odom_pos.head<2>()).norm() <= finish_dist &&
       (!use_goal_z || std::abs(end_pt.z() - odom_pos.z()) <= finish_dist_z);
 
-  if (near_traj_end && reached_end)
+  const bool terminal_approach =
+      have_goal_position && goal_xy_distance <= std::max(finish_dist, goal_slowdown_distance);
+  if ((near_traj_end && reached_end && !final_local_endpoint) || !trajectory_has_motion)
   {
+    // Reaching a short local spline is not arrival at the stamped final goal.
+    // Hold for a replacement trajectory; the same watchdog bounds this wait.
+    if (!navigationMakingProgress(false, terminal_approach, goal_xy_distance, 0.0)) return;
     publishExecutionFrozen(false);
     publishStop();
     return;
@@ -598,74 +973,10 @@ void cmdCallback(const legbot::TimerEvent &)
     }
   }
 
-  // Some velocity policies intentionally hold a static pose for very small
-  // commands. A rest-to-rest B-spline also starts with a very small non-zero
-  // feed-forward velocity, so the nearest-point tracker can deadlock at t=0:
-  // the policy does not step, and the requested speed never ramps up. Apply a
-  // configurable launch speed while the endpoint remains outside its finish
-  // tolerance. The normal reached_end branch above still publishes zero.
-  const double effective_min_walk_speed = std::min(std::max(min_walk_speed, 0.0), max_vx);
-  const double walk_speed = vel_world.norm();
-  const bool terminal_approach =
-      have_goal_position && goal_xy_distance <= std::max(finish_dist, goal_slowdown_distance);
-  const legbot::Time now = legbot::Time::now();
-  if (terminal_approach && goal_xy_distance > finish_dist)
-  {
-    if (goal_xy_distance <= best_terminal_distance - 0.01)
-    {
-      best_terminal_distance = goal_xy_distance;
-      terminal_progress_time = now;
-    }
-  }
-  else
-  {
-    best_terminal_distance = std::numeric_limits<double>::infinity();
-    terminal_progress_time = now;
-  }
-  const double terminal_idle_seconds = (now - terminal_progress_time).toSec();
-  if (terminal_stall_speed > 0.0 && terminal_approach && goal_xy_distance > finish_dist &&
-      terminal_idle_seconds >= terminal_failure_seconds && !execution_failure_sent)
-  {
-    execution_failure_sent = true;
-    const auto &stamp = latest_goal_msg.header.stamp;
-    const std::uint64_t stamp_ns = static_cast<std::uint64_t>(stamp.sec) * 1000000000ULL +
-                                   stamp.nanosec;
-    if (stamp_ns != 0)
-    {
-      std_msgs::msg::String failure;
-      failure.data = std::to_string(stamp_ns) + "|execution_no_progress";
-      goal_failure_pub.publish(failure);
-    }
-    ROS_WARN("[scan_go2_cmd_adapter] Goal execution made no terminal progress for %.1f s; "
-             "stopping and reporting failure.", terminal_idle_seconds);
-    publishExecutionFrozen(false);
-    publishStop();
-    return;
-  }
-  const bool needs_minimum_speed =
-      !reached_end && !terminal_approach && effective_min_walk_speed > 0.0 &&
-      walk_speed > 0.005 && walk_speed < effective_min_walk_speed;
-  if (needs_minimum_speed)
-    vel_world *= effective_min_walk_speed / walk_speed;
-
   // Stair minimum-speed handling must never defeat the caller's total speed
   // limit.  Previously a 0.10 m/s experiment could produce a 0.25 m/s
   // lateral command after the minimum-speed rescale.
   vel_world = clampNorm(vel_world, max_vx);
-
-  // A short local spline can still contain feed-forward speed at the mission
-  // endpoint.  Bound it by the remaining distance to avoid coasting through
-  // the finish circle; the measured-progress guard below handles commands
-  // that become too small for the locomotion policy to execute.
-  double terminal_scale = 1.0;
-  if (terminal_approach && goal_slowdown_distance > finish_dist + 1e-3)
-  {
-    terminal_scale = clamp(
-        (goal_xy_distance - finish_dist) /
-            (goal_slowdown_distance - finish_dist),
-        0.0, 1.0);
-    vel_world = clampNorm(vel_world, max_vx * terminal_scale);
-  }
 
   double yaw_des = estimateDesiredYaw(t_near, t_look, pos_near, pos_look);
   // Position-error steering is useful only during coarse tracking.  Near the
@@ -675,37 +986,39 @@ void cmdCallback(const legbot::TimerEvent &)
   if (steer_with_position_error && !terminal_approach && vel_world.norm() > 0.02)
     yaw_des = std::atan2(vel_world(1), vel_world(0));
   const double yaw_err = normalizeAngle(yaw_des - odom_yaw);
-  const double terminal_yaw_scale = terminal_approach ? terminal_scale : 1.0;
 
   const double abs_yaw_error = std::abs(yaw_err);
-  if (terminal_approach)
-  {
-    rotate_only = false;
-    rotate_direction = 0;
-  }
-  else if (!rotate_only && abs_yaw_error > heading_error_threshold)
+  // Preserve the existing coarse-heading policy outside the terminal zone;
+  // close to the goal use tighter hysteresis instead of disabling rotation.
+  const double rotate_enter = terminal_approach ? terminal_rotate_enter : heading_error_threshold;
+  const double rotate_exit = terminal_approach ? terminal_rotate_exit :
+      heading_error_threshold * rotate_exit_ratio;
+  if (!rotate_only && abs_yaw_error > rotate_enter)
   {
     rotate_only = true;
-    // At a nearly 180-degree turn, quaternion/odometry noise can move the
-    // wrapped error repeatedly between +pi and -pi. Latch one direction for
-    // this rotate-in-place phase so the command cannot alternate left/right.
     rotate_direction = yaw_err >= 0.0 ? 1 : -1;
-    ROS_INFO("[scan_go2_cmd_adapter] Enter rotate-in-place: yaw_error=%.2f rad, direction=%s.",
-             yaw_err, rotate_direction > 0 ? "CCW" : "CW");
+    ROS_INFO("[scan_go2_cmd_adapter] Enter rotate-in-place: yaw_error=%.2f rad.", yaw_err);
   }
-  else if (rotate_only && abs_yaw_error < heading_error_threshold * rotate_exit_ratio)
+  else if (rotate_only && abs_yaw_error <= rotate_exit)
   {
     rotate_only = false;
     rotate_direction = 0;
     ROS_INFO("[scan_go2_cmd_adapter] Exit rotate-in-place: yaw_error=%.2f rad.", yaw_err);
   }
+  // Latch the direction only near the +/-pi wrap. A changed spline must not
+  // make a small correction continue in the wrong direction.
+  if (rotate_only && abs_yaw_error < M_PI / 2.0)
+    rotate_direction = yaw_err >= 0.0 ? 1 : -1;
+
+  if (!navigationMakingProgress(rotate_only, terminal_approach,
+                                goal_xy_distance, abs_yaw_error)) return;
 
   const double controlled_yaw_error =
       rotate_only && rotate_direction != 0
           ? static_cast<double>(rotate_direction) * abs_yaw_error
           : yaw_err;
   const double vyaw_cmd = clamp(
-      kp_yaw * controlled_yaw_error * terminal_yaw_scale, -max_vyaw, max_vyaw);
+      kp_yaw * controlled_yaw_error, -max_vyaw, max_vyaw);
 
   // Separate enter/exit thresholds prevent the controller from alternating
   // between rotate-in-place and translation at the same angular boundary.
@@ -741,26 +1054,18 @@ void cmdCallback(const legbot::TimerEvent &)
     vel_world *= scale;
   }
 
-  // A path can remain valid while terminal slowdown drives the command below
-  // the locomotion policy's useful range.  After measured progress stops,
-  // follow the current spline toward the goal at a small minimum speed.  Do
-  // not replace a zero trajectory with an unchecked straight-line goal.
-  if (terminal_approach && goal_xy_distance > finish_dist &&
-      terminal_idle_seconds >= terminal_stall_seconds &&
-      abs_yaw_error <= 0.50 && terminal_stall_speed > 0.0)
+  // Keep tracking the spline. Floor only a forward command on a live
+  // segment while still outside the goal's horizontal arrival tolerance.
+  const double walk_floor = std::min(min_walk_speed, max_vx);
+  const double walk_speed = vel_world.norm();
+  if (have_goal_position && goal_xy_distance > finish_dist &&
+      abs_yaw_error <= turn_slowdown_angle && walk_speed > 1e-6 && walk_speed < walk_floor)
   {
-    Eigen::Vector2d direction = pos_look.head<2>() - odom_pos.head<2>();
-    if (direction.norm() <= 0.01)
-      direction = end_pt.head<2>() - odom_pos.head<2>();
-    const Eigen::Vector2d to_goal = latest_goal_pos.head<2>() - odom_pos.head<2>();
-    if (direction.norm() > 0.01 && direction.dot(to_goal) > 0.0 &&
-        vel_world.norm() < std::min(max_vx, terminal_stall_speed))
-    {
-      vel_world = direction.normalized() * std::min(max_vx, terminal_stall_speed);
-      ROS_WARN_THROTTLE(1.0,
-          "[scan_go2_cmd_adapter] Terminal progress stalled at %.3f m; following spline at %.2f m/s.",
-          goal_xy_distance, vel_world.norm());
-    }
+    Eigen::Vector2d forward = (pos_look - pos_near).head<2>();
+    if (forward.squaredNorm() < 1e-8)
+      forward = (pos_near - traj[0].evaluateDeBoorT(std::max(0.0, t_near - time_forward))).head<2>();
+    if (forward.squaredNorm() >= 1e-8 && vel_world.dot(forward) > 0.0)
+      vel_world *= walk_floor / walk_speed;
   }
 
   const double c = std::cos(odom_yaw);
@@ -785,8 +1090,16 @@ int main(int argc, char **argv)
                                legbot::TransportHints().tcpNoDelay());
   goal_sub = node.subscribe("/scan/goal", 10, goalCallback,
                             legbot::TransportHints().tcpNoDelay());
-  bootstrap_turn_sub = node.subscribe("/exploration/bootstrap_turn_cmd", 10,
-                                      bootstrapTurnCallback,
+  goal_request_sub = node.subscribe("/scan/goal_request",10,goalRequestCallback,
+                                     legbot::TransportHints().tcpNoDelay());
+  turn_request_sub = node.subscribe("/scan/recovery_turn_request", 10,
+                                    turnRequestCallback,
+                                    legbot::TransportHints().tcpNoDelay());
+  action_cancel_sub = node.subscribe("/scan/recovery_action_cancel", 10,
+                                     actionCancelCallback,
+                                     legbot::TransportHints().tcpNoDelay());
+  action_enabled_sub = node.subscribe("/scan/recovery_action_enabled", 10,
+                                      actionEnabledCallback,
                                       legbot::TransportHints().tcpNoDelay());
   reverse_request_sub = node.subscribe("/scan/recovery_reverse_request", 10,
                                        reverseRequestCallback,
@@ -795,10 +1108,16 @@ int main(int argc, char **argv)
                             legbot::TransportHints().tcpNoDelay());
   cmd_vel_pub = node.advertise<geometry_msgs::msg::Twist>("/cmd_vel", 20);
   execution_frozen_pub = node.advertise<std_msgs::msg::Bool>("/scan/planning/execution_frozen", 10);
+  stop_status_pub=node.advertise<std_msgs::msg::String>("/scan/execution_stop_status",10);
   goal_stop_ack_pub = node.advertise<geometry_msgs::msg::PoseStamped>("/scan/goal_stop_ack", 10);
   goal_failure_pub = node.advertise<std_msgs::msg::String>("/scan/goal_plan_failed", 10);
+  tolerance_status_pub = node.advertise<std_msgs::msg::String>("/scan/goal_tolerance_status",10);
   reverse_result_pub = node.advertise<std_msgs::msg::String>(
       "/scan/recovery_reverse_result", 10);
+  turn_result_pub = node.advertise<std_msgs::msg::String>(
+      "/scan/recovery_turn_result", 10);
+  recovery_state_pub = node.advertise<std_msgs::msg::String>(
+      "/scan/recovery_action_state", 10);
   cmd_timer = node.createTimer(legbot::Duration(0.01), cmdCallback);
 
   ROS_INFO("[scan_go2_cmd_adapter] ready. bspline=/scan/planning/bspline odom=%s",
@@ -809,13 +1128,20 @@ int main(int argc, char **argv)
   cmd_timer.stop();
   bspline_sub.shutdown();
   goal_sub.shutdown();
-  bootstrap_turn_sub.shutdown();
+  goal_request_sub.shutdown();
+  turn_request_sub.shutdown();
+  action_cancel_sub.shutdown();
+  action_enabled_sub.shutdown();
   reverse_request_sub.shutdown();
   odom_sub.shutdown();
   cmd_vel_pub.shutdown();
   execution_frozen_pub.shutdown();
+  stop_status_pub.shutdown();
   goal_stop_ack_pub.shutdown();
   goal_failure_pub.shutdown();
+  tolerance_status_pub.shutdown();
   reverse_result_pub.shutdown();
+  turn_result_pub.shutdown();
+  recovery_state_pub.shutdown();
   return 0;
 }

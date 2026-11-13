@@ -1,4 +1,6 @@
 """Standalone GO2 stand/SCAN-plan/RL transition coordinator."""
+import os
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -18,7 +20,8 @@ def generate_launch_description():
         Node(
             package='legbot_bringup', executable='go2_demo_sequencer',
             name='go2_demo_sequencer', output='screen',
-            parameters=[{
+            parameters=[os.path.join(get_package_share_directory('legbot_bringup'),
+                                     'config', 'go2_execution.yaml'), {
                 'use_sim_time': ParameterValue(LaunchConfiguration('use_sim_time'), value_type=bool),
                 'crouch_wait_seconds': ParameterValue(
                     LaunchConfiguration('crouch_wait_seconds'), value_type=float),

@@ -1,0 +1,24 @@
+/**:
+  ros__parameters:
+    # Ground -> navigation base origin. Not minimum clearance or slice spacing.
+    robot_reference_height: 0.32
+    # Shared by explorer and map; no launch override.
+    robot_radius: 0.35
+    waypoint_safety_margin: 0.05
+    # Sensor-origin XYZ clipping for both LiDARs; independent of planning radius.
+    # Trial cutoff for remaining leg returns beyond 0.50 m during exploration.
+    lidar_min_range: 0.70
+    # One source for simulation mounting/FOV and exploration view prediction.
+    ground_lidar_x: 0.35
+    ground_lidar_z: 0.20
+    ground_lidar_pitch: 0.6108652381980153
+    ground_lidar_horizontal_half_angle: 0.7853981633974483
+    ground_lidar_elevation_min: -0.0872664625997165
+    ground_lidar_elevation_max: 0.3490658503988659
+    ground_lidar_max_range: 12.0
+
+/ground_lidar_transform:
+  ros__parameters:
+    # Gazebo edge-ray outliers polluted mature G/C during body motion.
+    # Drop one column at each edge of this organized auxiliary scan only.
+    lidar_edge_columns: 1

@@ -30,6 +30,10 @@ def generate_launch_description():
                               choices=['true', 'false']),
         DeclareLaunchArgument('gazebo_gui', default_value='true',
                               choices=['true', 'false']),
+        DeclareLaunchArgument('enable_ground_lidar', default_value='true', choices=['true', 'false'],
+                              description='Start the downward LiDAR and fuse its registered cloud into the online PCT map.'),
+        DeclareLaunchArgument('skip_start_floor_exploration', default_value='', choices=['', 'true', 'false'],
+                              description='Use shared exploration to recognize stairs, then leave the initial floor early. Empty uses exploration.yaml.'),
         # The exploration entry owns Gazebo, localization, GO2 control and SCAN.
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(exploration_demo),
@@ -39,6 +43,8 @@ def generate_launch_description():
                 'control_start_delay': LaunchConfiguration('control_start_delay'),
                 'start_rviz': 'false',
                 'gazebo_gui': LaunchConfiguration('gazebo_gui'),
+                'enable_ground_lidar': LaunchConfiguration('enable_ground_lidar'),
+                'skip_start_floor_exploration': LaunchConfiguration('skip_start_floor_exploration'),
                 'planner_safety': 'true',
                 'scan_robot_radius': LaunchConfiguration('scan_robot_radius'),
                 'layer_map_in_process': 'true',

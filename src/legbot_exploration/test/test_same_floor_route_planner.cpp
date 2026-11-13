@@ -1,5 +1,6 @@
 #include "legbot_exploration/same_floor_route_planner.hpp"
 #include "legbot_exploration/recovery_planner.hpp"
+#include "legbot_exploration/exploration_candidate.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -20,6 +21,10 @@ int main() {
   assert(stages.size() >= 2 && stages.back() == XY({6.5, 2.5}));
   for (const auto &point : stages)
     assert(waypoint_footprint_safety(point, grid, cfg, {}) == WaypointSafety::safe);
+
+  const std::vector<XY> no_scan_points;
+  const OccupancyMapView corridor_view{grid,cfg,no_scan_points};
+  assert(!segment_safe_check({0.5,2.5},{6.5,2.5},corridor_view).safe);
 
   // Missing observations and blocked starts never create a direct unverified route.
   grid.erase({0, 2});
@@ -82,65 +87,31 @@ int main() {
   for (const auto &point : viewpoints)
     assert(waypoint_footprint_safety(point, grid, cfg, {}) == WaypointSafety::safe);
 
-  RecoveryState recovery(3, 2.0);
-  recovery.record_failure({0.0, 0.0}, "planning_failed");
-  recovery.record_failure({1.0, 0.0}, "planning_failed");
-  assert(!recovery.limit_reached());
-  recovery.record_failure({1.5, 0.0}, "planning_failed");
-  assert(recovery.limit_reached());
-  recovery.start({1.5, 0.0});
-  assert(recovery.phase() == RecoveryPhase::nearby);
-  recovery.mark_attempted({2.5, 0.0});
-  recovery.finish();
-  assert(!recovery.active() && recovery.failures() == 0);
-
-  // Reverse may leave the current foot blind spot. A partial step can remain
-  // inside the starting inflated zone if it increases clearance throughout.
-  Settings reverse_cfg;
-  reverse_cfg.resolution = 0.1;
-  reverse_cfg.robot_radius = 0.2;
-  reverse_cfg.waypoint_safety_margin = 0.05;
-  std::unordered_map<Cell, int, CellHash> rear_grid;
-  for (int x = -12; x <= 8; ++x)
-    for (int y = -8; y <= 8; ++y) rear_grid[{x, y}] = 0;
-  rear_grid.erase({0, 0});
-  rear_grid[{2, 0}] = 1;  // Existing front-side overlap may be left behind.
-  auto reverse = plan_recovery_reverse_route(
-      rear_grid, {0.05, 0.05}, 0.0, reverse_cfg, {}, 0.35);
-  assert(reverse.reason == "ok" && reverse.points.size() == 2);
-  auto direct = plan_recovery_direct_route(
-      rear_grid, {0.05, 0.05}, {-0.55, 0.05}, reverse_cfg, {}, 3.0);
-  assert(direct.reason == "unverified_recovery_connection");
-  rear_grid[{-1, 0}] = 1; // movement toward an existing rear obstacle is unsafe
-  reverse = plan_recovery_reverse_route(
-      rear_grid, {0.05, 0.05}, 0.0, reverse_cfg, {}, 0.35);
-  assert(reverse.points.empty() && reverse.reason == "reverse_known_obstacle");
-  direct = plan_recovery_direct_route(
-      rear_grid, {0.05, 0.05}, {-0.55, 0.05}, reverse_cfg, {}, 3.0);
-  assert(direct.points.empty() &&
-         direct.reason == "known_obstacle_in_recovery_corridor");
-  rear_grid[{-1, 0}] = 0;
-  Settings partial_cfg = reverse_cfg;
-  partial_cfg.robot_radius = 0.35;
-  rear_grid[{0, 3}] = 1; // side obstacle still touches the endpoint footprint
-  reverse = plan_recovery_reverse_route(
-      rear_grid, {0.05, 0.05}, 0.0, partial_cfg, {}, 0.35);
-  assert(reverse.reason == "ok" && reverse.points.size() == 2);
-  rear_grid[{0, 3}] = 0;
-  rear_grid.erase({-4, 0});
-  reverse = plan_recovery_reverse_route(
-      rear_grid, {0.05, 0.05}, 0.0, reverse_cfg, {}, 0.35);
-  assert(reverse.points.empty() &&
-         reverse.reason == "reverse_unknown_rear_corridor");
-  rear_grid[{-4, 0}] = 1;
-  reverse = plan_recovery_reverse_route(
-      rear_grid, {0.05, 0.05}, 0.0, reverse_cfg, {}, 0.35);
-  assert(reverse.points.empty() &&
-         reverse.reason == "reverse_known_obstacle");
-  rear_grid[{-4, 0}] = 0;
-  reverse = plan_recovery_reverse_route(
-      rear_grid, {0.05, 0.05}, 0.0, reverse_cfg, {{-0.30, 0.05}}, 0.35);
-  assert(reverse.points.empty() &&
-         reverse.reason == "reverse_scan_obstacle");
+  // Ordinary admission checks the actual footprint AND its grid connection.
+  Settings admission_cfg;
+  admission_cfg.resolution=.1;admission_cfg.robot_radius=.01;admission_cfg.waypoint_safety_margin=0;
+  std::unordered_map<Cell,int,CellHash> admission_grid;
+  for(int x=-12;x<=8;++x) for(int y=-8;y<=8;++y) admission_grid[{x,y}]=0;
+  FreeObservationCounts frames;
+  for (const auto &[cell,state]:admission_grid) if(state==0) frames[cell]=3;
+  frames.erase({0,0});
+  const std::vector<XY> empty_obstacles;
+  const OccupancyMapView evidence_view{admission_grid,admission_cfg,empty_obstacles,&frames,71};
+  const auto evidence_check=point_safe_check({0.05,0.05},evidence_view);
+  assert(!evidence_check.safe && evidence_check.map_version==71);
+  assert(evidence_check.rejected[static_cast<std::size_t>(SafetyIssue::zero_free_evidence)]>0);
+  frames[{0,0}]=3;
+  assert(check_start({0.05,0.05},evidence_view).ready);
+  // The physical pose can pass while its grid-centre anchor fails. Recovery
+  // completion must use admission, not just the physical pose's disk result.
+  Settings anchor_cfg;anchor_cfg.resolution=1.0;anchor_cfg.robot_radius=0.55;
+  anchor_cfg.waypoint_safety_margin=0;
+  std::unordered_map<Cell,int,CellHash> anchor_grid;
+  for(int x=0;x<=3;++x) for(int y=-2;y<=2;++y) anchor_grid[{x,y}]=0;
+  const OccupancyMapView anchor_view{anchor_grid,anchor_cfg,no_scan_points};
+  assert(point_safe_check({0.8,0.5},anchor_view).safe);
+  const auto incomplete_admission=check_start({0.8,0.5},anchor_view);
+  assert(!incomplete_admission.ready && incomplete_admission.stage=="start_node");
+  assert(check_start({1.5,0.5},anchor_view).ready);
   return 0;
 }

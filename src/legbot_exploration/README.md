@@ -1,5 +1,8 @@
 # legbot_exploration
 
+当前 PCT 选点使用[三维局部窗口优先、全局后备](docs/pct_local_window.md)，
+窗口只限制目标选择，原生 PCT 仍在完整累计图上规划。
+
 第一次阅读源码可先看 [代码阅读指南](代码阅读指南.md)：它解释 ROS 话题、体素地图、前沿选点和状态机；关键语句与参数旁也已补上中文注释。
 
 独立 ROS 2 Jazzy 功能包：`combined_exploration_cpp` 是唯一编译的生产可执行文件，
@@ -10,21 +13,22 @@ Gazebo 真值覆盖率验收工具，通过 `ament_cmake_python` 安装。
 旧 Python 探索器已移至项目根目录 `tmp/legacy_python_explorer_2026-10-29/`，
 不参与当前构建或运行。
 
+PCT 定向补扫、短距离换位及 SCAN 委托共用下文的执行接口。
+
 ## 探索控制与路径规划的第一步拆分
 
-探索节点是唯一向 `/scan/waypoint_input` 发送探索路点的节点。
+探索节点是唯一向 `/scan/waypoint_request` 发送探索路点的节点。
 选定前沿目标后，它给本次请求分配 `goal_id`、`attempt_id`、二维累计地图版本和
 层析图版本。`route_orchestrator.cpp` 对同一次目标请求分别计算二维与层析候选；
 组合入口的层析规划在读锁内直接使用在线地图，路径选择只接受编号和版本均匹配的结果。
-普通平层目标优先采用合格的层析图路线，失败时采用二维路线；回退目标只使用
-回退规划。跨层状态已预留，但此入口不会据此向 SCAN 下发跨层路点。
-地图产生新版本不会取消已下发目标；后续路点按本次规划结果依次下发，
-只有 SCAN 完成当前路点后才推进。普通二维 A* 断连时返回失败；只有脱困规划可提出
-“起始连通性未验证”的短距离安全终点，由 SCAN 判断能否执行。
+普通目标按规划器配置选择路线。PCT 平层探索按楼层记录已确认的楼梯入口坐标和上行方向，
+可在 `/exploration/status` 的 `pct_floor.saved_stair_entrances` 查询。
+本层首次与复查队列处理完成后开始查找上行路线。已有踏面线索时，可先从同层安全站位定向补扫。
+地图产生新版本后，已下发的路点继续等待 SCAN 回执，再依次推进。
 
 `/exploration/planning_goal` 和 `/exploration/planning_results` 发布带编号、
 版本及规划原因的 JSON 诊断；`/exploration/plans/occupancy`、
-`/exploration/plans/layer`、`/exploration/plans/recovery` 发布各候选路径，
+`/exploration/plans/layer`、`/exploration/plans/recovery_layer` 发布各候选路径，
 `/exploration/planned_path` 是最终选中、将分段交给 SCAN 的路点。
 当前规划模块通过包内 C++ 接口交互，这些话题用于观察和核对，
 尚未作为独立进程之间的请求与结果传输接口。
@@ -45,45 +49,73 @@ SCAN 在直达目标的全局参考路径生成失败，或当前目标的局部
 成功仍需匹配的停车应答和任务完成信号。它把成功或失败统一发布到
 `/exploration/execution_feedback`，附带 `goal_id`、`attempt_id`、
 `stage_index`、`scan_goal_stamp`、规划来源及原因。收到终态失败后，探索控制
-才结束当前路线，并按同一区域失败次数选择新目标或进入脱困。
+才结束当前路线，并按当前前沿簇或跨层任务处理失败。
 `/exploration/status` 同时记录 `scan_failure_count` 和最近一次失败原因。
 航点协调器保持原样。
 
-## 在线多层地形图
+## 执行职责与脱困动作
 
-仅建图模式可独立运行；多层组合入口则将地图节点和探索节点放在同一
-进程的两个执行线程。地图节点读取同一套适配器话题：
-`/slam/global_cloud_registered`、`/slam/odometry_lidar` 和
-`/slam/global_odometry_base`，在 `map` 坐标系中按时间匹配点云与雷达位姿，
-沿射线累计三维占据证据。地图会随新点云更新；旧障碍被反复射线穿过后，
-其证据可下降并从障碍转为空闲。
+exploration 不发布 `/go2/control_mode` 或 `/cmd_vel`，也不再发布旧
+`/exploration/bootstrap_turn_cmd`。探索控制只决定目标与脱困动作；路径处理器按当前
+时间戳接收结果，并发布统一的 `/exploration/execution_feedback`。
 
-每个水平网格可以保存多个不同高度的候选表面。高度切片 `slice_height` 仅用来标记
-候选所在的高度带，不会把它们合并成一层，也不把候选高度强制取整；同一水平位置的
-上下两层可以同时存在。表面候选需要从上方观测到点云，避免将从下方看到的天花板
-误当作可站立地面。候选再按邻近支撑点数、相邻高度差和上方占据证据分类。
-`step_candidate` 仅表示有待后续验证的高度变化，不等于已经能够跨越。
-未观测到顶面的露天位置归为 `unobserved`，不会仅因上方没有回波就判为有障碍；
-它也没有被标记为“已验证净空”。完全没有点云证据的水平格不会凭空生成表面。
-每帧保留至多 `max_points_per_cloud` 个点作为表面命中证据，同时只对其中至多
-`max_rays_per_cloud` 个点执行射线追踪。这样既保留较密的地面观测，又限制每轮计算量；
-两项默认分别为 12000 和 1200。表面颜色表示地形分类，不表示相机拍摄的真实颜色。
+- 原地转向：`/scan/recovery_turn_request`，String 内容 `时间戳纳秒|相对角度弧度`。
+  SCAN 执行适配器累计实测转角、限制位置漂移并判定超时；成功发布
+  `/scan/recovery_turn_result` 的 `时间戳|succeeded`。
+- 保持朝向直退沿用 `/scan/recovery_reverse_request` 与 `/scan/recovery_reverse_result`。
+- 两类动作失败均通过 `/scan/goal_plan_failed` 返回匹配时间戳的原因。
+  暂停探索或手动接管时可发送 `/scan/recovery_action_cancel`（String，当前时间戳）；
+  地图更新不会触发动作撤销，exploration 不自行监测执行无进展。
+
+执行侧闭环：适配器发布 `/scan/recovery_action_state` 的 `时间戳|accepted`，
+`go2_demo_sequencer` 完成原有模式 3 激活脉冲后，发布同时间戳的
+`/scan/recovery_action_enabled` 心跳。适配器收到后才运动；未获许可 4 秒、许可
+中断超过 0.5 秒均停车并返回失败。动作结束发布 `时间戳|finished`，协调器结算当前执行。
+探索通过可靠、保留最新值的 `/exploration/task_active`（Bool）发布任务生命周期：
+建图、规划、脱困与路点间等待均为 true，确认完成、暂停或仅观测模式为 false。
+探索持续时，执行侧保持已激活的 RL，不在每个路点后回固定站立。
+任务允许结束且当前执行结算后，协调器至少等待 `goal_settle_seconds`（默认 1.5 秒），
+再依据新鲜的零速度指令和连续机体位姿确认停稳，才请求模式 2；活动信号本身不激活步态。
+暂停不伪造当前目标已结束的回执，仍须等待 SCAN 结算。
+阈值见 `legbot_bringup/config/go2_execution.yaml`，执行侧检查结果见 `/go2/execution_state`。
+旧动作、旧取消和旧结果不能替代当前动作的身份。
+
+执行适配器参数 `recovery_turn_speed` 默认
+0.35 rad/s、`recovery_turn_timeout` 默认 8 s；直退速度仍由
+`recovery_reverse_speed` 控制。这些是 SCAN 适配器参数，不属于探索选点配置。
+
+隔离执行测试：`test/test_execution_actions_ros.py` 运行真实适配器和协调器，模拟里程计，
+验证行走激活门槛、转向跨越 ±π、直退、过期回执、取消、超时和许可中断；不会连接真机。
+
+## 在线 PCT 层析图
+
+组合入口与仅建图模式均使用唯一的在线 PCT 图。节点直接累计
+`/slam/global_cloud_registered` 的全部有限 XYZ（必须为 map 坐标系），
+仅用真实命中点更新 G/C；可选下视雷达的注册点云也融合到同一张图。
+不补面、不拟合或外推未知地面，不读取二维占据图。
+机体里程计仅用于选点、规划和上升预览。固定世界原点、0.10米水平格、G/C、
+净空、梯度和机体/未知膨胀均见 [在线PCT说明](docs/online_pct.md)。
+在线 PCT 使用固定大小分块、同列共享的有序表面记录和依赖驱动的局部代价更新。
+本轮仅支持静态模式：未成熟表面按点数加权更新平均高度，默认3个真实点即成熟。
+成熟后忽略容差内重复点；容差外的新高度仍接受为新证据，不会被旧格的冻结逻辑丢掉。
+`pct_surface_noise_tolerance` 当前 YAML 试验值为0.05米，`pct_maturity_min_points` 默认3；
+同一物理表面的多个切片共享 G/C 来源，不会因地面跨切片波动生成极小净空。
+不再维护三维均值、散布矩阵、协方差或动态时间窗口。详见[在线 PCT](docs/online_pct.md)。
+
+组合节点在仿真开始时即启动，控制与 SCAN 按原顺序延时启动，探索等执行就绪才发运动目标。
+缺测区域保持未知，不补面；下视雷达在多层 demo 默认开启，见[下视雷达测试](docs/ground_lidar_test.md)。
 
 节点输出：
 
-- `/exploration/layers/surfaces`：可在 RViz 用 PointCloud2 显示。绿色为有观测净空的平坦表面，蓝色为上方尚未充分观测的平坦表面，橙色为台阶候选，紫色为坡度或连接条件不合格，灰色为支撑不足，红色为净空被障碍占用。点云还包含 `slice_index`、`surface_kind`、`clearance_kind`、`support_columns`、`ceiling_z`、`hit_observations` 和 `last_observed` 字段，供后续跨层模块读取。
-- `/exploration/layers/planning_surfaces`：未为 RViz 抽稀的完整表面图，继续全量发布供外部检查。组合入口中的层析规划直接读内部地图。
-- `/exploration/layers/planning_occupied`：同一版本的完整三维占据体素中心，包含不形成支撑表面的立柱侧面等命中；组合入口不通过这两条话题重建地图。
-- `/exploration/layers/ceilings`：已观测到的上方障碍点，RViz 中可用 PointCloud2 显示。
-- `/exploration/layers/status`：JSON 统计，包括体素、水平格、候选表面数量、点云同步丢弃数、地图容量状态和每轮更新耗时。
-  `last_raw_cloud_points`、`last_sampled_points`、`last_rays_requested` 和
-  `integration_ms` 可用于检查点云抽样与射线追踪是否正常。组合入口另有
-  `dropped_planning` 与 `last_layer_planning_ms`：层析 A* 持读锁期间新点云直接丢弃，
-  规划结束后建图恢复；默认规划上限为 2000 毫秒，超时回退二维规划。SCAN 的实时
-  感知和避障不受这把地图锁影响。`publish_map_topics` 默认开启；关闭后仍更新
-  内部地图和状态，但不发送 RViz 与外部规划用的全量地图话题。
-  在线地图体素上限为 800 万；`map_full=true` 表示上限已满，后续新区域无法继续入图。
-  修改此上限后需重启地图节点，已运行节点不会自动读取新值。
+- `/exploration/layers/surfaces`：新PCT表面的抽稀显示，绿色安全实测、灰色规划受限、蓝色证据不足、红色实体/陡坡。
+- `/exploration/layers/planning_surfaces`：新PCT全部有限G表面，含cost、source、flags、ceiling_z、clearance、slice_index字段。均为发布输出，内部规划仍直接读共享图。
+- `/exploration/layers/measured_returns`：累计表面记录的真实命中高度上界，不表示经过射线清除的占据概率；旧planning_occupied话题已删除。
+- `/exploration/layers/ceilings`：新PCT中有实际上方命中的C。
+- `/exploration/layers/status`：后端、版本、接受/规划丢帧、容量、PCT统计、预览状态、构图耗时；另含每路点云的接收和融合计数。
+
+`publish_map_topics` 默认开启，关闭后仍更新PCT与状态，不产生地图显示输出。
+显示抽稀仅影响surfaces话题；完整表面导出不抽稀，不改变内部规划。
+规划持共享图读锁，写线程在规划期间丢弃帧，不复制规划全图。
 
 仅测试在线地图时，先关闭已单独运行的 Gazebo、定位适配器和旧地图节点，
 然后用一条命令启动 Gazebo、GUI、Gazebo 真值适配器、在线多层地图和 RViz：
@@ -123,13 +155,15 @@ Building 场景的二维覆盖栅格显示范围为 `x∈[-31.5,31.5]`、
 `control_start_delay:=12.0` 控制 GO2 高层控制的启动延时，
 `show_layer_rviz:=false` 可关闭默认打开的地图 RViz。此入口会自动发送探索目标，
 与上面的纯地图观察命令不同。启动前先关闭之前的仿真与探索进程，避免话题重复发布。
-组合入口在 Building 场景为探索选点额外启用 SCAN 障碍图就绪检查、0.50 m
-目标避障半径和 4 m 单次目标距离；同时将 SCAN 局部障碍膨胀半径设为
-0.35 m，减少贴着圆柱规划轨迹的情况；可用 `scan_robot_radius:=数值` 调整。
-探索节点读取的是 SCAN 已膨胀的障碍图，只再补足到自身 0.50 m 安全半径的差额，
-避免把同一障碍重复膨胀；调整 `scan_robot_radius` 时会同步更新这一差额。
-修改只影响新组合入口，
-`exploration_demo.launch.py` 的单独启动参数保持原有默认值。组合入口的
+探索、在线层析图及两路雷达近距过滤统一读取 `legbot_bringup/config/robot_geometry.yaml`。
+规划机体半径 `robot_radius` 为 0.35 m，安全余量另为 0.05 m；
+两路雷达各自原点的三维近距过滤由独立参数 `lidar_min_range: 0.70` 控制。
+省略它时回退使用机体半径；启动安全开关不会覆盖机体半径。
+两个探索 demo 入口的 SCAN 局部障碍膨胀半径默认也为 0.35 m，
+可用 `scan_robot_radius:=数值` 单独调整这一执行侧参数。
+二维分支读取 SCAN 已膨胀障碍图时，只补足与自身机体半径的差额；
+纯 PCT 分支独立检查层析图，不依赖 SCAN 二维障碍图，也不限制目标距离。
+组合入口的
 `show_layer_rviz` 控制唯一的 RViz 窗口，`start_rviz` 不用于控制这个窗口。
 启动后可用 `ros2 topic info /exploration/status -v` 确认探索状态发布者存在，
 再用 `ros2 topic echo /exploration/status std_msgs/msg/String --once --qos-durability transient_local --full-length` 读取完整状态。
@@ -152,28 +186,18 @@ Building 场景的二维覆盖栅格显示范围为 `x∈[-31.5,31.5]`、
 导航目标仍由原有单层探索节点产生，SCAN 负责执行。原有单层探索入口不启动此地图节点，
 保持原来的行走策略。
 
-## 第二阶段预览：表面图与跨层候选 A*
+## 上升预览：直接使用新 PCT 与原生 A*
 
-在线多层地图节点现在还会根据已观测表面建立一张只读的局部表面图。图的每个节点是
-一个具体 `(x, y, 实测高度)` 表面；同一水平格的上下表面保持为不同节点。只有相邻
-水平格均有足够支撑、没有已知净空障碍，且高度差不超过坡度或单级台阶阈值时才连边。
-搜索以机体当前位置附近、与 `机体 z - graph_nominal_body_height` 相符的表面为起点，
-用 A* 寻找图上可达且高于起点的橙色台阶候选。搜索半径、节点数和高度阈值在
-`config/multi_layer_map.yaml` 中配置；地图每轮更新后都会重建预览，旧路径会被清除。
+不再维护额外的旧表面图或兼容A*。节点在新PCT安全表面中按实际高度寻找
+上升候选，调用与正常规划相同的原生PCT A*和路段检查，输出地面参考高度路径。
+当前位置不满足普通PCT准入时明确报unsafe_start，不移到附近节点伪造起点。
+候选搜索半径默认7米，仅约束预览候选采样，不是正常规划范围限制。
+`graph_max_preview_candidates` 默认8，限定每轮最多尝试的目标数；预览是可选计算。
 
-RViz 中浅灰点是抽样显示的图节点，浅绿细线是抽样显示的相邻连接，黄色球是上升台阶
-候选，紫红粗线是 A* 找到的候选路线。路线的高度是地面表面高度，尚未换算成机体目标
-高度。`/exploration/layers/graph_preview` 发布这些 Marker；
-`/exploration/layers/candidate_path` 发布同一路径的 `nav_msgs/Path`，仅供检查，
-不会进入 `/scan/goal` 或 `/scan/waypoint_input`。
-
-`/exploration/layers/status` 新增 `graph_state`、`graph_nodes`、`graph_edges`、
-`graph_rising_candidates`、`graph_path_points` 等字段。`graph_nodes_truncated=true`
-表示局部候选表面超出本轮搜索节点上限，搜索结果只覆盖保留的节点。`preview_path_observed` 表示
-路径上表面的净空已有观测证据；`preview_path_clearance_unobserved` 表示路径上还有
-未确认净空。`rising_candidates_unreachable_in_window` 只表示当前局部搜索窗口内
-候选不可达，不能据此判定整张地图没有楼梯。表面图只检查局部高度、支撑和净空，
-尚未完成机体扫掠体积、足端落点及动态执行验证，因此路径不能直接用于跨层控制。
+`/exploration/layers/graph_preview`显示安全节点、橙色上升目标和紫红色路线，
+`/exploration/layers/candidate_path`输出同一路径，二者从不发送运动命令。
+状态包含graph_state和graph_path_points。找不到路线只表示本轮预览没有结果，
+不能证明全图没有楼梯，也不能替代后续跨层任务控制和运动能力验证。
 
 ## 输入和输出
 
@@ -186,9 +210,10 @@ RViz 中浅灰点是抽样显示的图节点，浅绿细线是抽样显示的相
   `/exploration/trajectory` (Path)。轨迹从探索节点启动时
   开始记录，每移动约 0.1 m 增加一点，RViz 中显示为绿色线。平层 RViz 固定
   `map` 视角概览整块场地，三种定位来源使用同一个视图。
-- 自动导航时，目标发到 `/scan/waypoint_input`，由既有
+- 自动导航时，目标发到 `/scan/waypoint_request`，由既有
   `scan_waypoint_mission` 以 `direct` 模式转发到 `/scan/goal`。节点根据转发目标的
-  时间戳、`/scan/goal_stop_ack` 和 `/scan/mission_complete` 判断本次路点完成；
+  目标标识、时间戳及执行器 `/scan/goal_stop_ack` 判断本次扩展路点完成；
+  旧 PoseStamped 输入保留 `/scan/mission_complete` 兼容流程，近路点回执先到时会暂存核对；
   完成后发送所选路径的下一路点。目标发出后，exploration 不按地图变化、
   距离或计时器撤销 SCAN 目标；未收到完成回执时保持等待。
 - `/exploration/set_paused` 是 `std_srvs/SetBool`：`true` 暂停后续自动选点，
@@ -281,14 +306,13 @@ $$
 各簇比较 $J$，选择得分最高的真实前沿目标，不按目标距离替换成中途格。
 探索控制先在前沿附近
 选出同一个已观测、膨胀安全的观察位置。二维占据 A* 和
-同层表面 A* 分别在各自地图快照上规划到它；层析路线合格时优先选择，失败时
+层析PCT A* 分别在各自地图上规划到它；层析路线合格时优先选择，失败时
 使用二维路线。二维 A* 的节点和边检查完整机体圆盘及 SCAN 膨胀障碍，未知格不能
-作为普通路径的中间格。层析 A* 使用全量表面和三维占据证据，要求机体圆盘覆盖的
-各格都有同层支撑及已观测净空，并检查相邻节点和路段的扫掠空间；完全缺失
-同层表面的格按障碍膨胀处理。层析规划器自行将密集 A* 路径生成执行路点；
+作为普通路径的中间格。层析正常与脱困规划均使用唯一在线PCT，保留净空、梯度和机体/未知膨胀检查，
+层析规划器自行输出执行路点；
 路径处理模块只简化二维路线，且直线替代仍需满足走廊安全与观测代价约束。
 最终路点显示在
-`/exploration/planned_path`，按次序通过 `/scan/waypoint_input` 交给 SCAN。
+`/exploration/planned_path`，按次序通过 `/scan/waypoint_request` 交给 SCAN。
 正常规划不会生成未验证的直达线。执行期间的地图或机体位置变化不会使探索器
 清除已选路线；所有规划出的目标点须在已观察空闲区，
 机体圆盘覆盖的未知格或障碍使其不合格。
@@ -523,21 +547,16 @@ PYTHONPATH=python python3 -m unittest discover -s test -p test_truth_coverage.py
 ```
 
 ## rviz路径颜色显示
-[exploration 路径发布](/home/likai/legbot_3D_Nav/src/legbot_exploration/cpp/src/single_floor_explorer_node.cpp:912)现在按**实际选中的规划来源**分别发布路线；[RViz 配置](/home/likai/legbot_3D_Nav/src/legbot_exploration/rviz/multi_layer_map.rviz:267)显示二维 A* 为蓝色、层析图为橙色、脱困为黄色。切换或清除路线时，旧颜色的路径也会清空。原有候选路径话题仍可用于诊断。
+[exploration 路径发布](/home/likai/legbot_3D_Nav/src/legbot_exploration/cpp/src/exploration_route_dispatch.cpp:80)现在按**实际选中的规划来源**分别发布路线；[RViz 配置](/home/likai/legbot_3D_Nav/src/legbot_exploration/rviz/multi_layer_map.rviz:267)显示二维 A* 为蓝色、层析图为橙色、脱困为黄色。切换或清除路线时，旧颜色的路径也会清空。原有候选路径话题仍可用于诊断。
 
 
 ## 清除残留进程
 ```
-# 查找残留进程
-legbot_3D_Nav$ pgrep -af 'gz sim|controller_manager|multi_layer_exploration_demo'
+# 在新终端执行：
+pkill -INT -f '^/usr/bin/python3 /opt/ros/jazzy/bin/ros2 launch legbot_exploration cross_layer_test\.launch\.py([[:space:]]|$)'
 
-125314 gz sim server
-161365 gz sim -r -v 3 /home/likai/legbot_3D_Nav/install/legbot_bringup/share/legbot_bringup/worlds/Building.sdf
-161501 gz sim server
-161503 gz sim gui
-
-#删除查找到的进程
-kill -TERM 125314 161365 161501 161503
+# 等几秒，让 ROS 2 launch 关闭子进程。然后检查是否还有残留：
+pgrep -af 'cross_layer_test\.launch\.py|gz sim|rviz2|combined_exploration_cpp|scan_planner_node|scan_go2_cmd_adapter|scan_waypoint_mission'
 ```
 
 ## 查看单层探索结果
@@ -550,3 +569,24 @@ Subscription count: 0
 #查看单层探索结果
 ros2 topic echo /exploration/status
 ```
+## 在线 PCT 接入
+
+组合启动默认使用项目 PCT 作为普通层析规划后端，统一参考高度见
+`legbot_bringup/config/robot_geometry.yaml`。固定世界格按共享表面记录增量融合 G/C，未知和机体空间独立处理；构图不依赖 GPU。依赖、
+资源上限、XYZ 执行及验证方法见 [在线 PCT 说明](docs/online_pct.md)。
+
+### PCT 前沿选点
+
+`config/exploration.yaml` 新增 `frontier_source`，可选 `pct` 或 `occupancy`。当前组合启动配置使用
+`pct` 配合已有的 `planner_mode: layer`；前沿提取、表面聚簇、XYZ 观察点和完成判断均取自 PCT。
+详细语义、诊断话题及测试范围见 [PCT 前沿选点](docs/pct_frontiers.md)。
+
+### 脱困请求与委托
+
+控制模块统一选目标与动作；脱困规划验证路径/动作或返回明确的 SCAN 委托结果，路径处理模块统一下发和关联回执。详见 [执行职责与脱困动作](#执行职责与脱困动作)。恢复目标使用普通安全点，`recovery_goal_xy_tolerance` 默认0.15米，仅传给最终位置路点；普通观察目标最终路点采用 `observation_goal_xy_tolerance: 0.15`，中间路点沿用SCAN默认0.40米；同层最终观察位置距机体至少 `observation_min_distance: 0.50` 米。旧停车圆和恢复目标距离上下限已移除。详见[按路点容差](docs/goal_tolerance.md)。
+
+旧 `/scan/waypoint_input` 的 PoseStamped 手动输入接口仍保留；探索输出使用带目标身份和可选容差的 GoalRequest。
+
+公共楼梯识别、逐级安全站位和两种启动模式见 [公共楼梯识别与逐级观测](docs/stair_recognition.md)。
+普通楼层探索只保存上升候选，不执行楼梯确认、换位或补扫；本层首次与复查队列收尾后再确认上楼。
+跳过起始层仍可提前使用同一识别流程。按楼层选点的续算间隔默认 0.10 秒，累计预算继续为 2 秒／4 秒。

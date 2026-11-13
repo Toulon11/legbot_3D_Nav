@@ -2,6 +2,7 @@
 """Queue RViz waypoints for SCAN and advance after each one is reached."""
 
 import argparse
+import copy
 from collections import deque
 import json
 import math
@@ -20,7 +21,7 @@ except ImportError:  # Jazzy exposes the underlying shutdown error as RuntimeErr
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.utilities import remove_ros_args
-from scan_planner.msg import Bspline
+from scan_planner.msg import Bspline, GoalRequest
 from std_msgs.msg import Bool, String
 from std_srvs.srv import SetBool, Trigger
 from visualization_msgs.msg import Marker, MarkerArray
@@ -48,6 +49,8 @@ class WaypointMission(Node):
         self.interactive = bool(args.input_topic)
         self.output = os.path.abspath(args.output)
         self.reach_xy = args.reach_xy
+        self.active_reach_xy = self.reach_xy
+        self.active_request = None
         self.reach_z = args.reach_z
         self.ack_timeout = args.ack_timeout
         self.max_attempts = args.max_attempts
@@ -84,6 +87,9 @@ class WaypointMission(Node):
         marker_qos.reliability = ReliabilityPolicy.RELIABLE
         marker_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.goal_pub = self.create_publisher(PoseStamped, args.goal_topic, goal_qos)
+        self.request_goal_pub = self.create_publisher(GoalRequest, '/scan/goal_request', goal_qos)
+        self.request_status_pub = self.create_publisher(String, '/scan/goal_tolerance_status', 10)
+        self.create_subscription(GoalRequest, '/scan/waypoint_request', self.on_goal_request, goal_qos)
         self.marker_pub = self.create_publisher(MarkerArray, '/scan/mission_waypoints', marker_qos)
         self.complete_pub = self.create_publisher(Bool, '/scan/mission_complete', marker_qos)
         self.plan_ready_pub = self.create_publisher(Bool, '/scan/plan_ready', marker_qos)
@@ -131,7 +137,19 @@ class WaypointMission(Node):
         stamp.sec, stamp.nanosec = divmod(stamp_ns, 1_000_000_000)
         return stamp
 
-    def on_waypoint(self, msg):
+    def on_goal_request(self, request):
+        if self.mode != 'direct':
+            # This atomic interface represents one dispatched route stage.
+            stamp = request.target.header.stamp
+            self.request_status_pub.publish(String(data=json.dumps(dict(
+                source='coordinator', event='rejected', reason='request_requires_direct_mode',
+                stamp_ns=stamp.sec*1_000_000_000+stamp.nanosec,
+                goal_id=request.goal_id, attempt_id=request.attempt_id,
+                waypoint_index=request.waypoint_index))))
+            return
+        self.on_waypoint(request.target, request)
+
+    def on_waypoint(self, msg, request=None):
         if msg.header.frame_id and msg.header.frame_id != self.frame_id:
             self.get_logger().error(
                 'Rejected waypoint in frame %s; RViz Fixed Frame must be %s' %
@@ -157,7 +175,18 @@ class WaypointMission(Node):
             # previous direct mission complete.
             self.complete_pub.publish(Bool(data=False))
             self.plan_ready_pub.publish(Bool(data=False))
-            self.goal_pub.publish(direct)
+            self.active_request = copy.deepcopy(request)
+            self.active_reach_xy = self.reach_xy
+            if request is None:
+                self.goal_pub.publish(direct)
+            else:
+                # Only one command topic is published. A PoseStamped shadow
+                # could reach SCAN first and cause an early default-tolerance stop.
+                self.active_request.target = direct
+                if (request.has_xy_tolerance and math.isfinite(request.xy_tolerance)
+                        and GoalRequest.MIN_XY_TOLERANCE <= request.xy_tolerance <= GoalRequest.MAX_XY_TOLERANCE):
+                    self.active_reach_xy = request.xy_tolerance
+                self.request_goal_pub.publish(self.active_request)
             self.direct_goal = values
             self.goal_stamp = (direct.header.stamp.sec, direct.header.stamp.nanosec)
             self.stop_ack_received = False
@@ -393,7 +422,7 @@ class WaypointMission(Node):
             target = self.waypoints[self.index] if self.index < len(self.waypoints) else None
         if (target is None or msg.header.frame_id != self.frame_id or
                 math.hypot(msg.pose.position.x - target[0],
-                           msg.pose.position.y - target[1]) > self.reach_xy or
+                           msg.pose.position.y - target[1]) > self.active_reach_xy or
                 (self.reach_z > 0.0 and
                  abs(msg.pose.position.z - target[2]) > self.reach_z)):
             return
@@ -624,6 +653,8 @@ class WaypointMission(Node):
             'coordinator_ready': self.ready,
             'mode': self.mode,
             'direct_goal': self.direct_goal,
+            'effective_reach_xy': self.active_reach_xy,
+            'has_xy_tolerance': bool(self.active_request and self.active_request.has_xy_tolerance),
         }
         os.makedirs(os.path.dirname(self.output), exist_ok=True)
         temporary = self.output + '.tmp'

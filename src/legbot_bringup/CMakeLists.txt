@@ -34,4 +34,16 @@ install(PROGRAMS
 install(DIRECTORY launch config models worlds rviz DESTINATION share/${PROJECT_NAME}
   PATTERN "__pycache__" EXCLUDE
   PATTERN "*.pyc" EXCLUDE)
+install(DIRECTORY docs DESTINATION share/${PROJECT_NAME})
+if(BUILD_TESTING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME go2_execution_idle COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_execution_idle_ros.py)
+  set_tests_properties(go2_execution_idle PROPERTIES TIMEOUT 60)
+  add_test(NAME lidar_near_filter COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_lidar_near_filter_ros.py
+    $<TARGET_FILE:cloud_transform> $<TARGET_FILE:global_navigation_adapter>)
+  set_tests_properties(lidar_near_filter PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE)
+
+endif()
 ament_package()

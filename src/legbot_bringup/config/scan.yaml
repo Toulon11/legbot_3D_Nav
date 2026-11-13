@@ -106,10 +106,10 @@ scan_go2_cmd_adapter:
     slope_down_threshold: -0.3
     stair_speed_scale: 1.0
     min_stair_speed: 0.0
-    # Disabled by default.  A non-zero floor makes short replanned splines
-    # overshoot corners and the final goal.
+    # Enable per gait. This floor applies only to valid forward tracking outside goal tolerance.
     min_walk_speed: 0.0
-    goal_slowdown_distance: 0.80
+    recovery_shift_speed: 0.22  # Verified fixed-heading shift speed in m/s.
+    goal_slowdown_distance: 0.80  # Near-goal heading and progress checks, in metres.
     turn_slowdown_angle: 0.30
     min_turn_speed_scale: 0.30
     cmd_accel_limit: 0.75

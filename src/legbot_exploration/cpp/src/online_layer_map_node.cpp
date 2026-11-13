@@ -1,513 +1,324 @@
-#include "legbot_exploration/multi_layer_map.hpp"
-#include "legbot_exploration/surface_graph.hpp"
 #include "legbot_exploration/exploration_node_factories.hpp"
-
+#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
-#include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstdint>
-#include <cstring>
+#include <iomanip>
 #include <deque>
-#include <limits>
-#include <memory>
+#include <optional>
 #include <mutex>
 #include <shared_mutex>
 #include <sstream>
-#include <stdexcept>
-#include <string>
-#include <vector>
 
-namespace le = legbot_exploration;
-using namespace std::chrono_literals;
-
+namespace le=legbot_exploration;
 namespace {
-double seconds_apart(const builtin_interfaces::msg::Time &a,
-                     const builtin_interfaces::msg::Time &b) {
-  return std::abs(static_cast<double>(a.sec - b.sec) +
-                  1e-9 * static_cast<double>(static_cast<int64_t>(a.nanosec) - b.nanosec));
-}
-
-uint32_t color(const le::LayerSurface &surface) {
-  if (surface.clearance == le::ClearanceKind::blocked) return 0xff3030u;
-  switch (surface.kind) {
-    case le::SurfaceKind::flat:
-      return surface.clearance == le::ClearanceKind::observed_clear ? 0x20c860u : 0x3080f0u;
-    case le::SurfaceKind::step_candidate: return 0xffbb30u;
-    case le::SurfaceKind::steep_or_disconnected: return 0xd040d0u;
-    case le::SurfaceKind::insufficient_support: return 0x909090u;
-  }
-  return 0x909090u;
-}
-
-sensor_msgs::msg::PointCloud2 make_cloud(
-    const std::vector<le::LayerPoint> &points, const std::vector<uint32_t> &colors,
-    const std_msgs::msg::Header &header) {
-  sensor_msgs::msg::PointCloud2 msg;
-  msg.header = header;
-  sensor_msgs::PointCloud2Modifier modifier(msg);
-  modifier.setPointCloud2FieldsByString(2, "xyz", "rgb");
-  modifier.resize(points.size());
-  sensor_msgs::PointCloud2Iterator<float> x(msg, "x"), y(msg, "y"), z(msg, "z"), rgb(msg, "rgb");
-  for (std::size_t i = 0; i < points.size(); ++i, ++x, ++y, ++z, ++rgb) {
-    *x = static_cast<float>(points[i].x);
-    *y = static_cast<float>(points[i].y);
-    *z = static_cast<float>(points[i].z);
-    float packed;
-    std::memcpy(&packed, &colors[i], sizeof(packed));
-    *rgb = packed;
-  }
-  msg.is_dense = true;
-  return msg;
-}
-
-sensor_msgs::msg::PointCloud2 make_surface_cloud(
-    const std::vector<le::LayerSurface> &surfaces, std::size_t stride,
-    double xy_resolution, const std_msgs::msg::Header &header) {
-  using sensor_msgs::msg::PointField;
-  sensor_msgs::msg::PointCloud2 msg;
-  msg.header = header;
-  msg.height = 1;
-  msg.width = static_cast<uint32_t>((surfaces.size() + stride - 1) / stride);
-  msg.is_dense = true;
-  msg.is_bigendian = false;
-  msg.point_step = 40;
-  msg.row_step = msg.width * msg.point_step;
-  auto field = [&](const char *name, uint32_t offset, uint8_t datatype) {
-    PointField item;
-    item.name = name;
-    item.offset = offset;
-    item.datatype = datatype;
-    item.count = 1;
-    msg.fields.push_back(item);
+sensor_msgs::msg::PointCloud2 cloud_message(std::vector<std::uint8_t> data,
+    const std_msgs::msg::Header &header,bool surfaces) {
+  using Field=sensor_msgs::msg::PointField;
+  sensor_msgs::msg::PointCloud2 out;out.header=header;out.height=1;
+  out.is_bigendian=false;out.is_dense=false;out.point_step=surfaces?56:16;
+  out.width=data.size()/out.point_step;out.row_step=out.width*out.point_step;out.data=std::move(data);
+  const auto field=[&](const char *name,int offset,int type) {
+    Field f;f.name=name;f.offset=offset;f.datatype=type;f.count=1;out.fields.push_back(f);
   };
-  field("x", 0, PointField::FLOAT32);
-  field("y", 4, PointField::FLOAT32);
-  field("z", 8, PointField::FLOAT32);
-  field("rgb", 12, PointField::FLOAT32);
-  field("slice_index", 16, PointField::INT32);
-  field("surface_kind", 20, PointField::UINT8);
-  field("clearance_kind", 21, PointField::UINT8);
-  field("support_columns", 22, PointField::UINT16);
-  field("ceiling_z", 24, PointField::FLOAT32);
-  field("hit_observations", 28, PointField::UINT32);
-  field("last_observed", 32, PointField::FLOAT64);
-  msg.data.resize(msg.row_step);
-  std::size_t out = 0;
-  for (std::size_t i = 0; i < surfaces.size(); i += stride, ++out) {
-    const auto &s = surfaces[i];
-    uint8_t *p = msg.data.data() + out * msg.point_step;
-    const auto write = [p](uint32_t offset, const auto &value) {
-      std::memcpy(p + offset, &value, sizeof(value));
-    };
-    const float x = static_cast<float>((s.x_cell + 0.5) * xy_resolution);
-    const float y = static_cast<float>((s.y_cell + 0.5) * xy_resolution);
-    const float z = static_cast<float>(s.height);
-    const uint32_t rgb = color(s);
-    const int32_t slice = s.slice_index;
-    const uint8_t kind = static_cast<uint8_t>(s.kind);
-    const uint8_t clearance = static_cast<uint8_t>(s.clearance);
-    const uint16_t support = static_cast<uint16_t>(std::min(s.support_columns, 65535));
-    const float ceiling = static_cast<float>(s.ceiling);
-    const uint32_t hits = static_cast<uint32_t>(std::max(0, s.hit_observations));
-    const double last_observed = s.last_observed;
-    write(0, x); write(4, y); write(8, z); write(12, rgb);
-    write(16, slice); write(20, kind); write(21, clearance); write(22, support);
-    write(24, ceiling); write(28, hits); write(32, last_observed);
+  field("x",0,Field::FLOAT32);field("y",4,Field::FLOAT32);field("z",8,Field::FLOAT32);field("rgb",12,Field::FLOAT32);
+  if(surfaces) {
+    field("cost",16,Field::FLOAT32);field("ceiling_z",20,Field::FLOAT32);field("clearance",24,Field::FLOAT32);
+    field("source",28,Field::UINT32);field("flags",32,Field::UINT32);field("slice_index",36,Field::UINT32);
+    field("passage_cost",40,Field::FLOAT32);field("relief_cost",44,Field::FLOAT32);
+    field("terrain_cost",48,Field::FLOAT32);field("inflated_terrain_cost",52,Field::FLOAT32);
   }
-  return msg;
+  return out;
 }
-
-geometry_msgs::msg::Point marker_point(const le::LayerPoint &point, double lift = 0.0) {
-  geometry_msgs::msg::Point result;
-  result.x = point.x;
-  result.y = point.y;
-  result.z = point.z + lift;
-  return result;
+double wall_now() {return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();}
 }
-
-visualization_msgs::msg::Marker make_marker(
-    const std_msgs::msg::Header &header, int id, int type,
-    float red, float green, float blue, float alpha, double scale) {
-  visualization_msgs::msg::Marker marker;
-  marker.header = header;
-  marker.ns = "surface_graph_preview";
-  marker.id = id;
-  marker.type = type;
-  marker.action = visualization_msgs::msg::Marker::ADD;
-  marker.pose.orientation.w = 1.0;
-  marker.color.r = red;
-  marker.color.g = green;
-  marker.color.b = blue;
-  marker.color.a = alpha;
-  marker.scale.x = scale;
-  marker.scale.y = scale;
-  marker.scale.z = scale;
-  return marker;
-}
-}  // namespace
 
 class OnlineLayerMapNode : public rclcpp::Node {
+  struct CloudInput {
+    std::string topic,pose_topic;
+    std::deque<nav_msgs::msg::Odometry::ConstSharedPtr> poses;
+    std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> pending;
+    std::atomic<std::uint64_t> filtered_far{0},dropped_pose{0},matched{0};
+    std::atomic<std::size_t> waiting_pose{0};
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr pose_sub;
+    std::atomic<std::uint64_t> seen{0},integrated{0};
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub;
+  };
  public:
-  explicit OnlineLayerMapNode(std::shared_ptr<le::SharedLayerMap> shared = {})
-      : Node("online_layer_map"), map_(read_config()), shared_(std::move(shared)) {
-    if (shared_) shared_->map = &map_;
-    xy_resolution_ = get_parameter("xy_resolution").as_double();
-    frame_id_ = declare_parameter<std::string>("frame_id", "map");
-    const auto cloud_topic = declare_parameter<std::string>(
-        "cloud_topic", "/slam/global_cloud_registered");
-    const auto sensor_topic = declare_parameter<std::string>(
-        "sensor_odom_topic", "/slam/odometry_lidar");
-    const auto base_topic = declare_parameter<std::string>(
-        "base_odom_topic", "/slam/global_odometry_base");
-    point_stride_ = declare_parameter<int>("point_stride", 1);
-    max_points_ = declare_parameter<int>("max_points_per_cloud", 12000);
-    max_rays_ = declare_parameter<int>("max_rays_per_cloud", 1200);
-    sync_tolerance_ = declare_parameter<double>("sensor_sync_tolerance", 0.05);
-    publish_period_ = declare_parameter<double>("publish_period", 1.0);
-    publish_map_topics_ = declare_parameter<bool>("publish_map_topics", true);
-    max_display_surfaces_ = declare_parameter<int>("max_display_surfaces", 120000);
-    graph_config_.xy_resolution = xy_resolution_;
-    graph_config_.max_step_height = get_parameter("max_step_height").as_double();
-    graph_config_.max_slope_radians = get_parameter("max_slope_radians").as_double();
-    graph_config_.min_support_columns = get_parameter("min_support_columns").as_int();
-    graph_config_.search_radius = declare_parameter<double>("graph_search_radius", 7.0);
-    graph_config_.min_height_gain = declare_parameter<double>("graph_min_height_gain", 0.07);
-    graph_config_.nominal_body_height = declare_parameter<double>("graph_nominal_body_height", 0.32);
-    graph_config_.start_xy_tolerance = declare_parameter<double>("graph_start_xy_tolerance", 0.45);
-    graph_config_.start_z_tolerance = declare_parameter<double>("graph_start_z_tolerance", 0.30);
-    graph_config_.max_nodes = declare_parameter<int>("graph_max_nodes", 25000);
-    graph_config_.max_preview_candidates = declare_parameter<int>("graph_max_preview_candidates", 128);
-    graph_config_.max_preview_nodes = declare_parameter<int>("graph_max_preview_nodes", 4000);
-    graph_config_.max_preview_edges = declare_parameter<int>("graph_max_preview_edges", 6000);
-    if (point_stride_ < 1 || max_points_ < 1 || max_rays_ < 1 || sync_tolerance_ <= 0 ||
-        publish_period_ <= 0 || max_display_surfaces_ < 1)
-      throw std::invalid_argument("invalid layer map node configuration");
-
-    auto map_qos = rclcpp::QoS(1).transient_local().reliable();
-    surface_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-        "/exploration/layers/surfaces", map_qos);
-    planning_surface_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-        "/exploration/layers/planning_surfaces", map_qos);
-    planning_occupied_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-        "/exploration/layers/planning_occupied", map_qos);
-    ceiling_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-        "/exploration/layers/ceilings", map_qos);
-    status_pub_ = create_publisher<std_msgs::msg::String>(
-        "/exploration/layers/status", map_qos);
-    graph_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
-        "/exploration/layers/graph_preview", map_qos);
-    graph_path_pub_ = create_publisher<nav_msgs::msg::Path>(
-        "/exploration/layers/candidate_path", map_qos);
-    cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
-        cloud_topic, rclcpp::SensorDataQoS(),
-        [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { on_cloud(*msg); });
-    sensor_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-        sensor_topic, rclcpp::SensorDataQoS(),
-        [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
-          push_odom(sensor_history_, *msg);
-        });
-    base_sub_ = create_subscription<nav_msgs::msg::Odometry>(
-        base_topic, rclcpp::SensorDataQoS(),
-        [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
-          push_odom(base_history_, *msg);
-        });
-    timer_ = create_wall_timer(std::chrono::duration<double>(publish_period_),
-                               [this]() { publish_map(); });
-    RCLCPP_INFO(get_logger(), "Online layer map observes %s in %s; no navigation goals are published",
-                cloud_topic.c_str(), frame_id_.c_str());
+  explicit OnlineLayerMapNode(std::shared_ptr<le::SharedLayerMap> shared)
+      :Node("online_layer_map"),shared_(shared?std::move(shared):std::make_shared<le::SharedLayerMap>()) {
+    const auto root=declare_parameter<std::string>("pct_root",ament_index_cpp::get_package_share_directory("pct_planner"));
+    const auto records=declare_parameter<int>("pct_max_surface_records",2000000);
+    const auto cells=declare_parameter<int>("pct_max_map_cells",20000000);
+    const double height=declare_parameter<double>("robot_reference_height",.32);
+    std::ostringstream settings;
+    settings<<'{';bool first=true;
+    const auto number=[&](const char *key,const char *parameter,double value) {
+      if(!first)settings<<',';first=false;
+      const auto configured=declare_parameter<double>(parameter,value);
+      settings<<'"'<<key<<"\":"<<configured;
+      return configured;
+    };
+    const auto integer=[&](const char *key,const char *parameter,int value) {
+      if(!first)settings<<',';first=false;
+      settings<<'"'<<key<<"\":"<<declare_parameter<int>(parameter,value);
+    };
+    const auto text=[&](const char *key,const char *parameter,const char *value) {
+      if(!first)settings<<',';first=false;
+      settings<<'"'<<key<<"\":"<<std::quoted(declare_parameter<std::string>(parameter,value));
+    };
+    text("mapping_mode","pct_mapping_mode","static");
+    integer("block_size","pct_block_size",32);
+    integer("slice_update_workers","pct_slice_update_workers",0);
+    integer("maturity_min_points","pct_maturity_min_points",3);
+    shared_->surface_noise_tolerance=number("surface_noise_tolerance","pct_surface_noise_tolerance",.05);
+    number("surface_normal_radius","pct_surface_normal_radius",.25);
+    integer("surface_normal_min_points","pct_surface_normal_min_points",6);
+    number("surface_normal_vertical","pct_surface_normal_vertical",.5);
+    number("surface_normal_thickness","pct_surface_normal_thickness",.03);
+    number("planning_budget_seconds","pct_planning_budget_seconds",1.5);
+    number("observation_revisit_radius","pct_observation_revisit_radius",1.0);
+    integer("floor_min_resolved_frontier_cells","pct_floor_min_resolved_frontier_cells",5);
+    settings<<",\"fast_exploration\":"<<(declare_parameter<bool>("pct_fast_exploration",false)?"true":"false");
+    integer("fast_min_visible_cells","pct_fast_min_visible_cells",3);
+    number("landing_support_radius","pct_landing_support_radius",.60);
+    number("landing_min_area","pct_landing_min_area",1.50);
+    number("landing_min_width","pct_landing_min_width",.80);
+    number("landing_min_depth","pct_landing_min_depth",1.00);
+    number("ground_lidar_x","ground_lidar_x",.35);
+    number("ground_lidar_z","ground_lidar_z",.20);
+    number("ground_lidar_pitch","ground_lidar_pitch",.6108652381980153);
+    number("ground_lidar_horizontal_half_angle","ground_lidar_horizontal_half_angle",.7853981633974483);
+    number("ground_lidar_elevation_min","ground_lidar_elevation_min",-.0872664625997165);
+    number("ground_lidar_elevation_max","ground_lidar_elevation_max",.3490658503988659);
+    number("ground_lidar_max_range","ground_lidar_max_range",12.);
+    number("ground_lidar_min_range","lidar_min_range",.70);
+    settings<<",\"observer_reference_height\":"<<height;
+    number("relief_update_threshold","pct_relief_update_threshold",.25);
+    number("terrain_update_threshold","pct_terrain_update_threshold",.25);
+    number("inflation_update_threshold","pct_inflation_update_threshold",.25);
+    integer("traversability_kernel_size","pct_traversability_kernel_size",7);
+    integer("inflation_kernel_size","pct_inflation_kernel_size",13);
+    number("standable_ratio","pct_standable_ratio",.5);
+    shared_->xy_resolution=number("resolution","xy_resolution",.1);
+    number("slice_dh","slice_height",.5);
+    number("origin_x","pct_origin_x",0);number("origin_y","pct_origin_y",0);number("origin_z","pct_origin_z",0);
+    number("robot_radius","robot_radius",.35);number("safety_margin","waypoint_safety_margin",.05);
+    number("minimum_clearance","pct_min_clearance",.5);number("desired_clearance","pct_desired_clearance",.55);
+    shared_->max_step_height=number("step_max","max_step_height",.16);
+    settings<<",\"slope_max\":"<<std::tan(declare_parameter<double>("max_slope_radians",.4))<<'}';
+    if(records<1 || cells<1 || !std::isfinite(height) || height<=0)throw std::invalid_argument("invalid PCT capacity/reference height");
+    shared_->pct=std::make_shared<le::PctBackend>(root,height,records,cells,settings.str());
+    frame_=declare_parameter<std::string>("frame_id","map");
+    const auto cloud=declare_parameter<std::string>("cloud_topic","/slam/global_cloud_registered");
+    const auto base=declare_parameter<std::string>("base_odom_topic","/slam/global_odometry_base");
+    const auto period=declare_parameter<double>("publish_period",1.);
+    show_=declare_parameter<bool>("publish_map_topics",true);
+    max_display_=declare_parameter<int>("max_display_surfaces",120000);
+    preview_=declare_parameter<bool>("graph_preview_enabled",true);
+    graph_radius_=declare_parameter<double>("graph_search_radius",7.);
+    graph_gain_=declare_parameter<double>("graph_min_height_gain",.07);
+    graph_candidates_=declare_parameter<int>("graph_max_preview_candidates",8);
+    graph_nodes_=declare_parameter<int>("graph_max_preview_nodes",4000);
+    if(!std::isfinite(period)||period<=0||max_display_<1||!std::isfinite(graph_radius_)||graph_radius_<=0||
+       !std::isfinite(graph_gain_)||graph_gain_<=0||graph_candidates_<1||graph_nodes_<1)
+      throw std::invalid_argument("invalid PCT publication/preview settings");
+    auto qos=rclcpp::QoS(1).transient_local().reliable();
+    surface_pub_=create_publisher<sensor_msgs::msg::PointCloud2>("/exploration/layers/surfaces",qos);
+    planning_pub_=create_publisher<sensor_msgs::msg::PointCloud2>("/exploration/layers/planning_surfaces",qos);
+    returns_pub_=create_publisher<sensor_msgs::msg::PointCloud2>("/exploration/layers/measured_returns",qos);
+    ceilings_pub_=create_publisher<sensor_msgs::msg::PointCloud2>("/exploration/layers/ceilings",qos);
+    status_pub_=create_publisher<std_msgs::msg::String>("/exploration/layers/status",qos);
+    graph_pub_=create_publisher<visualization_msgs::msg::MarkerArray>("/exploration/layers/graph_preview",qos);
+    path_pub_=create_publisher<nav_msgs::msg::Path>("/exploration/layers/candidate_path",qos);
+    cloud_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    reliable_range_=declare_parameter<double>("pct_reliable_observation_range",5.0);
+    if(!std::isfinite(reliable_range_) || reliable_range_<0)throw std::invalid_argument("invalid PCT reliable observation range");
+    add_input(cloud,declare_parameter<std::string>("cloud_sensor_odom_topic","/slam/odometry_lidar"));
+    const auto auxiliary=declare_parameter<std::string>("auxiliary_cloud_topic","");
+    if(!auxiliary.empty()) {
+      if(auxiliary==cloud)throw std::invalid_argument("auxiliary LiDAR requires a distinct cloud topic");
+      add_input(auxiliary,declare_parameter<std::string>("auxiliary_sensor_odom_topic","/ground_lidar/odometry_lidar"));
+    }
+    base_sub_=create_subscription<nav_msgs::msg::Odometry>(base,rclcpp::SensorDataQoS(),[this](nav_msgs::msg::Odometry::ConstSharedPtr msg){
+      if(msg->header.frame_id!=frame_)return;
+      base_={msg->pose.pose.position.x,msg->pose.pose.position.y,msg->pose.pose.position.z};base_wall_=wall_now();
+    });
+    timer_=create_wall_timer(std::chrono::duration<double>(period),[this]{publish_map();});
+    RCLCPP_INFO(get_logger(),"Online PCT map: %zu LiDAR inputs, registered XYZ only",inputs_.size());
   }
-
  private:
-  le::LayerMapConfig read_config() {
-    le::LayerMapConfig cfg;
-    cfg.xy_resolution = declare_parameter<double>("xy_resolution", cfg.xy_resolution);
-    cfg.z_resolution = declare_parameter<double>("z_resolution", cfg.z_resolution);
-    cfg.slice_height = declare_parameter<double>("slice_height", cfg.slice_height);
-    cfg.max_ray_range = declare_parameter<double>("max_ray_range", cfg.max_ray_range);
-    cfg.surface_merge_gap = declare_parameter<double>("surface_merge_gap", cfg.surface_merge_gap);
-    cfg.support_height_tolerance = declare_parameter<double>(
-        "support_height_tolerance", cfg.support_height_tolerance);
-    cfg.min_clearance = declare_parameter<double>("min_clearance", cfg.min_clearance);
-    cfg.max_slope_radians = declare_parameter<double>("max_slope_radians", cfg.max_slope_radians);
-    cfg.max_step_height = declare_parameter<double>("max_step_height", cfg.max_step_height);
-    cfg.support_radius_cells = declare_parameter<int>(
-        "support_radius_cells", cfg.support_radius_cells);
-    cfg.min_support_columns = declare_parameter<int>(
-        "min_support_columns", cfg.min_support_columns);
-    cfg.min_hit_observations = declare_parameter<int>(
-        "min_hit_observations", cfg.min_hit_observations);
-    cfg.max_surfaces_per_column = declare_parameter<int>(
-        "max_surfaces_per_column", cfg.max_surfaces_per_column);
-    cfg.max_voxels = declare_parameter<int>("max_voxels", cfg.max_voxels);
-    return cfg;
+  static std::int64_t stamp(const builtin_interfaces::msg::Time &t) {
+    return static_cast<std::int64_t>(t.sec)*1000000000LL+t.nanosec;
   }
-
-  using Odom = nav_msgs::msg::Odometry;
-  void push_odom(std::deque<Odom> &history, const Odom &odom) {
-    if (odom.header.frame_id != frame_id_) return;
-    history.push_back(odom);
-    while (history.size() > 60) history.pop_front();
+  void drain_input(CloudInput &input) {
+    for(auto it=input.pending.begin();it!=input.pending.end();) {
+      const auto ns=stamp((*it)->header.stamp);
+      const auto found=std::find_if(input.poses.begin(),input.poses.end(),
+          [&](const auto &pose){return stamp(pose->header.stamp)==ns;});
+      if(found!=input.poses.end()) {
+        const auto cloud=*it;it=input.pending.erase(it);
+        const auto &p=(*found)->pose.pose.position;
+        ++input.matched;on_cloud(*cloud,input,le::Point{p.x,p.y,p.z});
+      } else if(!input.poses.empty() && ns<stamp(input.poses.back()->header.stamp)-2000000000LL) {
+        ++input.dropped_pose;it=input.pending.erase(it);
+      } else ++it;
+    }
+    input.waiting_pose.store(input.pending.size());
   }
-  const Odom *nearest(const std::deque<Odom> &history,
-                      const builtin_interfaces::msg::Time &stamp) const {
-    const Odom *best = nullptr;
-    double error = sync_tolerance_;
-    for (const Odom &odom : history) {
-      const double delta = seconds_apart(odom.header.stamp, stamp);
-      if (delta <= error) { error = delta; best = &odom; }
-    }
-    return best;
+  void add_input(const std::string &cloud,const std::string &pose_topic) {
+    auto owned=std::make_unique<CloudInput>();auto *input=owned.get();input->topic=cloud;input->pose_topic=pose_topic;
+    rclcpp::SubscriptionOptions options;options.callback_group=cloud_group_;
+    if(reliable_range_>0)input->pose_sub=create_subscription<nav_msgs::msg::Odometry>(pose_topic,rclcpp::SensorDataQoS(),
+      [this,input](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+        const auto &p=msg->pose.pose.position;
+        if(msg->header.frame_id!=frame_ || stamp(msg->header.stamp)<=0 ||
+           !std::isfinite(p.x)||!std::isfinite(p.y)||!std::isfinite(p.z))return;
+        input->poses.push_back(msg);if(input->poses.size()>128)input->poses.pop_front();
+        drain_input(*input);
+      },options);
+    input->cloud_sub=create_subscription<sensor_msgs::msg::PointCloud2>(cloud,rclcpp::SensorDataQoS(),
+      [this,input](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg){
+        ++seen_;++input->seen;
+        if(msg->header.frame_id!=frame_){++wrong_frame_;return;}
+        if(msg->width && msg->height)shared_->last_sensor_wall_seconds.store(wall_now());
+        if(shared_->planning_active.load()){++shared_->dropped_planning;return;}
+        if(reliable_range_<=0)on_cloud(*msg,*input,std::nullopt);
+        else {
+          if(stamp(msg->header.stamp)<=0){++input->dropped_pose;return;}
+          input->pending.push_back(msg);
+          if(input->pending.size()>5){input->pending.pop_front();++input->dropped_pose;}
+          drain_input(*input);
+        }
+      },options);
+    inputs_.push_back(std::move(owned));
   }
-
-  void on_cloud(const sensor_msgs::msg::PointCloud2 &cloud) {
-    ++cloud_messages_seen_;
-    if (shared_ && shared_->planning_active.load()) {
-      ++shared_->dropped_planning;
-      return;
-    }
-    if (cloud.header.frame_id != frame_id_) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                           "Cloud frame %s differs from layer map frame %s",
-                           cloud.header.frame_id.c_str(), frame_id_.c_str());
-      return;
-    }
-    const Odom *sensor = nearest(sensor_history_, cloud.header.stamp);
-    const Odom *base = nearest(base_history_, cloud.header.stamp);
-    if (!sensor || !base) { ++dropped_sync_; return; }
-    const auto &p = sensor->pose.pose.position;
-    const le::LayerPoint origin{p.x, p.y, p.z};
-    std::vector<le::LayerPoint> points;
-    points.reserve(max_points_);
+  void on_cloud(const sensor_msgs::msg::PointCloud2 &msg,CloudInput &input,const std::optional<le::Point> &origin) {
+    std::vector<le::LayerPoint> points;points.reserve(static_cast<std::size_t>(msg.width)*msg.height);
     try {
-      sensor_msgs::PointCloud2ConstIterator<float> x(cloud, "x"), y(cloud, "y"), z(cloud, "z");
-      // Sample across the entire registered cloud instead of truncating its
-      // first scan rings when the cloud has many points.
-      const std::size_t count = static_cast<std::size_t>(cloud.width) * cloud.height;
-      const std::size_t stride = std::max<std::size_t>(
-          point_stride_, (count + static_cast<std::size_t>(max_points_) - 1) /
-                             static_cast<std::size_t>(max_points_));
-      std::size_t index = 0;
-      for (; x != x.end() && points.size() < static_cast<std::size_t>(max_points_);
-           ++x, ++y, ++z, ++index) {
-        if (index % stride != 0) continue;
-        points.push_back({*x, *y, *z});
+      sensor_msgs::PointCloud2ConstIterator<float> x(msg,"x"),y(msg,"y"),z(msg,"z");
+      for(;x!=x.end();++x,++y,++z)if(std::isfinite(*x)&&std::isfinite(*y)&&std::isfinite(*z)) {
+        if(origin && std::pow(*x-(*origin)[0],2)+std::pow(*y-(*origin)[1],2)+std::pow(*z-(*origin)[2],2)>reliable_range_*reliable_range_) {++input.filtered_far;continue;}
+        points.push_back({*x,*y,*z});
       }
-    } catch (const std::runtime_error &error) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 5000,
-                           "Cannot read XYZ from cloud: %s", error.what());
-      return;
+    }catch(const std::runtime_error &e){++invalid_cloud_;RCLCPP_WARN(get_logger(),"Invalid registered XYZ: %s",e.what());return;}
+    if(points.empty())return;
+    shared_->last_sensor_wall_seconds.store(wall_now());
+    if(shared_->planning_active.load()){++shared_->dropped_planning;return;}
+    const auto start=wall_now();
+    std::unique_lock<std::shared_mutex> lock(shared_->mutex,std::try_to_lock);
+    if(!lock.owns_lock()||shared_->planning_active.load()){++shared_->dropped_planning;return;}
+    shared_->pct->append(points,origin);
+    if(!shared_->pct->last_error().empty()) {
+      ++rejected_;RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),5000,"PCT integration failed: %s",shared_->pct->last_error().c_str());return;
     }
-    if (points.empty()) return;
-    const double stamp_seconds = static_cast<double>(cloud.header.stamp.sec) +
-        static_cast<double>(cloud.header.stamp.nanosec) * 1e-9;
-    const std::size_t ray_stride = std::max<std::size_t>(
-        1, (points.size() + static_cast<std::size_t>(max_rays_) - 1) /
-               static_cast<std::size_t>(max_rays_));
-    const auto started = std::chrono::steady_clock::now();
-    std::unique_lock<std::shared_mutex> map_lock;
-    if (shared_) {
-      map_lock = std::unique_lock<std::shared_mutex>(shared_->mutex, std::try_to_lock);
-      if (!map_lock.owns_lock() || shared_->planning_active.load()) {
-        ++shared_->dropped_planning;
-        return;
-      }
-    }
-    integrated_points_ += map_.integrate(origin, points, stamp_seconds, ray_stride);
-    if (shared_) shared_->current_version.store(map_.version());
-    last_integration_ms_ = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - started).count();
-    last_raw_cloud_points_ = static_cast<std::size_t>(cloud.width) * cloud.height;
-    last_sampled_points_ = points.size();
-    last_rays_requested_ = (points.size() + ray_stride - 1) / ray_stride;
-    ++clouds_received_;
+    ++input.integrated;
+    ++received_;integrated_+=points.size();last_raw_=points.size();++shared_->current_version;
+    shared_->last_integration_wall_seconds.store(wall_now());
+    integration_ms_=1000*(wall_now()-start);
   }
-
   void publish_map() {
-    const auto started = std::chrono::steady_clock::now();
-    std::unique_lock<std::shared_mutex> map_lock;
-    if (shared_) {
-      if (shared_->planning_active.load()) return;
-      map_lock = std::unique_lock<std::shared_mutex>(shared_->mutex);
-      if (shared_->planning_active.load()) return;
-    }
-    const std::size_t rebuilt = map_.rebuild_dirty();
-    const auto all = publish_map_topics_ ? map_.surfaces() :
-        std::vector<le::LayerSurface>{};
-    const auto occupied = publish_map_topics_ ? map_.occupied_voxels() :
-        std::vector<le::LayerPoint>{};
-    const le::LayerMapStats stats = map_.stats();
-    if (map_lock.owns_lock()) map_lock.unlock();
-    if (shared_) {
-      shared_->published_surfaces.store(stats.surfaces);
-      shared_->published_wall_seconds.store(
-          std::chrono::duration<double>(std::chrono::steady_clock::now()
-              .time_since_epoch()).count());
-    }
-    const std::size_t stride = std::max<std::size_t>(
-        1, (all.size() + static_cast<std::size_t>(max_display_surfaces_) - 1) /
-               static_cast<std::size_t>(max_display_surfaces_));
-    std::vector<le::LayerPoint> ceilings;
-    std::vector<uint32_t> ceiling_colors;
-    for (std::size_t i = 0; i < all.size(); i += stride) {
-      const le::LayerSurface &surface = all[i];
-      const double x = (surface.x_cell + 0.5) * xy_resolution_;
-      const double y = (surface.y_cell + 0.5) * xy_resolution_;
-      if (std::isfinite(surface.ceiling)) {
-        ceilings.push_back({x, y, surface.ceiling});
-        ceiling_colors.push_back(0x40e0e0u);
+    const auto started=wall_now();
+    if(shared_->planning_active.load())return;
+    le::PctInspection inspection;std::string metadata;std::uint64_t version;bool ready=false;
+    double lock_wait_ms=0,commit_ms=0,inspection_ms=0,locked_ms=0;
+    std::size_t surface_records=0;
+    {
+      std::unique_lock<std::shared_mutex> lock(shared_->mutex);
+      const auto acquired=wall_now();lock_wait_ms=1000*(acquired-started);
+      if(shared_->planning_active.load())return;
+      version=shared_->current_version.load();
+      if(shared_->pct->point_count())ready=shared_->pct->refresh(version);
+      const auto committed=wall_now();commit_ms=1000*(committed-acquired);
+      if(ready) {
+        shared_->published_wall_seconds.store(wall_now());
+        shared_->committed_version.store(version);
+        inspection=shared_->pct->inspect(version,base_,show_,max_display_,
+            preview_&&base_wall_>0&&wall_now()-base_wall_<2.,graph_radius_,graph_gain_,graph_candidates_,graph_nodes_);
       }
+      metadata=shared_->pct->map_metadata();
+      surface_records=shared_->pct->point_count();
+      inspection_ms=1000*(wall_now()-committed);locked_ms=1000*(wall_now()-acquired);
     }
-    std_msgs::msg::Header header;
-    header.frame_id = frame_id_;
-    header.stamp = now();
-    if (publish_map_topics_) {
-      surface_pub_->publish(make_surface_cloud(all, stride, xy_resolution_, header));
-      // Display decimation never changes the full planning topics.
-      planning_surface_pub_->publish(make_surface_cloud(all, 1, xy_resolution_, header));
-      planning_occupied_pub_->publish(make_cloud(
-          occupied, std::vector<uint32_t>(occupied.size(), 0xff3030u), header));
-      ceiling_pub_->publish(make_cloud(ceilings, ceiling_colors, header));
+    std_msgs::msg::Header header;header.frame_id=frame_;header.stamp=now();
+    if(show_ && inspection.valid) {
+      surface_pub_->publish(cloud_message(std::move(inspection.display),header,true));
+      planning_pub_->publish(cloud_message(std::move(inspection.surfaces),header,true));
+      returns_pub_->publish(cloud_message(std::move(inspection.returns),header,false));
+      ceilings_pub_->publish(cloud_message(std::move(inspection.ceilings),header,false));
     }
-    le::SurfaceGraphPreview graph;
-    if (!publish_map_topics_) {
-      graph.state = "map_topics_disabled";
-    } else if (base_history_.empty()) {
-      graph.state = "waiting_for_base_odometry";
-    } else if (seconds_apart(base_history_.back().header.stamp, header.stamp) > 2.0) {
-      graph.state = "base_odometry_stale";
-    } else {
-      const auto &p = base_history_.back().pose.pose.position;
-      graph = le::search_rising_surface(all, {p.x, p.y, p.z}, graph_config_);
-    }
-    if (publish_map_topics_) publish_graph(graph, header);
-    ++publish_cycles_;
-    if (stats.version == 0 && (publish_cycles_ == 1 || publish_cycles_ % 10 == 0)) {
-      RCLCPP_WARN(get_logger(),
-                  "Waiting for synchronized map inputs: cloud messages=%llu, "
-                  "lidar odometry samples=%zu, base odometry samples=%zu, "
-                  "dropped synchronization=%llu. Start Gazebo and one localization adapter first.",
-                  static_cast<unsigned long long>(cloud_messages_seen_),
-                  sensor_history_.size(), base_history_.size(),
-                  static_cast<unsigned long long>(dropped_sync_));
-    }
-    const auto elapsed = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - started).count();
+    if(show_)publish_preview(inspection,header);
     std::ostringstream json;
-    json << "{\"version\":" << stats.version << ",\"voxels\":" << stats.voxels
-         << ",\"columns\":" << stats.columns << ",\"surfaces\":" << stats.surfaces
-         << ",\"flat\":" << stats.flat << ",\"step_candidates\":"
-         << stats.step_candidates << ",\"insufficient_support\":"
-         << stats.insufficient_support << ",\"blocked_clearance\":"
-         << stats.blocked_clearance << ",\"unobserved_clearance\":"
-         << stats.unobserved_clearance << ",\"map_full\":"
-         << (stats.map_full ? "true" : "false") << ",\"clouds_received\":"
-         << clouds_received_ << ",\"dropped_sync\":" << dropped_sync_
-         << ",\"integrated_points\":" << integrated_points_
-         << ",\"cloud_messages_seen\":" << cloud_messages_seen_
-         << ",\"dropped_planning\":"
-         << (shared_ ? shared_->dropped_planning.load() : 0)
-         << ",\"last_layer_planning_ms\":"
-         << (shared_ ? shared_->last_planning_ms.load() : 0.0)
-         << ",\"last_raw_cloud_points\":" << last_raw_cloud_points_
-         << ",\"last_sampled_points\":" << last_sampled_points_
-         << ",\"last_rays_requested\":" << last_rays_requested_
-         << ",\"integration_ms\":" << last_integration_ms_
-         << ",\"rebuilt_columns\":" << rebuilt << ",\"update_ms\":" << elapsed
-         << ",\"graph_state\":\"" << graph.state
-         << "\",\"graph_nodes\":" << graph.graph_nodes
-         << ",\"graph_edges\":" << graph.graph_edges
-         << ",\"graph_nodes_truncated\":"
-         << (graph.nodes_truncated ? "true" : "false")
-         << ",\"graph_rising_candidates\":" << graph.rising_candidates
-         << ",\"graph_expanded_nodes\":" << graph.expanded_nodes
-         << ",\"graph_path_points\":" << graph.path.size()
-         << ",\"graph_path_clearance_unobserved\":"
-         << (graph.contains_unobserved_clearance ? "true" : "false") << '}';
-    std_msgs::msg::String status;
-    status.data = json.str();
-    status_pub_->publish(status);
-  }
-
-  void publish_graph(const le::SurfaceGraphPreview &graph,
-                     const std_msgs::msg::Header &header) {
-    using Marker = visualization_msgs::msg::Marker;
-    visualization_msgs::msg::MarkerArray message;
-    // Replacing the complete preview also clears a stale path after a map edit.
-    Marker clear;
-    clear.header = header;
-    clear.action = Marker::DELETEALL;
-    message.markers.push_back(clear);
-    auto nodes = make_marker(header, 0, Marker::POINTS, 0.75f, 0.75f, 0.75f, 0.45f, 0.035);
-    for (const auto &point : graph.preview_nodes)
-      nodes.points.push_back(marker_point(point, 0.025));
-    message.markers.push_back(std::move(nodes));
-    auto edges = make_marker(header, 1, Marker::LINE_LIST, 0.15f, 0.8f, 0.35f, 0.45f, 0.015);
-    for (const auto &[from, to] : graph.preview_edges) {
-      edges.points.push_back(marker_point(from, 0.035));
-      edges.points.push_back(marker_point(to, 0.035));
+    json<<"{\"backend\":\"project_pct_fixed_online\",\"version\":"<<version
+      <<",\"reliable_observation_range\":"<<reliable_range_
+      <<",\"pct_version\":"<<version<<",\"pct_ready\":"<<(ready?"true":"false")
+      <<",\"pct_surface_records\":"<<surface_records
+      <<",\"cloud_messages_seen\":"<<seen_<<",\"clouds_received\":"<<received_
+      <<",\"integrated_points\":"<<integrated_<<",\"rejected_frames\":"<<rejected_
+      <<",\"wrong_frame\":"<<wrong_frame_<<",\"invalid_cloud\":"<<invalid_cloud_
+      <<",\"dropped_planning\":"<<shared_->dropped_planning.load()
+      <<",\"last_sensor_age\":"<<(shared_->last_sensor_wall_seconds.load()>0?wall_now()-shared_->last_sensor_wall_seconds.load():-1.)
+      <<",\"last_integration_age\":"<<(shared_->last_integration_wall_seconds.load()>0?wall_now()-shared_->last_integration_wall_seconds.load():-1.)
+      <<",\"committed_input_version\":"<<shared_->committed_version.load()
+      <<",\"last_raw_cloud_points\":"<<last_raw_<<",\"integration_ms\":"<<integration_ms_
+      <<",\"pct_map\":"<<metadata<<",\"graph_state\":\""<<inspection.preview_state
+      <<"\",\"graph_path_points\":"<<inspection.path.size()
+      <<",\"inspection_valid\":"<<(inspection.valid?"true":"false")
+      <<",\"lock_wait_ms\":"<<lock_wait_ms<<",\"commit_ms\":"<<commit_ms
+      <<",\"inspection_ms\":"<<inspection_ms<<",\"lock_held_ms\":"<<locked_ms
+      <<",\"read_wait_ms\":"<<shared_->last_read_wait_ms.load()
+      <<",\"read_commit_ms\":"<<shared_->last_read_commit_ms.load()
+      <<",\"read_phase_ms\":"<<shared_->last_read_phase_ms.load()
+      <<",\"planning_ms\":"<<shared_->last_planning_ms.load()
+      <<",\"update_ms\":"<<1000*(wall_now()-started)<<",\"cloud_sources\":[";
+    for(std::size_t i=0;i<inputs_.size();++i) {
+      if(i)json<<',';const auto &input=*inputs_[i];
+      json<<"{\"topic\":"<<std::quoted(input.topic)<<",\"seen\":"<<input.seen.load()
+          <<",\"integrated\":"<<input.integrated.load()
+          <<",\"sensor_pose_topic\":"<<std::quoted(input.pose_topic)
+          <<",\"matched_pose_frames\":"<<input.matched.load()<<",\"waiting_pose_frames\":"<<input.waiting_pose.load()
+          <<",\"dropped_pose_frames\":"<<input.dropped_pose.load()<<",\"filtered_far_points\":"<<input.filtered_far.load()<<'}';
     }
-    message.markers.push_back(std::move(edges));
-    auto candidates = make_marker(header, 2, Marker::SPHERE_LIST,
-                                  1.0f, 0.65f, 0.0f, 0.9f, 0.11);
-    for (const auto &point : graph.preview_candidates)
-      candidates.points.push_back(marker_point(point, 0.075));
-    message.markers.push_back(std::move(candidates));
-    auto route = make_marker(header, 3, Marker::LINE_STRIP,
-                             1.0f, 0.1f, 0.9f, 1.0f, 0.075);
-    for (const auto &point : graph.path)
-      route.points.push_back(marker_point(point, 0.10));
-    message.markers.push_back(std::move(route));
-    graph_pub_->publish(message);
-
-    nav_msgs::msg::Path path;
-    path.header = header;
-    for (const auto &point : graph.path) {
-      geometry_msgs::msg::PoseStamped pose;
-      pose.header = header;
-      pose.pose.position.x = point.x;
-      pose.pose.position.y = point.y;
-      pose.pose.position.z = point.z + 0.10;
-      pose.pose.orientation.w = 1.0;
-      path.poses.push_back(std::move(pose));
-    }
-    graph_path_pub_->publish(path);
+    json<<"]}";
+    status_pub_->publish(std_msgs::msg::String().set__data(json.str()));
   }
-
-  le::OnlineLayerMap map_;
+  void publish_preview(const le::PctInspection &data,const std_msgs::msg::Header &header) {
+    using Marker=visualization_msgs::msg::Marker;
+    visualization_msgs::msg::MarkerArray array;Marker clear;clear.header=header;clear.action=Marker::DELETEALL;array.markers.push_back(clear);
+    const auto marker=[&](int id,int type,double r,double g,double b,double size,const std::vector<le::Point> &points) {
+      Marker m;m.header=header;m.ns="pct_ascent_preview";m.id=id;m.type=type;m.action=Marker::ADD;
+      m.pose.orientation.w=1.;m.scale.x=m.scale.y=m.scale.z=size;m.color.r=r;m.color.g=g;m.color.b=b;m.color.a=.8;
+      for(const auto &p:points){geometry_msgs::msg::Point q;q.x=p[0];q.y=p[1];q.z=p[2]+.03;m.points.push_back(q);}array.markers.push_back(std::move(m));
+    };
+    marker(0,Marker::POINTS,.5,.7,.8,.035,data.preview_nodes);
+    marker(1,Marker::SPHERE_LIST,1.,.65,0.,.11,data.preview_candidates);
+    marker(2,Marker::LINE_STRIP,1.,.1,.9,.06,data.path);graph_pub_->publish(array);
+    nav_msgs::msg::Path path;path.header=header;
+    for(const auto &p:data.path){geometry_msgs::msg::PoseStamped pose;pose.header=header;pose.pose.orientation.w=1.;
+      pose.pose.position.x=p[0];pose.pose.position.y=p[1];pose.pose.position.z=p[2];path.poses.push_back(pose);}path_pub_->publish(path);
+  }
   std::shared_ptr<le::SharedLayerMap> shared_;
-  le::SurfaceGraphConfig graph_config_;
-  double xy_resolution_ = 0.10;
-  std::string frame_id_;
-  int point_stride_ = 1, max_points_ = 12000, max_rays_ = 1200;
-  int max_display_surfaces_ = 120000;
-  bool publish_map_topics_ = true;
-  double sync_tolerance_ = 0.05, publish_period_ = 1.0;
-  double last_integration_ms_ = 0.0;
-  uint64_t clouds_received_ = 0, dropped_sync_ = 0, integrated_points_ = 0;
-  uint64_t cloud_messages_seen_ = 0, publish_cycles_ = 0;
-  std::size_t last_raw_cloud_points_ = 0, last_sampled_points_ = 0;
-  std::size_t last_rays_requested_ = 0;
-  std::deque<Odom> sensor_history_, base_history_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
-  rclcpp::Subscription<Odom>::SharedPtr sensor_sub_, base_sub_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr surface_pub_, ceiling_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr planning_surface_pub_,
-      planning_occupied_pub_;
+  std::vector<std::unique_ptr<CloudInput>> inputs_;
+  le::Point base_{};double base_wall_=0,graph_radius_=7,graph_gain_=.07,reliable_range_=5.;
+  std::atomic<double> integration_ms_{0};
+  int max_display_=120000,graph_candidates_=8,graph_nodes_=4000;
+  bool show_=true,preview_=true;std::string frame_;
+  std::atomic<std::uint64_t> seen_{0},received_{0},rejected_{0},integrated_{0},wrong_frame_{0},invalid_cloud_{0};
+  std::atomic<std::size_t> last_raw_{0};
+  rclcpp::CallbackGroup::SharedPtr cloud_group_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr base_sub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr surface_pub_,planning_pub_,returns_pub_,ceilings_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr graph_pub_;
-  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr graph_path_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
-
-std::shared_ptr<rclcpp::Node> make_online_layer_map_node(
-    std::shared_ptr<le::SharedLayerMap> shared) {
+std::shared_ptr<rclcpp::Node> make_online_layer_map_node(std::shared_ptr<le::SharedLayerMap> shared) {
   return std::make_shared<OnlineLayerMapNode>(std::move(shared));
 }

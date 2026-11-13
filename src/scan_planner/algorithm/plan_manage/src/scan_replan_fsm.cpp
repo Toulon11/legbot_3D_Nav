@@ -1,9 +1,11 @@
 
 #include <plan_manage/scan_replan_fsm.h>
+#include <plan_manage/goal_tolerance.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstdint>
+#include <stdexcept>
 
 namespace scan_planner
 {
@@ -28,7 +30,8 @@ namespace scan_planner
     nh.param("fsm/navi_mode", navi_mode_, -1);
     nh.param("fsm/thresh_replan", replan_thresh_, -1.0);
     nh.param("fsm/thresh_no_replan", no_replan_thresh_, -1.0);
-    nh.param("fsm/finish_dist", finish_dist_, 0.35);
+    nh.param("fsm/finish_dist", default_finish_dist_, 0.35);
+    finish_dist_=default_finish_dist_;
     nh.param("fsm/finish_dist_z", finish_dist_z_, 0.25);
     nh.param("fsm/planning_horizon", planning_horizon_, -1.0);
     nh.param("fsm/emergency_time_", emergency_time_, 1.0);
@@ -83,11 +86,14 @@ namespace scan_planner
 
     bspline_pub_ = nh.advertise<scan_planner::msg::Bspline>("/planning/bspline", 10);
     goal_failure_pub_ = nh.advertise<std_msgs::msg::String>("/scan/goal_plan_failed", 10);
+    tolerance_status_pub_=nh.advertise<std_msgs::msg::String>("/scan/goal_tolerance_status",10);
     data_disp_pub_ = nh.advertise<scan_planner::msg::DataDisp>("/planning/data_display", 100);
     self_inflation_pub_ = nh.advertise<visualization_msgs::msg::Marker>("self_inflation", 10, true);
 
-    if (navi_mode_ == NAVI_MODE::MANUAL_TARGET)
+    if (navi_mode_ == NAVI_MODE::MANUAL_TARGET) {
       goal_sub_ = nh.subscribe("/move_base_simple/goal", 1, &SCANReplanFSM::rvizGoalCallback, this);
+      goal_request_sub_=nh.subscribe("/scan/goal_request",10,&SCANReplanFSM::goalRequestCallback,this);
+    }
     else if (navi_mode_ == NAVI_MODE::PRESET_TARGET)
     {
       legbot::Duration(1.0).sleep();
@@ -126,19 +132,60 @@ namespace scan_planner
     }
   }
 
-  void SCANReplanFSM::rvizGoalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg)
-  {
-    if (!msg)
-      return;
-
+  void SCANReplanFSM::rvizGoalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg) {
+    if(!msg)return;
+    scan_planner::msg::GoalRequest request;request.target=*msg;acceptGoal(request);
+  }
+  void SCANReplanFSM::goalRequestCallback(const scan_planner::msg::GoalRequest::ConstSharedPtr &msg) {
+    if(msg)acceptGoal(*msg);
+  }
+  void SCANReplanFSM::acceptGoal(const scan_planner::msg::GoalRequest &request) {
+    const auto msg=std::make_shared<geometry_msgs::msg::PoseStamped>(request.target);
+    const auto stamp=static_cast<std::uint64_t>(msg->header.stamp.sec)*1000000000ULL+msg->header.stamp.nanosec;
+    if(stamp && active_goal_stamp_ns_ && stamp<=active_goal_stamp_ns_)return;
     active_goal_stamp_ns_ = static_cast<std::uint64_t>(msg->header.stamp.sec) * 1000000000ULL +
                             msg->header.stamp.nanosec;
     active_goal_failure_sent_ = false;
+    active_goal_reached_ = false;
+    request_reference_ = false;
+    if(!validGoalReference(request)) {
+      have_target_=false;have_new_target_=false;trigger_=false;
+      changeFSMExecState(WAIT_TARGET,"INVALID_GOAL_REFERENCE");
+      publishGoalFailure("invalid_goal_reference");return;
+    }
+    if(!validGoalTolerance(request)) {
+      have_target_=false;have_new_target_=false;trigger_=false;
+      changeFSMExecState(WAIT_TARGET,"INVALID_GOAL_TOLERANCE");
+      tolerance_status_pub_.publish(std_msgs::msg::String().set__data(
+          goalToleranceStatus(request,"planner","rejected",0)));
+      publishGoalFailure("invalid_goal_tolerance");return;
+    }
+    finish_dist_=request.has_xy_tolerance?request.xy_tolerance:default_finish_dist_;
+    tolerance_status_pub_.publish(std_msgs::msg::String().set__data(
+        goalToleranceStatus(request,"planner","accepted",finish_dist_)));
 
     if (!rviz_height_ready_)
     {
       ROS_WARN("[SCANReplanFSM] Ignore RViz goal before receiving initial body pose.");
       publishGoalFailure("no_body_pose");
+      return;
+    }
+
+    if(!request.reference_points.empty()) {
+      request_reference_=true;
+      manual_clicked_xy_<<msg->pose.position.x,msg->pose.position.y;
+      manual_planning_z_=manual_goal_initial_z_=msg->pose.position.z;
+      reference_progress_time_=0.;init_pt_=odom_pos_;trigger_=true;
+      std::vector<Eigen::Vector3d> points{odom_pos_};
+      for(const auto &p:request.reference_points)points.emplace_back(p.x,p.y,p.z);
+      if(!planGlobalTrajByWaypoints(points)) {
+        have_target_=false;trigger_=false;
+        publishGoalFailure("global_reference_failed");
+        changeFSMExecState(WAIT_TARGET,"REFERENCE_FAILED");return;
+      }
+      if(exec_state_==WAIT_TARGET || exec_state_==INIT)
+        changeFSMExecState(GEN_NEW_TRAJ,"REFERENCE_GOAL");
+      else changeFSMExecState(REPLAN_TRAJ,"REFERENCE_GOAL");
       return;
     }
 
@@ -184,6 +231,10 @@ namespace scan_planner
                           msg->poses[0].pose.position.y;
     ROS_INFO("[SCAN manual goal] target=[%.2f, %.2f, %.2f], message_z=%s.",
              end_pt_(0), end_pt_(1), end_pt_(2), manual_goal_use_message_z_ ? "enabled" : "disabled");
+    // A goal already inside its own arrival tolerance needs a stop, not a
+    // zero/short global reference (or repeated failed local replanning).
+    if (stopIfPointGoalReached())
+      return;
     // A queued/manual waypoint is released only after the preceding point has
     // settled.  FAST-LIO's instantaneous twist on a walking quadruped can
     // contain large footfall spikes even when net body motion is near zero;
@@ -259,7 +310,7 @@ namespace scan_planner
   void SCANReplanFSM::publishGoalFailure(const char *reason)
   {
     if (navi_mode_ != NAVI_MODE::MANUAL_TARGET || active_goal_stamp_ns_ == 0 ||
-        active_goal_failure_sent_)
+        active_goal_failure_sent_ || active_goal_reached_)
       return;
     active_goal_failure_sent_ = true;
     std_msgs::msg::String event;
@@ -400,6 +451,23 @@ namespace scan_planner
            goalFloorMatches();
   }
 
+  bool SCANReplanFSM::stopIfPointGoalReached()
+  {
+    if (isWaypointSequenceMode() || !have_odom_ || !goalFloorMatches() ||
+        (end_pt_.head<2>() - odom_pos_.head<2>()).norm() > finish_dist_)
+      return false;
+    callEmergencyStop(odom_pos_);
+    replan_fail_count_ = 0;
+    have_target_ = false;
+    have_new_target_ = false;
+    trigger_ = false;
+    need_hover_stop_ = false;
+    if (navi_mode_ == NAVI_MODE::MANUAL_TARGET)
+      active_goal_reached_ = true;
+    changeFSMExecState(WAIT_TARGET, "FSM_GOAL_REACHED");
+    return true;
+  }
+
   bool SCANReplanFSM::goalFloorMatches() const
   {
     // Reaching a waypoint is a horizontal navigation decision. Z is only a
@@ -447,6 +515,8 @@ namespace scan_planner
 
   void SCANReplanFSM::pathCallback(const nav_msgs::msg::Path::ConstSharedPtr &msg)
   {
+    request_reference_=false;
+    finish_dist_=default_finish_dist_;
     if (!msg || msg->poses.empty())
     {
       ROS_WARN_THROTTLE(1.0, "[pathCallback] Received empty /initial_path, ignore.");
@@ -760,6 +830,10 @@ namespace scan_planner
 
     case GEN_NEW_TRAJ:
     {
+      // Odometry can enter the goal tolerance after command acceptance but
+      // before this timer. Arrival must precede the <0.20m replan rejection.
+      if (stopIfPointGoalReached())
+        break;
       setStartStateFromOdomOrCurrentTraj();
 
       // Eigen::Vector3d rot_x = odom_orient_.toRotationMatrix().block(0, 0, 3, 1);
@@ -790,15 +864,8 @@ namespace scan_planner
 
     case REPLAN_TRAJ:
     {
-      if (!isWaypointSequenceMode() && referenceGoalReached())
-      {
-        callEmergencyStop(odom_pos_);
-        replan_fail_count_ = 0;
-        have_target_ = false;
-        trigger_ = false;
-        changeFSMExecState(WAIT_TARGET, "FSM_GOAL_REACHED");
+      if (stopIfPointGoalReached())
         break;
-      }
 
       if (isWaypointSequenceMode() && referenceGoalReached())
       {
@@ -846,15 +913,8 @@ namespace scan_planner
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
 
-      if (!isWaypointSequenceMode() && referenceGoalReached())
-      {
-        callEmergencyStop(odom_pos_);
-        replan_fail_count_ = 0;
-        have_target_ = false;
-        trigger_ = false;
-        changeFSMExecState(WAIT_TARGET, "FSM_GOAL_REACHED");
+      if (stopIfPointGoalReached())
         break;
-      }
 
       if (isWaypointSequenceMode() &&
           current_wp_ + 1 < (int)active_waypoints_.size() &&
@@ -997,7 +1057,7 @@ namespace scan_planner
 
     //cout << "info->velocity_traj_=" << info->velocity_traj_.get_control_points() << endl;
 
-    if (navi_mode_ == NAVI_MODE::REFERENCE_PATH)
+    if (navi_mode_ == NAVI_MODE::REFERENCE_PATH || request_reference_)
     {
       // Replan from measured state.  Starting from the old planned state can
       // accumulate tracking error and eventually detach the local trajectory
@@ -1098,7 +1158,7 @@ namespace scan_planner
     }
 
     LocalTrajData *info = &planner_manager_->local_data_;
-    if (navi_mode_ == NAVI_MODE::REFERENCE_PATH)
+    if (navi_mode_ == NAVI_MODE::REFERENCE_PATH || request_reference_)
       return;
     if (info->start_time_.toSec() < 1e-5 || info->duration_ <= 1e-5)
       return;

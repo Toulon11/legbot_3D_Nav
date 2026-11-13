@@ -56,6 +56,7 @@ def setup(context):
         'navigation_source': 'ground_truth' if truth else 'fastlio',
         'navigation_interface': 'global',
         'publish_ground_truth': 'true',
+        'enable_ground_lidar': LaunchConfiguration('enable_ground_lidar').perform(context),
     })]
 
     # 第二阶段：只选一种定位和已配准点云来源；Gazebo 真值已由 simulation 启动。
@@ -91,11 +92,12 @@ def setup(context):
                 'odom_topic': odom,
                 'cloud_topic': cloud,
                 'sensor_pose_topic': sensor_pose,
-                'manual_goal_use_message_z': 'false',
+                'manual_goal_use_message_z': ('true' if LaunchConfiguration(
+                    'layer_map_in_process').perform(context) == 'true' else 'false'),
                 'robot_radius': LaunchConfiguration('scan_robot_radius').perform(context),
-                # 探索路径含有近距离转折点；0.80 m 减速圈会让约 0.45 m 的路点
-                # 从下发起就只有极小速度。仅覆盖本探索演示的启动参数。
+                # 保留近目标的航向与进展判定范围。速度由轨迹跟踪给出。
                 'goal_slowdown_distance': '0.55',
+                'min_walk_speed': '0.08',
             })]),
     ])
     if LaunchConfiguration('start_rviz').perform(context) == 'true':
@@ -104,7 +106,8 @@ def setup(context):
                 'use_sim_time': 'true',
                 'config': os.path.join(bringup, 'rviz', 'scan_exploration_global.rviz'),
             })]))
-    actions.append(TimerAction(period=delay + 3.0, actions=[include(
+    actions.append(TimerAction(period=(0.0 if LaunchConfiguration(
+        'layer_map_in_process').perform(context) == 'true' else delay + 3.0), actions=[include(
             'legbot_exploration', 'exploration.launch.py', {
                 'use_sim_time': 'true',
                 'observation_only': 'false',
@@ -117,6 +120,8 @@ def setup(context):
                     else '0.0'),
                 'layer_map_in_process': LaunchConfiguration(
                     'layer_map_in_process').perform(context),
+                'enable_ground_lidar': LaunchConfiguration('enable_ground_lidar').perform(context),
+                'skip_start_floor_exploration': LaunchConfiguration('skip_start_floor_exploration').perform(context),
             })]))
     # 返回本函数计算得到的结果。
     return actions
@@ -143,10 +148,12 @@ def generate_launch_description():
                               description='Show the Gazebo GUI.'),
         DeclareLaunchArgument('planner_safety', default_value='false',
                               choices=['true', 'false'],
-                              description='Require current SCAN occupancy and use wider clearance for exploration goals.'),
+                              description='Require current SCAN occupancy for occupancy-based exploration.'),
         DeclareLaunchArgument('layer_map_in_process', default_value='false',
                               choices=['true', 'false']),
-        DeclareLaunchArgument('scan_robot_radius', default_value='0.20',
+        DeclareLaunchArgument('enable_ground_lidar', default_value='false', choices=['true', 'false']),
+        DeclareLaunchArgument('skip_start_floor_exploration', default_value='', choices=['', 'true', 'false']),
+        DeclareLaunchArgument('scan_robot_radius', default_value='0.35',
                               description='SCAN local obstacle inflation radius in metres.'),
         # 等参数解析后才运行 setup，选择要启动的节点。
         OpaqueFunction(function=setup),

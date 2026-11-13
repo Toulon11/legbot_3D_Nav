@@ -129,163 +129,90 @@ bool observed_free_corridor(
     const std::unordered_map<Cell, int, CellHash> &grid,
     const Settings &cfg, const std::vector<XY> &inflated_scan_obstacles,
     const FreeObservationCounts *free_observations = nullptr) {
-  if (cfg.resolution <= 0.0 || cfg.robot_radius < 0.0 ||
-      cfg.waypoint_safety_margin < 0.0 ||
-      cfg.planner_occupancy_resolution <= 0.0) return false;
-  const double radius = cfg.robot_radius + cfg.waypoint_safety_margin;
-  const int min_x = static_cast<int>(std::floor((std::min(a[0], b[0]) - radius) /
-                                            cfg.resolution));
-  const int max_x = static_cast<int>(std::floor((std::max(a[0], b[0]) + radius) /
-                                            cfg.resolution));
-  const int min_y = static_cast<int>(std::floor((std::min(a[1], b[1]) - radius) /
-                                            cfg.resolution));
-  const int max_y = static_cast<int>(std::floor((std::max(a[1], b[1]) + radius) /
-                                            cfg.resolution));
-  for (int x = min_x; x <= max_x; ++x)
-    for (int y = min_y; y <= max_y; ++y) {
-      const double left = x * cfg.resolution, bottom = y * cfg.resolution;
-      if (segment_square_distance(a, b, left, left + cfg.resolution,
-                                  bottom, bottom + cfg.resolution) > radius + 1e-9)
-        continue;
-      const auto it = grid.find({x, y});
-      if (it == grid.end() || it->second != 0) return false;
-      if (!std::isfinite(free_evidence_multiplier(
-              {x, y}, cfg, free_observations))) return false;
-    }
-  const double extra = std::max(0.0, radius - cfg.planner_occupancy_radius) +
-      cfg.planner_occupancy_resolution / std::sqrt(2.0);
-  for (const auto &obstacle : inflated_scan_obstacles)
-    if (std::isfinite(obstacle[0]) && std::isfinite(obstacle[1]) &&
-        point_segment_distance(obstacle, a, b) <= extra + 1e-9)
-      return false;
-  return true;
-}
-std::unordered_set<Cell, CellHash> blocked_cells(
-    const std::unordered_map<Cell, int, CellHash> &grid,
-    const Settings &cfg, const std::vector<XY> &obstacles) {
-  std::unordered_set<Cell, CellHash> blocked;
-  const auto inflate = [&](Cell cell, double radius) {
-    const int reach = static_cast<int>(std::ceil(radius / cfg.resolution));
-    for (int dx = -reach; dx <= reach; ++dx)
-      for (int dy = -reach; dy <= reach; ++dy)
-        if (std::hypot(dx, dy) * cfg.resolution <= radius + 1e-9)
-          blocked.insert({cell.x + dx, cell.y + dy});
-  };
-  for (const auto &[cell, state] : grid)
-    if (state == 1) inflate(cell, cfg.robot_radius);
-  const double extra = std::max(0.0, cfg.robot_radius - cfg.planner_occupancy_radius);
-  for (const auto &p : obstacles)
-    if (std::isfinite(p[0]) && std::isfinite(p[1]))
-      inflate(cell_of(p, cfg.resolution), extra);
-  return blocked;
-}
-bool frontier_visible_without_known_obstacle(
-    const XY &from, const XY &frontier,
-    const std::unordered_map<Cell, int, CellHash> &grid, double resolution) {
-  const int samples = std::max(1, static_cast<int>(
-      std::ceil(distance(from, frontier) / (resolution * 0.4))));
-  for (int i = 0; i <= samples; ++i) {
-    const double t = static_cast<double>(i) / samples;
-    const Cell cell = cell_of({from[0] + t * (frontier[0] - from[0]),
-                               from[1] + t * (frontier[1] - from[1])}, resolution);
-    const auto found = grid.find(cell);
-    if (found != grid.end() && found->second == 1) return false;
-  }
-  return true;
+  return segment_safe_check(a, b,
+      OccupancyMapView{grid,cfg,inflated_scan_obstacles,free_observations}).safe;
 }
 }  // namespace
 
-WaypointSafety waypoint_footprint_safety(
-    const XY &point, const std::unordered_map<Cell, int, CellHash> &grid,
-    const Settings &cfg, const std::vector<XY> &inflated_scan_obstacles) {
+PointSafetyResult point_safe_check(const XY &point, const OccupancyMapView &map) {
+  PointSafetyResult out;
+  out.evaluated=true;
+  out.map_version=map.version;
+  out.position={point[0],point[1],0.0};
+  const auto &cfg=map.settings;
   if (!std::isfinite(point[0]) || !std::isfinite(point[1]) ||
-      cfg.resolution <= 0.0 || cfg.robot_radius < 0.0 ||
-      cfg.waypoint_safety_margin < 0.0 ||
-      cfg.planner_occupancy_resolution <= 0.0)
-    return WaypointSafety::unknown_footprint;
-  const double radius = cfg.robot_radius + cfg.waypoint_safety_margin;
-  const int min_x = static_cast<int>(std::floor((point[0] - radius) / cfg.resolution));
-  const int max_x = static_cast<int>(std::floor((point[0] + radius) / cfg.resolution));
-  const int min_y = static_cast<int>(std::floor((point[1] - radius) / cfg.resolution));
-  const int max_y = static_cast<int>(std::floor((point[1] + radius) / cfg.resolution));
-  for (int x = min_x; x <= max_x; ++x)
-    for (int y = min_y; y <= max_y; ++y) {
-      const double dx = std::max({x * cfg.resolution - point[0], 0.0,
-                                  point[0] - (x + 1) * cfg.resolution});
-      const double dy = std::max({y * cfg.resolution - point[1], 0.0,
-                                  point[1] - (y + 1) * cfg.resolution});
-      if (std::hypot(dx, dy) > radius + 1e-9) continue;
-      const auto it = grid.find({x, y});
-      if (it == grid.end()) return WaypointSafety::unknown_footprint;
-      if (it->second != 0) return WaypointSafety::occupied_footprint;
-    }
-  const double extra = std::max(0.0, radius - cfg.planner_occupancy_radius) +
-      cfg.planner_occupancy_resolution * std::sqrt(0.5);
-  for (const auto &obstacle : inflated_scan_obstacles) {
-    if (!std::isfinite(obstacle[0]) || !std::isfinite(obstacle[1])) continue;
-    if (std::abs(point[0] - obstacle[0]) <= extra &&
-        std::abs(point[1] - obstacle[1]) <= extra &&
-        distance(point, obstacle) <= extra + 1e-9)
-      return WaypointSafety::scan_obstacle;
+      !std::isfinite(cfg.resolution) || cfg.resolution<=0 ||
+      !std::isfinite(cfg.robot_radius) || cfg.robot_radius<0 ||
+      !std::isfinite(cfg.waypoint_safety_margin) || cfg.waypoint_safety_margin<0 ||
+      cfg.planner_occupancy_resolution<=0) {
+    out.reject(SafetyIssue::invalid_input);return out;
   }
-  return WaypointSafety::safe;
+  out.cell=cell_of(point,cfg.resolution);
+  const double radius=cfg.robot_radius+cfg.waypoint_safety_margin;
+  const int x0=static_cast<int>(std::floor((point[0]-radius)/cfg.resolution));
+  const int x1=static_cast<int>(std::floor((point[0]+radius)/cfg.resolution));
+  const int y0=static_cast<int>(std::floor((point[1]-radius)/cfg.resolution));
+  const int y1=static_cast<int>(std::floor((point[1]+radius)/cfg.resolution));
+  for (int x=x0;x<=x1;++x) for (int y=y0;y<=y1;++y) {
+    const double dx=std::max({x*cfg.resolution-point[0],0.0,point[0]-(x+1)*cfg.resolution});
+    const double dy=std::max({y*cfg.resolution-point[1],0.0,point[1]-(y+1)*cfg.resolution});
+    if (std::hypot(dx,dy)>radius+1e-9) continue;
+    ++out.checked_cells;
+    const auto found=map.grid.find({x,y});
+    if (found==map.grid.end()) out.reject(SafetyIssue::unknown);
+    else if (found->second!=0) out.reject(SafetyIssue::occupied);
+    else if (!std::isfinite(free_evidence_multiplier({x,y},cfg,map.free_observations)))
+      out.reject(SafetyIssue::zero_free_evidence);
+  }
+  const double extra=std::max(0.0,radius-cfg.planner_occupancy_radius)+
+      cfg.planner_occupancy_resolution/std::sqrt(2.0);
+  for (const auto &p:map.scan_obstacles)
+    if (std::isfinite(p[0]) && std::isfinite(p[1]) && distance(point,p)<=extra+1e-9)
+      out.reject(SafetyIssue::scan_obstacle);
+  return out;
 }
 
-std::vector<XY> nearby_safe_viewpoints(
-    const std::unordered_map<Cell, int, CellHash> &grid, const XY &start,
-    const Settings &cfg, const std::vector<XY> &inflated_scan_obstacles,
-    double min_distance, double max_distance) {
-  std::vector<std::pair<double, XY>> candidates;
-  if (cfg.resolution <= 0.0 || min_distance <= 0.0 ||
-      max_distance < min_distance || !std::isfinite(start[0]) ||
-      !std::isfinite(start[1])) return {};
-  for (const auto &[cell, state] : grid) {
-    if (state != 0) continue;
-    const XY point = center_of(cell, cfg.resolution);
-    const double length = distance(start, point);
-    if (length < min_distance || length > max_distance ||
-        waypoint_footprint_safety(point, grid, cfg,
-                                  inflated_scan_obstacles) != WaypointSafety::safe)
-      continue;
-    candidates.push_back({length, point});
+SegmentSafetyResult segment_safe_check(const XY &a,const XY &b,const OccupancyMapView &map) {
+  SegmentSafetyResult out;
+  out.failure.map_version=map.version;
+  out.failure.evaluated=true;
+  const auto &cfg=map.settings;
+  const auto at_a=point_safe_check(a,map),at_b=point_safe_check(b,map);
+  if (!at_a.safe || !at_b.safe) {
+    out.safe=false;out.failure=!at_a.safe?at_a:at_b;return out;
   }
-  std::sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) {
-    if (a.first != b.first) return a.first < b.first;
-    return a.second < b.second;
-  });
-  std::vector<XY> result;
-  result.reserve(candidates.size());
-  for (const auto &item : candidates) result.push_back(item.second);
-  return result;
+  const double radius=cfg.robot_radius+cfg.waypoint_safety_margin;
+  const int x0=static_cast<int>(std::floor((std::min(a[0],b[0])-radius)/cfg.resolution));
+  const int x1=static_cast<int>(std::floor((std::max(a[0],b[0])+radius)/cfg.resolution));
+  const int y0=static_cast<int>(std::floor((std::min(a[1],b[1])-radius)/cfg.resolution));
+  const int y1=static_cast<int>(std::floor((std::max(a[1],b[1])+radius)/cfg.resolution));
+  for (int x=x0;x<=x1;++x) for (int y=y0;y<=y1;++y) {
+    const double left=x*cfg.resolution,bottom=y*cfg.resolution;
+    if (segment_square_distance(a,b,left,left+cfg.resolution,bottom,bottom+cfg.resolution)>radius+1e-9) continue;
+    ++out.failure.checked_cells;
+    const auto found=map.grid.find({x,y});
+    if (found==map.grid.end()) out.failure.reject(SafetyIssue::unknown);
+    else if (found->second!=0) out.failure.reject(SafetyIssue::occupied);
+    else if (!std::isfinite(free_evidence_multiplier({x,y},cfg,map.free_observations)))
+      out.failure.reject(SafetyIssue::zero_free_evidence);
+  }
+  const double extra=std::max(0.0,radius-cfg.planner_occupancy_radius)+
+      cfg.planner_occupancy_resolution/std::sqrt(2.0);
+  for (const auto &p:map.scan_obstacles)
+    if (std::isfinite(p[0]) && std::isfinite(p[1]) && point_segment_distance(p,a,b)<=extra+1e-9)
+      out.failure.reject(SafetyIssue::scan_obstacle);
+  out.safe=out.failure.safe;
+  return out;
 }
 
-std::vector<XY> observation_viewpoints(
-    const std::unordered_map<Cell, int, CellHash> &grid,
-    const XY &frontier, const Settings &cfg,
-    const std::vector<XY> &inflated_scan_obstacles, double viewpoint_radius) {
-  std::vector<std::pair<double, XY>> ranked;
-  if (cfg.resolution <= 0.0 || viewpoint_radius <= 0.0 ||
-      !std::isfinite(frontier[0]) || !std::isfinite(frontier[1])) return {};
-  Settings endpoint_cfg = cfg;
-  endpoint_cfg.robot_radius += 0.15;
-  for (const auto &[cell, state] : grid) {
-    if (state != 0) continue;
-    const XY point = center_of(cell, cfg.resolution);
-    const double separation = distance(point, frontier);
-    if (separation > std::max(viewpoint_radius, cfg.resolution * 1.1) ||
-        waypoint_footprint_safety(point, grid, endpoint_cfg,
-                                  inflated_scan_obstacles) != WaypointSafety::safe ||
-        !frontier_visible_without_known_obstacle(
-            point, frontier, grid, cfg.resolution)) continue;
-    ranked.emplace_back(separation, point);
-  }
-  std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) {
-    return a.first != b.first ? a.first < b.first : a.second < b.second;
-  });
-  std::vector<XY> result;
-  result.reserve(ranked.size());
-  for (const auto &item : ranked) result.push_back(item.second);
-  return result;
+WaypointSafety waypoint_footprint_safety(
+    const XY &point,const std::unordered_map<Cell,int,CellHash> &grid,
+    const Settings &cfg,const std::vector<XY> &obstacles) {
+  const auto result=point_safe_check(point,OccupancyMapView{grid,cfg,obstacles});
+  if (result.safe) return WaypointSafety::safe;
+  if (result.rejected[static_cast<std::size_t>(SafetyIssue::occupied)]) return WaypointSafety::occupied_footprint;
+  if (result.rejected[static_cast<std::size_t>(SafetyIssue::scan_obstacle)]) return WaypointSafety::scan_obstacle;
+  return WaypointSafety::unknown_footprint;
 }
 
 PlannedRoute plan_occupancy_route(
@@ -305,18 +232,16 @@ PlannedRoute plan_occupancy_route(
   const ScanObstacleIndex scan_index(inflated_scan_obstacles, cfg.resolution);
   const double scan_search_radius = cfg.robot_radius +
       cfg.waypoint_safety_margin + cfg.planner_occupancy_resolution;
-  if (waypoint_footprint_safety(target, grid, cfg,
-                                inflated_scan_obstacles) != WaypointSafety::safe) {
-    out.reason = "unsafe_viewpoint";
+  const OccupancyMapView map{grid,cfg,inflated_scan_obstacles,free_observations};
+  out.start_check=check_start(start,map);
+  if (!out.start_check.ready) {
+    out.reason="unsafe_start";
+    out.failure_stage=out.start_check.stage;
     return out;
   }
-  if (waypoint_footprint_safety(start, grid, cfg,
-                                inflated_scan_obstacles) != WaypointSafety::safe ||
-      !observed_free_corridor(start, center_of(origin, cfg.resolution), grid,
-                              cfg, inflated_scan_obstacles,
-                              free_observations)) {
-    out.reason = "unsafe_start";
-    return out;
+  out.goal_check=point_safe_check(target,map);
+  if (!out.goal_check.safe) {
+    out.reason="unsafe_viewpoint";out.failure_stage="goal_position";return out;
   }
   std::unordered_map<Cell, bool, CellHash> traversable_cache;
   const auto traversable = [&](const Cell &cell) {
@@ -324,10 +249,8 @@ PlannedRoute plan_occupancy_route(
     if (cached != traversable_cache.end()) return cached->second;
     const XY point = center_of(cell, cfg.resolution);
     const auto nearby = scan_index.near(point, point, scan_search_radius);
-    const bool safe = waypoint_footprint_safety(
-        point, grid, cfg, nearby) == WaypointSafety::safe &&
-        std::isfinite(free_evidence_multiplier(
-            cell, cfg, free_observations));
+    const bool safe = point_safe_check(point,
+        OccupancyMapView{grid,cfg,nearby,free_observations}).safe;
     traversable_cache.emplace(cell, safe);
     return safe;
   };
@@ -354,10 +277,11 @@ PlannedRoute plan_occupancy_route(
     const Item current = open.top();
     open.pop();
     if (current.cost > cost[current.cell] + 1e-9) continue;
+    ++out.expanded_nodes;
     if (current.cell == finish) { reached = current.cell; found = true; break; }
     for (const Cell step : kSteps) {
       const Cell next{current.cell.x + step.x, current.cell.y + step.y};
-      if (!traversable(next)) continue;
+      if (!traversable(next)) {++out.rejected_missing_nodes;continue;}
       if (step.x && step.y &&
           (!traversable({current.cell.x + step.x, current.cell.y}) ||
            !traversable({current.cell.x, current.cell.y + step.y}))) continue;
@@ -365,7 +289,7 @@ PlannedRoute plan_occupancy_route(
       const XY b = center_of(next, cfg.resolution);
       const auto nearby = scan_index.near(a, b, scan_search_radius);
       if (!observed_free_corridor(a, b, grid, cfg, nearby,
-                                  free_observations)) continue;
+                                  free_observations)) {++out.rejected_corridor_edges;continue;}
       const double edge_length = cfg.resolution * std::hypot(step.x, step.y);
       const double next_cost = current.cost + edge_length * 0.5 *
           (free_evidence_multiplier(current.cell, cfg, free_observations) +
@@ -380,21 +304,24 @@ PlannedRoute plan_occupancy_route(
   }
   if (!found) {
     out.reason = "occupancy_route_disconnected";
+    out.failure_stage="astar";
     return out;
   }
   std::vector<XY> reversed;
   for (Cell cursor = reached; !(cursor == origin); cursor = parent.at(cursor))
     reversed.push_back(center_of(cursor, cfg.resolution));
   out.points.push_back(start);
+  if (distance(start,out.start_check.anchor)>1e-9)
+    out.points.push_back(out.start_check.anchor);
   for (auto it = reversed.rbegin(); it != reversed.rend(); ++it)
     out.points.push_back(*it);
   if (out.points.size() == 1 || distance(out.points.back(), target) > 1e-9)
     out.points.push_back(target);
-  if (!observed_free_corridor(out.points[out.points.size() - 2], target, grid,
-                              cfg, inflated_scan_obstacles,
-                              free_observations)) {
+  out.failed_connection=segment_safe_check(out.points[out.points.size()-2],target,map);
+  if (!out.failed_connection.safe) {
     out.points.clear();
     out.reason = "unsafe_endpoint_approach";
+    out.failure_stage="goal_connection";
     return out;
   }
   out.reason = "ok";

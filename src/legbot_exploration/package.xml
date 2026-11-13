@@ -19,11 +19,21 @@
   <depend>rclpy</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>control_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
+  <test_depend>tf2_msgs</test_depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>visualization_msgs</depend>
   <depend>scan_planner</depend>
+  <depend>ament_index_cpp</depend>
+  <build_depend>python3-dev</build_depend>
+  <build_depend>pybind11-dev</build_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>pct_planner</exec_depend>
   <!-- Python 点云读取库只需在运行 Python 节点时存在。 -->
   <exec_depend>sensor_msgs_py</exec_depend>
   <exec_depend>ament_index_python</exec_depend>

@@ -9,6 +9,14 @@
   <xacro:arg name="GAZEBO" default="false"/>
   <xacro:arg name="CLASSIC" default="false"/>
   <xacro:arg name="ENABLE_LIDAR" default="true"/>
+  <xacro:arg name="ENABLE_GROUND_LIDAR" default="false"/>
+  <xacro:arg name="ground_lidar_x" default=".35"/>
+  <xacro:arg name="ground_lidar_z" default=".20"/>
+  <xacro:arg name="ground_lidar_pitch" default=".6108652381980153"/>
+  <xacro:arg name="ground_lidar_horizontal_half_angle" default=".7853981633974483"/>
+  <xacro:arg name="ground_lidar_elevation_min" default="-.0872664625997165"/>
+  <xacro:arg name="ground_lidar_elevation_max" default=".3490658503988659"/>
+  <xacro:arg name="ground_lidar_max_range" default="12."/>
   <xacro:arg name="ENABLE_CAMERA" default="true"/>
   <xacro:arg name="controller_config" default="$(find go2_description)/config/gazebo.yaml"/>
 
@@ -211,6 +219,28 @@
     <origin xyz="0.011 0.02329 -0.04412" rpy="0 0 0"/>
   </joint>
   <xacro:if value="$(arg GAZEBO)">
+    <!-- Auxiliary front-ground sensor. +X points 35 degrees below body +X;
+         the local scan window concentrates samples on the ground ahead. -->
+    <xacro:if value="$(arg ENABLE_GROUND_LIDAR)">
+      <!-- Match the existing virtual Livox sensor: no rendered housing, which
+           would otherwise be measured as a nearby obstacle by the main LiDAR. -->
+      <link name="ground_lidar_link"/>
+      <joint name="ground_lidar_mount" type="fixed">
+        <parent link="trunk"/><child link="ground_lidar_link"/>
+        <origin xyz="$(arg ground_lidar_x) 0 $(arg ground_lidar_z)" rpy="0 $(arg ground_lidar_pitch) 0"/>
+      </joint>
+      <gazebo reference="ground_lidar_link">
+        <sensor name="ground_lidar" type="gpu_lidar">
+          <topic>/ground_lidar/scan</topic><gz_frame_id>ground_lidar_link</gz_frame_id>
+          <update_rate>10</update_rate><always_on>true</always_on><visualize>false</visualize>
+          <lidar><scan>
+            <!-- Horizontal +/-45 degrees; local elevation -5 to +20 degrees. -->
+            <horizontal><samples>256</samples><resolution>1</resolution><min_angle>-$(arg ground_lidar_horizontal_half_angle)</min_angle><max_angle>$(arg ground_lidar_horizontal_half_angle)</max_angle></horizontal>
+            <vertical><samples>64</samples><resolution>1</resolution><min_angle>$(arg ground_lidar_elevation_min)</min_angle><max_angle>$(arg ground_lidar_elevation_max)</max_angle></vertical>
+          </scan><range><min>0.05</min><max>$(arg ground_lidar_max_range)</max><resolution>0.01</resolution></range></lidar>
+        </sensor>
+      </gazebo>
+    </xacro:if>
     <gazebo reference="livox_imu_link">
       <sensor name="livox_imu" type="imu"><topic>/livox/imu</topic><gz_frame_id>livox_imu_link</gz_frame_id><always_on>true</always_on><update_rate>200</update_rate></sensor>
     </gazebo>

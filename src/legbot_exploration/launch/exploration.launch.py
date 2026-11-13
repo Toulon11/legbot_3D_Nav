@@ -28,6 +28,7 @@ def setup(context):
     flat_safety = LaunchConfiguration('flat_safety').perform(context) == 'true'
     planner_safety = LaunchConfiguration('planner_safety').perform(context) == 'true'
     combined_layer_map = LaunchConfiguration('layer_map_in_process').perform(context) == 'true'
+    skip_start_floor = LaunchConfiguration('skip_start_floor_exploration').perform(context)
 
     # 将计算结果保存为 actions（启动文件返回的启动动作列表）。
     actions = []
@@ -43,6 +44,7 @@ def setup(context):
                 'odom_topic': odom,
                 'frame_id': 'map',
                 'ready_topic': '/go2/demo_ready',
+                'reach_z': '0.25' if combined_layer_map else '0.0',
             }.items()))
     # 把本次结果放入容器，供下一轮处理。
     actions.append(Node(
@@ -53,6 +55,7 @@ def setup(context):
         output='screen',
         parameters=[
             os.path.join(share('legbot_exploration'), 'config', 'exploration.yaml'),
+            os.path.join(share('legbot_bringup'), 'config', 'robot_geometry.yaml'),
             *([os.path.join(share('legbot_exploration'), 'config',
                             'multi_layer_map.yaml')] if combined_layer_map else []),
             {
@@ -63,18 +66,23 @@ def setup(context):
                 'sensor_odom_topic': sensor_pose,
                 'cloud_topic': cloud,
                 'frame_id': 'map',
+                'auxiliary_cloud_topic': ParameterValue('/ground_lidar/points_registered' if
+                    LaunchConfiguration('enable_ground_lidar').perform(context) == 'true' else '', value_type=str),
+                # Standalone flat mode has no shared PCT map. Combined mode
+                # reads frontier_source from exploration.yaml unchanged.
+                **({'frontier_source': 'occupancy'} if not combined_layer_map else {}),
+                **({'skip_start_floor_exploration': skip_start_floor == 'true'} if skip_start_floor else {}),
                 'planner_occupancy_radius': float(
                     LaunchConfiguration('planner_occupancy_radius').perform(context)),
-                **({'robot_radius': 0.50,
-                    'global_search': True,
+                # Body geometry comes from robot_geometry.yaml in every mode.
+                **({'global_search': True,
                     'bounds_relative_to_start': True,
                     'exploration_min_x': -4.5,
                     'exploration_max_x': 26.5,
                     'exploration_min_y': -21.5,
                     'exploration_max_y': 9.5,
                     'require_planner_occupancy': True} if flat_safety else {}),
-                **({'robot_radius': 0.50,
-                    'require_planner_occupancy': True}
+                **({'require_planner_occupancy': True}
                    if planner_safety and not flat_safety else {}),
             },
         ],
@@ -98,6 +106,9 @@ def generate_launch_description():
         DeclareLaunchArgument('planner_occupancy_radius', default_value='0.0'),
         DeclareLaunchArgument('layer_map_in_process', default_value='false',
                               choices=['true', 'false']),
+        DeclareLaunchArgument('enable_ground_lidar', default_value='false', choices=['true', 'false']),
+        DeclareLaunchArgument('skip_start_floor_exploration', default_value='', choices=['', 'true', 'false'],
+                              description='Use shared exploration to recognize stairs, then leave the initial floor early. Empty uses exploration.yaml.'),
         # 等参数解析后才运行 setup，选择要启动的节点。
         OpaqueFunction(function=setup),
     ])

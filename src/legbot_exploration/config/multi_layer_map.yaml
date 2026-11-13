@@ -1,40 +1,58 @@
 /online_layer_map:
   ros__parameters:
+    pct_mapping_mode: static           # Only static mapping is currently supported.
+    pct_block_size: 32                 # Existing blocks never resize.
+    pct_slice_update_workers: 0      # Auto: serial for small batches, up to 4 workers otherwise. Set 1 for serial replay.
+    # Sensor-origin XYZ range used ONLY for PCT surface evidence; 0 permits offline full-map fixtures.
+    pct_reliable_observation_range: 5.0
+    cloud_sensor_odom_topic: /slam/odometry_lidar
+    auxiliary_sensor_odom_topic: /ground_lidar/odometry_lidar
+    pct_maturity_min_points: 3         # Same frame or accumulated frames.
+    pct_surface_noise_tolerance: 0.05  # Same-column matching and near-ground noise band, in metres.
+    # Temporary normals of real frame points; no inferred/fitted ground is added.
+    pct_surface_normal_radius: 0.25
+    pct_surface_normal_min_points: 6
+    pct_surface_normal_vertical: 0.5
+    pct_surface_normal_thickness: 0.03
+    pct_planning_budget_seconds: 1.5  # Total native search time for one endpoint request, all anchor pairs.
+    pct_observation_revisit_radius: 1.0 # Suppress similar completed same-surface views until relevant new evidence.
+    pct_floor_min_resolved_frontier_cells: 5 # Also require 10% of covered cells; capped by actual view coverage.
+    pct_fast_exploration: true              # Prioritize useful ordinary floor observations and allow partial coverage.
+    pct_fast_min_visible_cells: 3           # Minimum number visible from the candidate pose and yaw.
+    pct_landing_support_radius: 0.60   # Support radius used to rank interior staging poses, in metres.
+    pct_landing_min_area: 1.50         # Connected measured platform area in square metres.
+    pct_landing_min_width: 0.80        # Continuous level width across the ascent, in metres.
+    pct_landing_min_depth: 1.00        # Continuous level depth along the ascent, in metres.
+    # Initial trial values; calibrate against registered-cloud noise.
+    pct_relief_update_threshold: 0.25
+    pct_terrain_update_threshold: 0.25
+    pct_inflation_update_threshold: 0.25
+    pct_traversability_kernel_size: 7  # separate from inflation window
+    pct_standable_ratio: 0.5
+    pct_inflation_kernel_size: 13
+    pct_max_surface_records: 2000000        # Shared surface records; no raw XYZ history.
+    pct_origin_x: 0.0
+    pct_origin_y: 0.0
+    pct_origin_z: 0.0
+    pct_min_clearance: 0.50
+    pct_desired_clearance: 0.55
+    pct_max_map_cells: 20000000         # Fail explicitly rather than allocating unbounded dense grids.
     use_sim_time: true
     frame_id: map
     cloud_topic: /slam/global_cloud_registered
-    sensor_odom_topic: /slam/odometry_lidar
     base_odom_topic: /slam/global_odometry_base
-    sensor_sync_tolerance: 0.05
     # PCT's horizontal grid and height slices are separate.  The surface
     # height remains a measured value and is not rounded to slice_height.
     xy_resolution: 0.10
-    z_resolution: 0.10
     slice_height: 0.50
-    max_ray_range: 12.0
-    surface_merge_gap: 0.15
-    support_height_tolerance: 0.20
-    min_clearance: 0.55
     max_slope_radians: 0.40
     max_step_height: 0.16
-    support_radius_cells: 2
-    min_support_columns: 5
-    min_hit_observations: 2
-    max_surfaces_per_column: 8
-    max_voxels: 8000000
-    point_stride: 1
-    max_points_per_cloud: 12000
-    max_rays_per_cloud: 1200
     publish_period: 1.0
-    publish_map_topics: true        #在线层析图节点是否发布层析图(平面和占据体素)信息
+    publish_map_topics: true        # 是否发布新 PCT 表面、实际命中、净空及预览信息
     max_display_surfaces: 120000
-    # Read-only cross-layer A* preview. These topics never command SCAN.
+    # Diagnostic A* preview holds the map lock; keep it off during exploration.
+    graph_preview_enabled: false
     graph_search_radius: 7.0
     graph_min_height_gain: 0.07
-    graph_nominal_body_height: 0.32
-    graph_start_xy_tolerance: 0.45
-    graph_start_z_tolerance: 0.30
-    graph_max_nodes: 25000
-    graph_max_preview_candidates: 128
+    graph_max_preview_candidates: 8
     graph_max_preview_nodes: 4000
-    graph_max_preview_edges: 6000

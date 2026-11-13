@@ -44,7 +44,8 @@ def generate_launch_description():
             arguments=['--exploration-mode=map'],
             name='online_layer_map',
             output='screen',
-            parameters=[config, {'use_sim_time': True}],
+            parameters=[config, os.path.join(bringup, 'config', 'robot_geometry.yaml'),
+                        {'use_sim_time': True}],
         ),
         Node(
             package='rviz2',

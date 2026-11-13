@@ -20,7 +20,7 @@ find_package(cv_bridge REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(pcl_ros REQUIRED)
 find_package(legbot_runtime REQUIRED)
-rosidl_generate_interfaces(${PROJECT_NAME} "msg/Bspline.msg" "msg/DataDisp.msg" DEPENDENCIES std_msgs geometry_msgs builtin_interfaces)
+rosidl_generate_interfaces(${PROJECT_NAME} "msg/Bspline.msg" "msg/DataDisp.msg" "msg/GoalRequest.msg" DEPENDENCIES std_msgs geometry_msgs builtin_interfaces)
 rosidl_get_typesupport_target(typesupport ${PROJECT_NAME} rosidl_typesupport_cpp)
 include_directories(algorithm/plan_manage/include algorithm/plan_env/include algorithm/path_searching/include algorithm/bspline_opt/include algorithm/traj_utils/include ${EIGEN3_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
 add_executable(scan_planner_node algorithm/plan_manage/src/scan_planner_node.cpp algorithm/plan_manage/src/scan_replan_fsm.cpp algorithm/plan_manage/src/planner_manager.cpp algorithm/plan_env/src/grid_map.cpp algorithm/plan_env/src/raycast.cpp algorithm/path_searching/src/dyn_a_star.cpp algorithm/bspline_opt/src/uniform_bspline.cpp algorithm/bspline_opt/src/bspline_optimizer.cpp algorithm/bspline_opt/src/gradient_descent_optimizer.cpp algorithm/traj_utils/src/planning_visualization.cpp algorithm/traj_utils/src/polynomial_traj.cpp)
@@ -33,4 +33,19 @@ install(TARGETS scan_planner_node scan_go2_cmd_adapter DESTINATION lib/${PROJECT
 install(PROGRAMS tools/keypoint_recorder_ros2.py
   DESTINATION lib/${PROJECT_NAME}
   RENAME scan_keypoint_recorder)
+include(CTest)
+if(BUILD_TESTING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME scan_go2_terminal_control COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_go2_terminal_ros.py $<TARGET_FILE:scan_go2_cmd_adapter>)
+  set_tests_properties(scan_go2_terminal_control PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+  add_test(NAME scan_goal_tolerance COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_goal_tolerance_ros.py
+    $<TARGET_FILE:scan_go2_cmd_adapter> $<TARGET_FILE:scan_planner_node>)
+  set_tests_properties(scan_goal_tolerance PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+  add_test(NAME scan_near_goal_arrival COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_near_goal_ros.py
+    $<TARGET_FILE:scan_go2_cmd_adapter> $<TARGET_FILE:scan_planner_node>)
+  set_tests_properties(scan_near_goal_arrival PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+endif()
 ament_package()

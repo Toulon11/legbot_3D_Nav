@@ -4,6 +4,8 @@
 #include <chrono>
 #include <iostream>
 #include <queue>
+#include <stdexcept>
+#include <cmath>
 #include <unordered_map>
 #include <unordered_set>
 #include <unistd.h>
@@ -28,6 +30,12 @@ void Astar::Init(const double cost_threshold, const int num_layers,
 
   cost_threshold_ = cost_threshold;
   step_cost_weight_  = step_cost_weight;
+  reader_ = {};
+  timed_out_ = false;
+  blocked_edges_.clear();
+  search_result_.clear();
+  sparse_nodes_.clear();
+  resolution_ = resolution;
 
   max_x_ = cost_map.cols();
   max_y_ = cost_map.rows() / num_layers;
@@ -69,6 +77,11 @@ void Astar::Init(const double cost_threshold, const int num_layers,
 }
 
 void Astar::Reset() {
+  if (reader_) {
+    search_result_.clear();
+    sparse_nodes_.clear();
+    return;
+  }
   for (size_t i = 0; i < grid_map_.size(); ++i) {
     for (size_t j = 0; j < grid_map_[i].size(); ++j) {
       for (size_t k = 0; k < grid_map_[i][j].size(); ++k) {
@@ -78,8 +91,40 @@ void Astar::Reset() {
   }
 }
 
-int Astar::GetHash(const Eigen::Vector3i& idx) const {
-  return idx[0] * 10000000 + idx[1] * max_x_ + idx[2];
+void Astar::InitAccessor(double threshold, int layers, int rows, int columns,
+                         double resolution, double weight, CellReader reader) {
+  timed_out_ = false;
+  search_result_.clear();
+  sparse_nodes_.clear();
+  grid_map_.clear();
+  cost_threshold_ = threshold;
+  max_layers_ = layers; max_y_ = rows; max_x_ = columns;
+  resolution_ = resolution; step_cost_weight_ = weight;
+  reader_ = std::move(reader);
+  search_layers_offset_ = {0};
+  for (int i = 1; i <= layers; ++i) {
+    search_layers_offset_.push_back(-i);
+    search_layers_offset_.push_back(i);
+  }
+}
+
+Node* Astar::NodeAt(int layer, int row, int column) const {
+  if (!reader_) return const_cast<Node*>(&grid_map_[layer][row][column]);
+  const auto key = GetHash(Eigen::Vector3i(layer, row, column));
+  auto found = sparse_nodes_.find(key);
+  if (found != sparse_nodes_.end()) return found->second.get();
+  const auto value = reader_(layer, row, column);
+  auto node = std::make_unique<Node>(Eigen::Vector3i(
+      static_cast<int>(value[1] / resolution_), row, column), nullptr);
+  node->cost = value[0]; node->height = value[1]; node->ele = value[2]; node->layer = layer;
+  auto* result = node.get();
+  sparse_nodes_.emplace(key, std::move(node));
+  return result;
+}
+
+std::int64_t Astar::GetHash(const Eigen::Vector3i& idx) const {
+  return static_cast<std::int64_t>(idx[0]) * max_y_ * max_x_ +
+         static_cast<std::int64_t>(idx[1]) * max_x_ + idx[2];
 }
 
 
@@ -106,8 +151,19 @@ bool Astar::IsValidNodeCoord(int layer, int y, int x) const {
 }
 
 
+void Astar::SetTimeLimit(double seconds) {
+  if (!std::isfinite(seconds) || seconds < 0.)
+    throw std::invalid_argument("A* time limit must be finite and nonnegative");
+  time_limit_seconds_ = seconds;
+}
+
 bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
   auto t0 = std::chrono::high_resolution_clock::now();
+  const auto began = std::chrono::steady_clock::now();
+  timed_out_ = false;
+  blocked_edges_.clear();
+
+  if (reader_) Reset();
 
   if (!search_result_.empty()) {
     Reset();
@@ -120,8 +176,8 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
     return false;
   }
   
-  auto start_node = &grid_map_[start[0]][start[2]][start[1]];
-  auto goal_node = &grid_map_[goal[0]][goal[2]][goal[1]];
+  auto start_node = NodeAt(start[0],start[2],start[1]);
+  auto goal_node = NodeAt(goal[0],goal[2],goal[1]);
   start_node->g = 0.0;
 
   if (goal_node->cost > cost_threshold_) {
@@ -131,14 +187,21 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
   // 优先队列（open_set）：按节点的f值（g+h）从小到大排序（通过NodeCompare实现）
   std::priority_queue<Node*, std::vector<Node*>, NodeCompare> open_set;
   // 哈希表（closed_set）：存储已处理的节点（避免重复访问）
-  std::unordered_map<int, Node*> closed_set;
+  std::unordered_map<std::int64_t, Node*> closed_set;
 
   open_set.push(start_node);  // 起点加入开放集
 
   printf("start searching\n");
 
   Node* best_node = start_node;
+  std::size_t iterations = 0;
   while (!open_set.empty()) {
+    if ((iterations++ & 63) == 0 && time_limit_seconds_ > 0. &&
+        std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count() >= time_limit_seconds_) {
+      timed_out_ = true;
+      search_result_.clear();
+      return false;
+    }
     // 步骤1：从开放集取出 f 值最小的节点（当前节点）
     Node* current_node = open_set.top();
     open_set.pop();
@@ -178,20 +241,22 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
         continue;
       }
       // 获取邻居节点（基于当前层layer），这个节点在grid_map中会被赋予权重，即costmap的cost
-      auto neighbor_node = &grid_map_[layer][i][j];
+      auto neighbor_node = NodeAt(layer,i,j);
 
       // 检查邻居节点是否可通行
-      if (neighbor_node->cost > cost_threshold_) {
-        // 若成本超过阈值，但ele值较大（可能是特殊地形），进一步检查高度差
-        if (abs(neighbor_node->ele) < 0.5 ) {
-          continue;// ele值小，直接视为不可通行
-        } else {
-          // ele值大，但高度差超过0.3也视为不可通行
-          if (std::abs(neighbor_node->height - current_node->height) > 0.3) {
-            continue;
-          }
+      if (neighbor_node->cost > cost_threshold_ &&
+          (abs(neighbor_node->ele) < 0.5 ||
+           std::abs(neighbor_node->height - current_node->height) > 0.3)) {
+        if (blocked_edge_radius_ > 0 && blocked_edges_.size() < 256 &&
+            std::hypot(double(i) - start[2], double(j) - start[1]) <= blocked_edge_radius_ &&
+            (double(i) - start[2]) * (double(goal[2]) - start[2]) +
+            (double(j) - start[1]) * (double(goal[1]) - start[1]) > 0.) {
+          const auto& from = current_node->idx;
+          blocked_edges_.try_emplace(GetHash(Eigen::Vector3i(layer, i, j)),
+              std::array<int, 6>{layer, i, j, current_node->layer, from[1], from[2]});
         }
-      }       
+        continue;
+      }
       // 计算当前节点到邻居节点的代价
       auto diff = neighbor_node->idx - current_node->idx;// 坐标差      
       double step_cost = step_cost_weight_ * neighbor_node->cost;
@@ -251,7 +316,7 @@ int Astar::DecideLayer(const Node* cur_node) const {
   double cur_height = cur_node->height;
 
   int best_layer = original_layer;
-  double min_cost = grid_map_[original_layer][i][j].cost;  // 初始化为当前图层的代价
+  double min_cost = NodeAt(original_layer,i,j)->cost;
 
   // 遍历多层偏移（扩大图层搜索范围）
   for (const auto offset : search_layers_offset_) {
@@ -264,13 +329,13 @@ int Astar::DecideLayer(const Node* cur_node) const {
 
     // 获取当前搜索节点
     // const Node& search_node = grid_map_[cur_layer][ni][nj];
-    const Node& search_node = grid_map_[cur_layer][i][j];
+    const Node& search_node = *NodeAt(cur_layer,i,j);
 
     // 筛选：高度差需在合理范围内（避免高度突变）
     if (std::abs(search_node.height - cur_height) > 0.2) {
       continue;
     //便免越界得到空的值
-    }else if (search_node.cost > cost_threshold_ || search_node.cost <=0) {
+    }else if (search_node.cost > cost_threshold_ || search_node.cost < 0) {
       continue;
     }
 
@@ -370,7 +435,7 @@ Eigen::MatrixXd Astar::GetResultMatrix() const {
 }
 
 void Astar::ConvertClosedSetToMatrix(
-    const std::unordered_map<int, Node*>& closed_set) {
+    const std::unordered_map<std::int64_t, Node*>& closed_set) {
   visited_set_ = Eigen::MatrixXi(closed_set.size(), 3);
   int count = 0;
   for (auto i = closed_set.begin(); i != closed_set.end(); ++i) {
@@ -389,7 +454,7 @@ Eigen::MatrixXd Astar::GetCostLayer(int layer) const {
   Eigen::MatrixXd cost_layer(max_y_, max_x_);
   for (int i = 0; i < max_y_; ++i) {
     for (int j = 0; j < max_x_; ++j) {
-      cost_layer(i, j) = grid_map_[layer][i][j].cost;
+      cost_layer(i, j) = NodeAt(layer,i,j)->cost;
     }
   }
   return cost_layer;
@@ -399,7 +464,7 @@ Eigen::MatrixXd Astar::GetEleLayer(int layer) const {
   Eigen::MatrixXd ele_layer(max_y_, max_x_);
   for (int i = 0; i < max_y_; ++i) {
     for (int j = 0; j < max_x_; ++j) {
-      ele_layer(i, j) = grid_map_[layer][i][j].ele;
+      ele_layer(i, j) = NodeAt(layer,i,j)->ele;
     }
   }
   return ele_layer;

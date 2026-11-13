@@ -2,8 +2,11 @@
 """Coordinate GO2 stand-up, SCAN plan acceptance and RL activation."""
 import math
 import time
+import json
+from collections import deque
 
 import rclpy
+from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.executors import ExternalShutdownException
 try:
@@ -12,9 +15,81 @@ except ImportError:  # Jazzy exposes the underlying shutdown error as RuntimeErr
     RCLError = RuntimeError
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
-from scan_planner.msg import Bspline
+from scan_planner.msg import Bspline, GoalRequest
 from sensor_msgs.msg import JointState, PointCloud2
-from std_msgs.msg import Bool, Int32
+from std_msgs.msg import Bool, Int32, String
+
+
+class PoseSettling:
+    """Measure motion from fresh, distinct body poses, never odometry twist."""
+    def __init__(self, window, stable_seconds, max_speed, max_angular_speed,
+                 max_tilt, timeout):
+        self.window = window
+        self.stable_seconds = stable_seconds
+        self.max_speed = max_speed
+        self.max_angular_speed = max_angular_speed
+        self.max_tilt = max_tilt
+        self.timeout = timeout
+        self.samples = deque()
+        self.received = None
+        self.stable_since = None
+        self.frame = None
+        self.speed = self.angular_speed = self.tilt = None
+
+    def invalidate(self):
+        self.samples.clear()
+        self.stable_since = None
+        self.speed = self.angular_speed = self.tilt = None
+
+    def update(self, stamp, position, quaternion, frame, received):
+        if self.samples and stamp == self.samples[-1][0]:
+            return  # Replayed poses must not refresh the physical-stop evidence.
+        if (self.samples and (stamp < self.samples[-1][0] or
+                stamp - self.samples[-1][0] > self.timeout or
+                received - self.received > self.timeout or frame != self.frame)):
+            self.invalidate()
+        self.received, self.frame = received, frame
+        self.samples.append((stamp, position, quaternion))
+        while len(self.samples) > 2 and stamp - self.samples[1][0] >= self.window:
+            self.samples.popleft()
+        # Use multiple baselines of at least half a window. Unlike net
+        # displacement alone this also detects motion that reverses direction.
+        rates = []
+        for old_stamp, old_position, old_quaternion in self.samples:
+            dt = stamp - old_stamp
+            if dt < self.window / 2:
+                continue
+            dot = min(1., abs(sum(a*b for a,b in zip(quaternion, old_quaternion))))
+            rates.append((math.dist(position, old_position) / dt,
+                          2 * math.acos(dot) / dt))
+        x, y, _, _ = quaternion
+        self.tilt = math.acos(max(-1., min(1., 1 - 2*(x*x + y*y))))
+        if not rates:
+            self.stable_since = None
+            return
+        self.speed = max(v for v, _ in rates)
+        self.angular_speed = max(w for _, w in rates)
+        if (self.speed <= self.max_speed and self.angular_speed <= self.max_angular_speed
+                and self.tilt <= self.max_tilt):
+            if self.stable_since is None:
+                self.stable_since = stamp
+        else:
+            self.stable_since = None
+
+    def reason(self, now):
+        if self.received is None or now - self.received > self.timeout:
+            return 'body_pose_stale'
+        if self.speed is None:
+            return 'body_pose_window_incomplete'
+        if self.speed > self.max_speed:
+            return 'body_still_moving'
+        if self.angular_speed > self.max_angular_speed:
+            return 'body_still_rotating'
+        if self.tilt > self.max_tilt:
+            return 'body_tilt_exceeds_limit'
+        if self.stable_since is None or self.samples[-1][0] - self.stable_since < self.stable_seconds:
+            return 'body_settling'
+        return 'ready'
 
 
 class DemoSequencer(Node):
@@ -25,6 +100,26 @@ class DemoSequencer(Node):
         self.pulse_seconds = float(self.declare_parameter('mode_pulse_seconds', 1.0).value)
         self.goal_settle_seconds = max(
             0.0, float(self.declare_parameter('goal_settle_seconds', 1.5).value))
+        def positive_parameter(name, default):
+            value = float(self.declare_parameter(name, default).value)
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError('%s must be finite and positive' % name)
+            return value
+        self.stand_stable_seconds = positive_parameter('stand_stable_seconds', .5)
+        self.feedback_timeout = positive_parameter('stand_feedback_timeout', .3)
+        self.command_epsilon = positive_parameter('stand_cmd_epsilon', .001)
+        self.settling = PoseSettling(
+            positive_parameter('stand_motion_window', .2), self.stand_stable_seconds,
+            positive_parameter('stand_max_linear_speed', .03),
+            positive_parameter('stand_max_angular_speed', .10),
+            positive_parameter('stand_max_tilt', math.radians(10.)), self.feedback_timeout)
+        if self.settling.window >= self.feedback_timeout:
+            raise ValueError('stand_motion_window must be less than stand_feedback_timeout')
+        self.task_active = False
+        self.command_received = self.command_zero_since = None
+        self.command_is_zero = False
+        self.stand_gate = 'execution_not_settled'
+        self.last_execution_status = None
         self.odom_topic = str(self.declare_parameter(
             'odom_topic', '/fast_lio/odometry_base').value)
         self.cloud_topic = str(self.declare_parameter(
@@ -34,6 +129,12 @@ class DemoSequencer(Node):
         self.joint_seen = self.odom_seen = self.cloud_seen = self.plan_seen = False
         self.plan_ready_source_seen = False
         self.mission_complete = False
+        self.navigation_stamp = 0
+        self.navigation_active = False
+        self.walking_active = False
+        self.recovery_stamp = 0
+        self.last_recovery_stamp = 0
+        self.navigation_enabled = False
         self.state = 'waiting_for_joint_states'
         self.state_started = time.monotonic()
         self.last_wait_log = 0.0
@@ -42,13 +143,27 @@ class DemoSequencer(Node):
         latched.reliability = ReliabilityPolicy.RELIABLE
         latched.durability = DurabilityPolicy.TRANSIENT_LOCAL
         self.mode_pub = self.create_publisher(Int32, '/go2/control_mode', 10)
+        self.action_enabled_pub = self.create_publisher(
+            String, '/scan/recovery_action_enabled', 10)
+        self.create_subscription(
+            String, '/scan/recovery_action_state', self.on_recovery_action, 10)
         self.ready_pub = self.create_publisher(Bool, '/go2/demo_ready', latched)
+        self.execution_status_pub = self.create_publisher(String, '/go2/execution_state', latched)
+        self.create_subscription(Bool, '/exploration/task_active', self.on_task_active, latched)
+        self.create_subscription(Twist, '/cmd_vel', self.on_command, qos_profile_sensor_data)
         self.create_subscription(JointState, '/joint_states', self.on_joint, qos_profile_sensor_data)
         self.create_subscription(
             Odometry, self.odom_topic, self.on_odom, qos_profile_sensor_data)
         self.create_subscription(
             PointCloud2, self.cloud_topic, self.on_cloud, qos_profile_sensor_data)
         self.create_subscription(Bspline, '/scan/planning/bspline', self.on_plan, 10)
+        self.create_subscription(PoseStamped, '/scan/goal', self.on_navigation_goal, 10)
+        # The extended command is the same stamped navigation-start event.
+        # Reuse the existing idle/gait policy; never publish a second pose command.
+        self.create_subscription(GoalRequest, '/scan/goal_request',
+                                 lambda request: self.on_navigation_goal(request.target), 10)
+        self.create_subscription(PoseStamped, '/scan/goal_stop_ack', self.on_stop_ack, 10)
+        self.create_subscription(String, '/scan/goal_plan_failed', self.on_navigation_failure, 10)
         self.create_subscription(Bool, '/scan/plan_ready', self.on_plan_ready, latched)
         self.create_subscription(Bool, '/scan/mission_complete', self.on_complete, latched)
         self.create_timer(0.05, self.tick)
@@ -70,12 +185,71 @@ class DemoSequencer(Node):
                           and all(math.isfinite(v) for v in values)
                           and max(abs(p.x), abs(p.y), abs(p.z)) <= 10000.0
                           and 0.5 <= q_norm <= 1.5)
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if (not self.odom_seen or stamp <= 0 or
+                abs(self.get_clock().now().nanoseconds * 1e-9 - stamp) > self.feedback_timeout):
+            self.settling.invalidate()
+            return
+        self.settling.update(stamp, (p.x, p.y, p.z),
+                             tuple(v/q_norm for v in (q.x, q.y, q.z, q.w)),
+                             msg.header.frame_id, time.monotonic())
+
+    def on_command(self, msg):
+        now = time.monotonic()
+        values = (msg.linear.x, msg.linear.y, msg.linear.z,
+                  msg.angular.x, msg.angular.y, msg.angular.z)
+        zero = all(math.isfinite(v) and abs(v) <= self.command_epsilon for v in values)
+        if not zero:
+            self.command_zero_since = None
+        elif (not self.command_is_zero or self.command_received is None or
+              now - self.command_received > self.feedback_timeout):
+            self.command_zero_since = now
+        self.command_is_zero, self.command_received = zero, now
+
+    def on_task_active(self, msg):
+        if self.task_active == bool(msg.data):
+            return
+        self.task_active = bool(msg.data)
+        if not self.navigation_enabled:
+            return
+        if self.task_active and self.state in ('settling_at_goal', 'stop_pulse', 'complete'):
+            # A lifecycle signal only holds walking; it never activates RL.
+            self.enter('waiting_for_scan_plan')
+        elif not self.task_active and not self.navigation_active and not self.recovery_stamp:
+            if self.mission_complete:
+                self.begin_idle()
+
+    def stand_reason(self):
+        if self.task_active:
+            return 'exploration_active'
+        if self.navigation_active or self.recovery_stamp or not self.mission_complete:
+            return 'execution_not_settled'
+        now = time.monotonic()
+        if self.command_received is None or now - self.command_received > self.feedback_timeout:
+            return 'command_stale'
+        if not self.command_is_zero:
+            return 'command_not_zero'
+        if self.command_zero_since is None or now - self.command_zero_since < self.stand_stable_seconds:
+            return 'zero_command_settling'
+        return self.settling.reason(now)
+
+    def publish_execution_status(self):
+        data = json.dumps({'state': self.state, 'task_active': self.task_active,
+                           'navigation_active': self.navigation_active,
+                           'recovery_active': bool(self.recovery_stamp),
+                           'walking_active': self.walking_active, 'stand_gate': self.stand_reason(),
+                           'linear_speed': self.settling.speed,
+                           'angular_speed': self.settling.angular_speed,
+                           'tilt': self.settling.tilt}, allow_nan=False)
+        if data != self.last_execution_status:
+            self.execution_status_pub.publish(String(data=data))
+            self.last_execution_status = data
 
     def on_cloud(self, msg):
         self.cloud_seen = bool(msg.header.frame_id) and msg.width * msg.height > 0
 
     def on_plan(self, msg):
-        if self.plan_ready_source_seen:
+        if self.recovery_stamp or self.plan_ready_source_seen or self.mission_complete:
             # Once a waypoint coordinator is present, only its goal-matched
             # plan_ready acknowledgment may arm RL walking. A delayed spline
             # from the preceding target is not permission to move.
@@ -85,21 +259,115 @@ class DemoSequencer(Node):
             self.plan_seen = True
 
     def on_plan_ready(self, msg):
+        if self.recovery_stamp or self.mission_complete:
+            return
         self.plan_ready_source_seen = True
         self.plan_seen = bool(msg.data)
 
     def on_complete(self, msg):
-        self.mission_complete = bool(msg.data)
-        if not self.mission_complete and self.state in (
-                'complete', 'settling_at_goal', 'stop_pulse'):
-            self.plan_seen = False
-            self.get_logger().info('New waypoint mission: waiting for a fresh SCAN trajectory')
+        if self.recovery_stamp:
+            return
+        # Bool completion has no goal identity. Once /scan/goal is available,
+        # only its matching stop/failure acknowledgment may finish the task.
+        if self.navigation_stamp:
+            return
+        if msg.data:
+            self.finish_navigation()
+        elif not self.navigation_active:
+            was_idle = self.mission_complete
+            self.navigation_active = True
+            self.mission_complete = False
+            if was_idle:
+                self.plan_seen = False
+            if self.navigation_enabled:
+                self.enter('waiting_for_scan_plan')
+
+    def on_navigation_goal(self, msg):
+        # A new navigation goal can preempt an action. Its completion=False
+        # may arrive before the adapter's action-finished event, so release
+        # the recovery gate using the goal's own identity first.
+        stamp = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        if stamp and stamp <= max(self.navigation_stamp, self.last_recovery_stamp):
+            return
+        self.navigation_stamp = stamp
+        self.recovery_stamp = 0
+        self.navigation_active = True
+        self.mission_complete = False
+        self.plan_seen = False
+        if self.navigation_enabled:
+            # Receiving a task cancels idle immediately, including while its
+            # planner is still working and /cmd_vel is temporarily zero.
             self.enter('waiting_for_scan_plan')
+
+    def finish_navigation(self):
+        if self.mission_complete and not self.navigation_active:
+            return
+        self.navigation_active = False
+        self.mission_complete = True
+        self.plan_seen = False
+        if self.navigation_enabled:
+            self.begin_idle()
+
+    def on_stop_ack(self, msg):
+        stamp = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        if self.navigation_active and not self.recovery_stamp and stamp == self.navigation_stamp:
+            self.finish_navigation()
+
+    def on_navigation_failure(self, msg):
+        fields = msg.data.split('|', 1)
+        if len(fields) != 2 or not fields[0].isascii() or not fields[0].isdigit():
+            return
+        if (self.navigation_active and not self.recovery_stamp and
+                int(fields[0]) == self.navigation_stamp):
+            # SCAN latches zero before sending this terminal failure.
+            self.finish_navigation()
+
+    def begin_idle(self):
+        if self.task_active:
+            # Planning, mapping and recovery waits are part of the same task.
+            if self.state != 'waiting_for_scan_plan':
+                self.enter('waiting_for_scan_plan')
+            return
+        if not self.walking_active:
+            # Mode 2 toggles stand -> crouch once already standing. An
+            # already-reached goal must not send another stand pulse.
+            self.enter('complete')
+        elif self.state != 'settling_at_goal':
+            self.get_logger().info(
+                'Task idle: waiting at least %.2fs and for physical settling before stand' %
+                self.goal_settle_seconds)
+            self.enter('settling_at_goal')
+
+    def on_recovery_action(self, msg):
+        # Recovery starts only after the normal startup sequence. Repeated
+        # announcements are intentional; stale requests never reactivate RL.
+        if not self.navigation_enabled:
+            return
+        fields = msg.data.split('|')
+        if len(fields) != 2 or not fields[0].isascii() or not fields[0].isdigit():
+            return
+        stamp = int(fields[0])
+        if fields[1] == 'accepted':
+            if stamp <= max(self.last_recovery_stamp, self.navigation_stamp):
+                return
+            self.last_recovery_stamp = stamp
+            self.recovery_stamp = stamp
+            self.mission_complete = False
+            self.navigation_active = False
+            self.plan_seen = False
+            self.enter('recovery_running' if self.walking_active else 'recovery_rl_pulse')
+        elif fields[1] == 'finished' and stamp == self.recovery_stamp:
+            self.recovery_stamp = 0
+            self.mission_complete = True
+            self.plan_seen = False
+            self.begin_idle()
 
     def publish_mode(self, mode):
         self.mode_pub.publish(Int32(data=mode))
+        self.walking_active = mode == 3
 
     def tick(self):
+        self.publish_execution_status()
         elapsed = time.monotonic() - self.state_started
         if self.state == 'waiting_for_joint_states':
             if self.joint_seen:
@@ -122,6 +390,7 @@ class DemoSequencer(Node):
                 self.enter('waiting_for_navigation_inputs')
         elif self.state == 'waiting_for_navigation_inputs':
             if self.odom_seen and self.cloud_seen:
+                self.navigation_enabled = True
                 self.ready_pub.publish(Bool(data=True))
                 self.get_logger().info(
                     '%s ready: enabling SCAN waypoint mission' % self.localization_label)
@@ -133,37 +402,49 @@ class DemoSequencer(Node):
                     '(topics: %s, %s)' %
                     (self.localization_label, self.odom_seen, self.cloud_seen,
                      self.odom_topic, self.cloud_topic))
+        elif self.state == 'recovery_rl_pulse':
+            self.publish_mode(3)
+            if elapsed >= self.pulse_seconds:
+                self.enter('recovery_running')
+                self.action_enabled_pub.publish(String(data=str(self.recovery_stamp)))
+        elif self.state == 'recovery_running':
+            # A lease prevents motion if this coordinator disappears.
+            self.action_enabled_pub.publish(String(data=str(self.recovery_stamp)))
         elif self.state == 'waiting_for_scan_plan':
             self.ready_pub.publish(Bool(data=True))
             if self.mission_complete:
                 # An already-reached nearby goal needs no new spline. Never
                 # pulse RL walking after the execution adapter confirmed stop.
-                self.enter('stop_pulse')
+                self.begin_idle()
             elif self.plan_seen:
-                self.get_logger().info('SCAN trajectory accepted: enabling configured RL walking policy')
-                self.enter('rl_pulse')
+                if self.walking_active:
+                    self.enter('running')
+                else:
+                    self.get_logger().info('SCAN trajectory accepted: enabling configured RL walking policy')
+                    self.enter('rl_pulse')
         elif self.state == 'rl_pulse':
             if self.mission_complete:
-                self.enter('stop_pulse')
+                self.begin_idle()
                 return
             self.publish_mode(3)
             if elapsed >= self.pulse_seconds:
                 self.enter('running')
         elif self.state == 'running' and self.mission_complete:
-            # The execution adapter has already latched cmd_vel to zero. Keep
-            # the learned gait active briefly so all swing legs can touch down
-            # before fixed-stand starts interpolating joint positions. An
-            # immediate mode switch makes the body visibly rock once for gait
-            # arrest and again for stand-pose interpolation.
-            self.get_logger().info(
-                'Waypoint mission complete: holding zero command for %.2fs before fixed stand' %
-                self.goal_settle_seconds)
-            self.enter('settling_at_goal')
+            self.begin_idle()
         elif self.state == 'settling_at_goal':
-            if elapsed >= self.goal_settle_seconds:
-                self.get_logger().info('Goal gait settled: returning to fixed stand')
+            reason = self.stand_reason()
+            if elapsed >= self.goal_settle_seconds and reason == 'ready':
+                self.get_logger().info('Task idle and body settled: returning to fixed stand')
                 self.enter('stop_pulse')
+            elif reason != self.stand_gate:
+                self.get_logger().info('Fixed stand deferred: %s' % reason)
+            self.stand_gate = reason
         elif self.state == 'stop_pulse':
+            if self.walking_active and self.stand_reason() != 'ready':
+                # Recheck immediately before the first mode-2 command. Once
+                # sent, the controller owns completion of its interpolation.
+                self.enter('settling_at_goal')
+                return
             self.publish_mode(2)
             if elapsed >= self.pulse_seconds:
                 if self.mission_complete:

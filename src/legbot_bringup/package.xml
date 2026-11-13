@@ -25,6 +25,8 @@
 <depend>controller_manager</depend>
 <depend>go2_description</depend>
 <depend>rclpy</depend>
+<test_depend>ament_index_python</test_depend>
+<test_depend>python3-yaml</test_depend>
 <depend>control_input_msgs</depend>
 <depend>tf2_sensor_msgs</depend>
 <exec_depend>pct_planner</exec_depend><exec_depend>scan_planner</exec_depend><exec_depend>ego_planner</exec_depend><exec_depend>fast_lio</exec_depend><exec_depend>gz_quadruped_hardware</exec_depend><exec_depend>rl_quadruped_controller</exec_depend>

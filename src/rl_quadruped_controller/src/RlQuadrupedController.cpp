@@ -159,6 +159,7 @@ namespace rl_quadruped_controller
             stand_pos_ = auto_declare<std::vector<double>>("stand_pos", stand_pos_);
             stand_kp_ = auto_declare<double>("stand_kp", stand_kp_);
             stand_kd_ = auto_declare<double>("stand_kd", stand_kd_);
+            stand_transition_seconds_ = auto_declare<double>("stand_transition_seconds", stand_transition_seconds_);
 
             get_node()->get_parameter("update_rate", ctrl_interfaces_.frequency_);
             RCLCPP_INFO(get_node()->get_logger(), "Controller Update Rate: %d Hz", ctrl_interfaces_.frequency_);
@@ -275,7 +276,8 @@ namespace rl_quadruped_controller
         // Create FSM List
         state_list_.passive = std::make_shared<StatePassive>(ctrl_interfaces_);
         state_list_.fixedDown = std::make_shared<StateFixedDown>(ctrl_interfaces_, down_pos_, stand_kp_, stand_kd_);
-        state_list_.fixedStand = std::make_shared<StateFixedStand>(ctrl_interfaces_, stand_pos_, stand_kp_, stand_kd_);
+        state_list_.fixedStand = std::make_shared<StateFixedStand>(
+            ctrl_interfaces_, stand_pos_, stand_kp_, stand_kd_, stand_transition_seconds_);
         state_list_.rl = std::make_shared<StateRL>(ctrl_interfaces_, ctrl_component_, stand_pos_);
 
         // Initialize FSM

@@ -270,7 +270,13 @@ private:
     transform.transform.rotation.z = rotation.z();
     transform.transform.rotation.w = rotation.w();
     Cloud output;
-    tf2::doTransform(input, output, transform);
+    // Near-range filtering may remove every point; tf2's XYZ iterators require
+    // nonempty storage even when no loop iterations would be performed.
+    if (input.width && input.height && !input.data.empty()) {
+      tf2::doTransform(input, output, transform);
+    } else {
+      output = input;
+    }
     output.header.stamp = input.header.stamp;
     output.header.frame_id = global_frame_;
     cloud_pub_->publish(output);

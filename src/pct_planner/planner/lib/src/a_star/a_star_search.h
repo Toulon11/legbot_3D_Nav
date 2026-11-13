@@ -1,6 +1,10 @@
 #pragma once
 
 #include <Eigen/Core>
+#include <array>
+#include <cstdint>
+#include <functional>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -54,10 +58,23 @@ class Astar {
     };
   }
   ~Astar() = default;
+  Astar(const Astar&) = delete;
+  Astar& operator=(const Astar&) = delete;
 
   void Init(const double cost_threshold, const int num_layers,
             const double resolution, const double step_cost_weight,  const Eigen::MatrixXd& cost_map,
             const Eigen::MatrixXd& height_map, const Eigen::MatrixXd& ele_map);
+
+  // Online maps can lend a read accessor instead of materialising dense
+  // Eigen matrices. Only visited search nodes are allocated, per search.
+  using CellReader = std::function<std::array<double, 3>(int, int, int)>;
+  void InitAccessor(double cost_threshold, int num_layers, int rows, int columns,
+                    double resolution, double step_cost_weight, CellReader reader);
+  std::size_t GetSearchNodeCount() const { return sparse_nodes_.size(); }
+  void SetTimeLimit(double seconds);
+  bool TimedOut() const { return timed_out_; }
+  void SetBlockedEdgeRadius(int cells) { blocked_edge_radius_ = cells; }
+  const auto& GetBlockedEdges() const { return blocked_edges_; }
 
   void Reset();
 
@@ -74,11 +91,16 @@ class Astar {
   Eigen::MatrixXd GetEleLayer(int layer) const;
 
  private:
+  double time_limit_seconds_ = 0.; // Original API is unlimited unless requested.
+  bool timed_out_ = false;
+  int blocked_edge_radius_ = 0;
+  std::unordered_map<std::int64_t, std::array<int, 6>> blocked_edges_;
   double CalculateStepCost(const Node* node1, const Node* node2) const;
 
   int DecideLayer(const Node* cur_node) const;
 
-  int GetHash(const Eigen::Vector3i& idx) const;
+  std::int64_t GetHash(const Eigen::Vector3i& idx) const;
+  Node* NodeAt(int layer, int row, int column) const;
 
   std::vector<Eigen::Vector3i> GetNeighbors(Node* node) const;
 
@@ -90,7 +112,7 @@ class Astar {
                     std::vector<PathPoint>& path_points);
 
   void ConvertClosedSetToMatrix(
-      const std::unordered_map<int, Node*>& closed_set);
+      const std::unordered_map<std::int64_t, Node*>& closed_set);
 
   double GetNeighborAverageCost(const Node* node1);
 
@@ -110,6 +132,8 @@ class Astar {
   int xy_size_ = 0;
   double resolution_ = 0;
   MultiLayerGridMap grid_map_;
+  CellReader reader_;
+  mutable std::unordered_map<std::int64_t, std::unique_ptr<Node>> sparse_nodes_;
   double cost_threshold_ = 35;
   double step_cost_weight_ = 1.0;
 

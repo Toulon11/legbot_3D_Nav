@@ -1,6 +1,8 @@
 #include "a_star/a_star_search.h"
 #include "pybind11/eigen.h"
 #include "pybind11/pybind11.h"
+#include "pybind11/functional.h"
+#include "pybind11/stl.h"
 
 namespace py = pybind11;
 
@@ -17,6 +19,12 @@ PYBIND11_MODULE(a_star, m) {
       .def(py::init<HeuristicType>(),
            py::arg("h_type") = HeuristicType::kDiagonal)
       .def("init", &Astar::Init)
+      .def("init_accessor", &Astar::InitAccessor)
+      .def("get_search_node_count", &Astar::GetSearchNodeCount)
+      .def("set_time_limit", &Astar::SetTimeLimit)
+      .def("timed_out", &Astar::TimedOut)
+      .def("set_blocked_edge_radius", &Astar::SetBlockedEdgeRadius)
+      .def("get_blocked_edges", &Astar::GetBlockedEdges)
       .def("search", &Astar::Search)
       .def("debug", &Astar::Debug)
       .def("get_result_matrix", &Astar::GetResultMatrix)

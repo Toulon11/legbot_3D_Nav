@@ -4,6 +4,7 @@ import pickle
 from pathlib import Path
 import numpy as np
 from scipy.interpolate import griddata  # 新增：用于XY坐标的高度插值
+from pct_layer_selection import rank_layers
 
 from utils import *
 
@@ -120,43 +121,24 @@ class TomogramPlanner(object):
     
 
     def match_best_layer(self, x, y, target_height):
-        """
-        迭代所有layer，找到与目标高度最匹配的layer（核心方法）
-        :param x: 物理X坐标
-        :param y: 物理Y坐标
-        :param target_height: 目标高度（如start_pos/end_pos的z值）
-        :return: 最佳匹配的layer索引、该layer下XY对应的高度、高度差值
-        """
-        min_cost = float('inf')
-        best_layer = 0
+        """Choose the lowest-cost cut compatible with the endpoint height."""
+        if not self.n_slice:
+            return 0
+        grid_idx = self.pos2idx(np.array([x, y])).astype(int)
+        height, width = self.tomogram[0][0].shape
+        row = np.clip(grid_idx[1], 0, height - 1)
+        col = np.clip(grid_idx[0], 0, width - 1)
 
-        # 迭代所有layer（可优化：先粗筛再细查，减少迭代次数）
-        for layer_idx in range(self.n_slice):
-            # 获取该layer下XY对应的真实高度
-            layer_height = self.get_layer_height_by_xy(layer_idx, x, y)
-            # 跳过无效层
-            if layer_height == -100.0:
-                continue
-            # 计算高度差值（绝对值）
-            diff = abs(layer_height - target_height)
-            if diff > self.slice_dh :  
-                continue
-            # 先将物理XY坐标转换为网格索引（用于查costmap）
-            grid_idx = self.pos2idx(np.array([x, y])).astype(int)
-            height, width = self.tomogram[0][layer_idx].shape
-            # 安全地 clip 行和列索引
-            row = np.clip(grid_idx[1], 0, height - 1)
-            col = np.clip(grid_idx[0], 0, width - 1)
-            # 然后安全访问
-            layer_cost_ = self.tomogram[0][layer_idx][row][col]
-            #去除代价不存在的层级，即没有tomogram分析点云
-            if layer_cost_==0:
-                continue
-            # 更新最佳匹配
-            if layer_cost_ < min_cost:
-                min_cost = layer_cost_
-                best_layer = layer_idx
-        return best_layer
+        def read_height(layer):
+            ground = self.get_layer_height_by_xy(layer, x, y)
+            return float('nan') if ground == -100.0 else ground
+
+        def read_cost(layer):
+            cost = self.tomogram[0][layer][row][col]
+            return cost if cost != 0 else None
+
+        layers = rank_layers(range(self.n_slice), target_height, self.slice_dh, read_height, read_cost)
+        return layers[0] if layers else 0
         
     def initPlanner(self, trav, trav_gx, trav_gy, elev_g, elev_c):
         diff_t = trav[1:] - trav[:-1]

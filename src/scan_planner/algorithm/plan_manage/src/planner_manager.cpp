@@ -87,9 +87,16 @@ namespace scan_planner
     cout << "start: " << start_pt.transpose() << ", " << start_vel.transpose() << "\ngoal:" << local_target_pt.transpose() << ", " << local_target_vel.transpose()
          << endl;
 
-    if ((start_pt - local_target_pt).norm() < 0.2)
+    const double target_distance = (start_pt - local_target_pt).norm();
+    const bool short_segment = target_distance < 0.2;
+    // Arrival belongs to the FSM/executor and its per-goal tolerance. A short
+    // but unreached segment still needs an optimized, collision-checked path.
+    if (!start_pt.allFinite() || !local_target_pt.allFinite() || !start_vel.allFinite() ||
+        !start_acc.allFinite() || !local_target_vel.allFinite() ||
+        target_distance < 1e-6 || pp_.max_vel_ <= 0 || pp_.max_acc_ <= 0 ||
+        pp_.ctrl_pt_dist <= 0)
     {
-      cout << "Close to goal" << endl;
+      ROS_WARN("Invalid or degenerate local trajectory initialization.");
       continuous_failures_count_++;
       return false;
     }
@@ -108,7 +115,7 @@ namespace scan_planner
       start_end_derivatives.clear();
       flag_regenerate = false;
 
-      if (flag_first_call || flag_polyInit || flag_force_polynomial /*|| ( start_pt - local_target_pt ).norm() < 1.0*/) // Initial path generated from a min-snap traj by order.
+      if (short_segment || flag_first_call || flag_polyInit || flag_force_polynomial) // Short segments must not inherit a depleted previous spline.
       {
         flag_first_call = false;
         flag_force_polynomial = false;
@@ -118,7 +125,19 @@ namespace scan_planner
         double dist = (start_pt - local_target_pt).norm();
         double time = pow(pp_.max_vel_, 2) / pp_.max_acc_ > dist ? sqrt(dist / pp_.max_acc_) : (dist - pow(pp_.max_vel_, 2) / pp_.max_acc_) / pp_.max_vel_ + 2 * pp_.max_vel_ / pp_.max_acc_;
 
-        if (!flag_randomPolyTraj)
+        if (short_segment)
+        {
+          // Give the quintic enough time to move/brake; refinement below still
+          // enforces the configured physical limits after optimization.
+          time = std::max({time, 0.1, std::sqrt(6.0 * dist / pp_.max_acc_),
+                           2.0 * dist / pp_.max_vel_,
+                           2.0 * std::max(start_vel.norm(), local_target_vel.norm()) / pp_.max_acc_});
+          if (pp_.max_jerk_ > 0)
+            time = std::max(time, std::cbrt(60.0 * dist / pp_.max_jerk_));
+          ts = std::min(ts, time / 8.0);
+        }
+
+        if (short_segment || !flag_randomPolyTraj)
         {
           gl_traj = PolynomialTraj::one_segment_traj_gen(start_pt, start_vel, start_acc, local_target_pt, local_target_vel, Eigen::Vector3d::Zero(), time);
         }
@@ -140,10 +159,18 @@ namespace scan_planner
 
         double t;
         bool flag_too_far;
+        unsigned sample_attempts = 0;
         ts *= 1.5; // ts will be divided by 1.5 in the next
         do
         {
           ts /= 1.5;
+          if (++sample_attempts > 24 || !std::isfinite(time) || !std::isfinite(ts) ||
+              ts < 1e-6 || time / ts > 20000)
+          {
+            ROS_WARN("Local polynomial sampling exceeded initialization bounds.");
+            continuous_failures_count_++;
+            return false;
+          }
           point_set.clear();
           flag_too_far = false;
           Eigen::Vector3d last_pt = gl_traj.evaluate(0);

@@ -102,6 +102,7 @@ namespace rl_quadruped_controller
 
         double stand_kp_ = 80.0;
         double stand_kd_ = 3.5;
+        double stand_transition_seconds_ = 1.5;
         double feet_force_threshold_ = 20.0;
 
         std::unordered_map<

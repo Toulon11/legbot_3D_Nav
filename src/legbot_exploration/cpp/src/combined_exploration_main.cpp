@@ -40,7 +40,7 @@ int main(int argc, char **argv) {
       auto shared = std::make_shared<legbot_exploration::SharedLayerMap>();
       auto map_node = make_online_layer_map_node(shared);
       auto explorer_node = make_explorer_node(shared);
-      rclcpp::executors::SingleThreadedExecutor map_executor;
+      rclcpp::executors::MultiThreadedExecutor map_executor(rclcpp::ExecutorOptions{},2);
       rclcpp::executors::SingleThreadedExecutor explorer_executor;
       map_executor.add_node(map_node);
       explorer_executor.add_node(explorer_node);

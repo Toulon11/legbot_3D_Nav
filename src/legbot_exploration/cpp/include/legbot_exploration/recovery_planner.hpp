@@ -1,7 +1,9 @@
 #pragma once
 
 #include "legbot_exploration/same_floor_route_planner.hpp"
+#include "legbot_exploration/pct_backend.hpp"
 
+#include <functional>
 #include <optional>
 #include <set>
 #include <string>
@@ -9,52 +11,57 @@
 
 namespace legbot_exploration {
 
-enum class RecoveryPhase { idle, nearby, turning, settling, history, blocked };
+struct PlanningSnapshot;
 
-// Tracks a physical failure episode. A different frontier in the same area
-// does not erase previous no-progress evidence.
-class RecoveryState {
- public:
-  explicit RecoveryState(int failure_limit = 3, double area_radius = 2.0);
-  void record_failure(const XY &position, const std::string &reason);
-  bool limit_reached() const { return failures_ >= failure_limit_; }
-  void start(const XY &position);
-  void finish();
-  bool active() const { return phase_ != RecoveryPhase::idle; }
-  int failures() const { return failures_; }
-  RecoveryPhase phase() const { return phase_; }
-  void set_phase(RecoveryPhase phase) { phase_ = phase; }
-  const std::string &reason() const { return reason_; }
-  bool mark_attempted(const XY &point);
-  bool tried(const XY &point) const;
-  void reset_attempts() { attempted_.clear(); }
-
- private:
-  int failure_limit_;
-  double area_radius_;
-  int failures_ = 0;
-  std::optional<XY> area_;
-  RecoveryPhase phase_ = RecoveryPhase::idle;
-  std::string reason_;
-  std::set<XY> attempted_;
+struct PctRecoveryConstraints {
+  std::optional<XY> floor;
+  std::optional<double> ascent;
+  std::vector<Point> contacts;
+  std::function<bool(const Point &)> permits_goal;
+  std::function<bool(const Point &)> permits_scan;
 };
 
-const char *recovery_phase_name(RecoveryPhase phase);
+struct PctRecoveryAction {
+  enum class Kind { scan, shift, reverse, delegate };
+  Kind kind;
+  Point position;
+  Point gap{};
+  double yaw=0.;
+};
 
-// Only recovery may propose a short, connectivity-unverified goal from a
-// blind start. Initial inflated overlap is allowed only while clearance
-// increases; newly swept obstacles and unknown cells still reject the route.
-// SCAN remains responsible for accepting and executing the actual motion.
-PlannedRoute plan_recovery_direct_route(
-    const std::unordered_map<Cell, int, CellHash> &grid,
-    const XY &start, const XY &target, const Settings &cfg,
-    const std::vector<XY> &scan_obstacles, double max_distance);
+std::optional<double> verified_short_recovery_stop(
+    const Point &start,const XY &target,const Point &stop,double yaw_error,bool partial_reverse=false);
+std::vector<XY> stair_recovery_repositions(
+    PctBackend &map,std::uint64_t version,const Point &base,const Point &forward,double yaw,double ascent,
+    double tread_height,double max_step,bool reverse,
+    const std::function<bool(const Point &,double)> &scan_inflated);
+std::optional<PctRecoveryAction> plan_pct_landing_shift(
+    const PlanningSnapshot &snapshot,std::uint64_t version,const XY &departure_floor,
+    double tread_height,double ascent);
 
-// A fixed-heading reverse manoeuvre. It may end inside the starting inflated
-// zone when clearance improves; every newly swept cell must be observed free.
-PlannedRoute plan_recovery_reverse_route(
-    const std::unordered_map<Cell, int, CellHash> &grid,
-    const XY &start, double yaw, const Settings &cfg,
-    const std::vector<XY> &scan_obstacles, double distance);
+// Select one action per call. Execution ownership and frontier accounting
+// stay with the caller, which refreshes blockers after each completed scan.
+class PctBlockerRecovery {
+ public:
+  std::optional<PctRecoveryAction> next(
+      const PlanningSnapshot &snapshot, std::uint64_t version, const Point &attitude,
+      const std::vector<PctUnknownBlocker> &blockers, const PctRecoveryConstraints &constraints,
+      bool can_move, const std::function<bool(const Point &)> &stance_clear,
+      const std::vector<Point> &review={});
+  std::optional<PctRecoveryAction> delegate(
+      const PlanningSnapshot &snapshot, std::uint64_t version,
+      const PctRecoveryConstraints &constraints, const std::vector<Point> &goals,
+      double arrival_tolerance);
+  void retry_delegates() { delegated_.clear(); }
+  std::optional<double> scan_heading(
+      PctBackend &map, std::uint64_t version, const Point &position, const Point &attitude,
+      const Point &gap, const std::vector<PctUnknownBlocker> &blockers, double body_height,
+      const PctRecoveryConstraints &constraints,bool review=false);
+
+ private:
+  std::set<std::array<long, 6>> scans_;
+  std::set<std::array<long, 5>> moves_;
+  std::vector<Point> delegated_;
+};
 
 }  // namespace legbot_exploration

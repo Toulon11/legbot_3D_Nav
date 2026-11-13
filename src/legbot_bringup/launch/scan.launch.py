@@ -109,7 +109,7 @@ def generate_launch_description():
             ('/move_base_simple/goal', '/scan/goal'),
         ]))
     actions.append(Node(package='scan_planner', executable='scan_go2_cmd_adapter', name='scan_go2_cmd_adapter', output="screen",
-        parameters=[config, {
+        parameters=[config, os.path.join(get_package_share_directory('legbot_bringup'), 'config', 'go2_execution.yaml'), {
             'max_vx': ParameterValue(LaunchConfiguration('max_vel'), value_type=float),
             'max_vy': ParameterValue(LaunchConfiguration('max_vy'), value_type=float),
             'max_vyaw': ParameterValue(LaunchConfiguration('max_vyaw'), value_type=float),

@@ -20,6 +20,7 @@
 #include <plan_env/grid_map.h>
 #include <scan_planner/msg/bspline.hpp>
 #include <scan_planner/msg/data_disp.hpp>
+#include <scan_planner/msg/goal_request.hpp>
 #include <plan_manage/planner_manager.h>
 #include <traj_utils/planning_visualization.h>
 
@@ -57,7 +58,8 @@ namespace scan_planner
     /* parameters */
     int navi_mode_; // 1 manual select, 2 hard code
     double no_replan_thresh_, replan_thresh_;
-    double finish_dist_, finish_dist_z_;
+    double finish_dist_, finish_dist_z_, default_finish_dist_;
+    bool request_reference_ = false;
     std::vector<Eigen::Vector3d> preset_waypoints_;
     int waypoint_num_;
     double planning_horizon_;
@@ -104,10 +106,12 @@ namespace scan_planner
     /* ROS utils */
     legbot::NodeHandle node_;
     legbot::Timer exec_timer_, safety_timer_;
-    legbot::Subscriber goal_sub_, odom_sub_, path_sub_, go2_execution_frozen_sub_;
+    legbot::Subscriber goal_request_sub_, goal_sub_, odom_sub_, path_sub_, go2_execution_frozen_sub_;
     legbot::Publisher replan_pub_, new_pub_, bspline_pub_, data_disp_pub_, self_inflation_pub_, goal_failure_pub_;
     std::uint64_t active_goal_stamp_ns_{0};
     bool active_goal_failure_sent_{false};
+    bool active_goal_reached_{false};
+    legbot::Publisher tolerance_status_pub_;
     void publishGoalFailure(const char *reason);
 
     /* helper functions */
@@ -127,6 +131,7 @@ namespace scan_planner
     bool isWaypointSequenceMode() const;
     bool advanceReferencePath();
     bool referenceGoalReached() const;
+    bool stopIfPointGoalReached();
     bool goalFloorMatches() const;
     bool checkGlobalTargetOccupancy();
     bool getLocalTarget();
@@ -139,6 +144,8 @@ namespace scan_planner
     /* ROS functions */
     void execFSMCallback(const legbot::TimerEvent &e);
     void checkCollisionCallback(const legbot::TimerEvent &e);
+    void goalRequestCallback(const scan_planner::msg::GoalRequest::ConstSharedPtr &msg);
+    void acceptGoal(const scan_planner::msg::GoalRequest &request);
     void rvizGoalCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr &msg);
     void waypointCallback(const nav_msgs::msg::Path::ConstSharedPtr &msg);
     nav_msgs::msg::Path::ConstSharedPtr pending_path_;

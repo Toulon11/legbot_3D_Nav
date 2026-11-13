@@ -1,6 +1,6 @@
 #pragma once
 
-#include "legbot_exploration/single_floor_exploration.hpp"
+#include "legbot_exploration/point_safety.hpp"
 
 #include <string>
 #include <unordered_map>
@@ -9,8 +9,16 @@
 namespace legbot_exploration {
 
 struct PlannedRoute {
-  std::vector<XY> points;  // Includes the start and an observed-free endpoint.
+  std::vector<XY> points;  // Occupancy includes start; native PCT points are kept as returned.
   std::string reason;
+  StartAdmission start_check;
+  PointSafetyResult goal_check;
+  SegmentSafetyResult failed_connection;
+  std::string failure_stage;
+  std::size_t expanded_nodes = 0;
+  std::size_t rejected_slope_edges = 0;
+  std::size_t rejected_corridor_edges = 0;
+  std::size_t rejected_missing_nodes = 0;
 };
 
 enum class WaypointSafety {
@@ -26,21 +34,6 @@ enum class WaypointSafety {
 WaypointSafety waypoint_footprint_safety(
     const XY &point, const std::unordered_map<Cell, int, CellHash> &grid,
     const Settings &cfg, const std::vector<XY> &inflated_scan_obstacles);
-
-// Candidate observation positions and recovery destinations. This function
-// never claims that a route to one of these positions exists.
-std::vector<XY> nearby_safe_viewpoints(
-    const std::unordered_map<Cell, int, CellHash> &grid, const XY &start,
-    const Settings &cfg, const std::vector<XY> &inflated_scan_obstacles,
-    double min_distance, double max_distance);
-
-// Select an observed, inflated-safe position from which the frontier is
-// visible. The route planners independently try to reach this exact position.
-std::vector<XY> observation_viewpoints(
-    const std::unordered_map<Cell, int, CellHash> &grid,
-    const XY &frontier, const Settings &cfg,
-    const std::vector<XY> &inflated_scan_obstacles,
-    double viewpoint_radius = 2.0);
 
 // Search only connected, observed-free cells and edges. Failure is reported
 // to the exploration controller; recovery is a separate planner's job.
