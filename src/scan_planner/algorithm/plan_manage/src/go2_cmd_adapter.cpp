@@ -107,6 +107,7 @@ struct MotionSample {double t;Eigen::Vector3d p;Eigen::Quaterniond q;};
 std::deque<MotionSample> motion_samples;
 double measured_linear_speed=std::numeric_limits<double>::infinity();
 double measured_angular_speed=std::numeric_limits<double>::infinity();
+Eigen::Vector3d measured_velocity=Eigen::Vector3d::Zero(),measured_rotation_rate=Eigen::Vector3d::Zero();
 bool rotate_only = false;
 int rotate_direction = 0;
 // Recovery actions own their execution watchdogs. The gait coordinator is the
@@ -726,8 +727,13 @@ void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg)
     const double dt=last.t-first.t;
     measured_linear_speed=measured_angular_speed=std::numeric_limits<double>::infinity();
     if(dt>=.16 && dt<=.5) {
-      measured_linear_speed=(last.p-first.p).norm()/dt;
-      measured_angular_speed=2.*std::acos(clamp(std::abs(first.q.dot(last.q)),0.,1.))/dt;
+      measured_velocity=(last.p-first.p)/dt;
+      measured_linear_speed=measured_velocity.norm();
+      Eigen::Quaterniond rotation=first.q.conjugate()*last.q;
+      if(rotation.w()<0)rotation.coeffs()*=-1.;
+      const Eigen::AngleAxisd change(rotation);
+      measured_rotation_rate=change.axis()*change.angle()/dt;
+      measured_angular_speed=measured_rotation_rate.norm();
     }
   }
   odom_yaw = yaw;
@@ -738,24 +744,39 @@ void odomCallback(const nav_msgs::msg::Odometry::ConstSharedPtr &msg)
 const char *stopName() {
   return stop_owner==StopOwner::goal?"goal":(stop_owner==StopOwner::turn?"turn":"reverse");
 }
-void reportStop(const char *phase) {
+void reportStop(const char *phase,bool force=false) {
   const auto now=legbot::Time::now();
-  if(std::string(phase)!="settled" && !stop_status_at.isZero() && (now-stop_status_at).toSec()<.1)return;
+  if(!force && std::string(phase)!="settled" && !stop_status_at.isZero() && (now-stop_status_at).toSec()<.1)return;
   stop_status_at=now;
   std::ostringstream out;out<<"{\"owner\":\""<<stopName()<<"\",\"phase\":\""<<phase
       <<"\",\"elapsed\":"<<(now-stop_started).toSec()<<",\"command_speed\":"<<std::hypot(last_motion_cmd.linear.x,last_motion_cmd.linear.y)
-      <<",\"command_yaw_speed\":"<<last_motion_cmd.angular.z;
-  if(std::isfinite(measured_linear_speed))out<<",\"actual_speed\":"<<measured_linear_speed;
-  if(std::isfinite(measured_angular_speed))out<<",\"actual_angular_speed\":"<<measured_angular_speed;
+      <<",\"command_yaw_speed\":"<<last_motion_cmd.angular.z
+      <<",\"command_velocity_xyz\":["<<last_motion_cmd.linear.x<<','<<last_motion_cmd.linear.y<<','<<last_motion_cmd.linear.z<<']'
+      <<",\"goal_id\":"<<current_goal_request.goal_id<<",\"attempt_id\":"<<current_goal_request.attempt_id
+      <<",\"action_stamp\":"<<(stop_owner==StopOwner::turn?turn_stamp:stop_owner==StopOwner::reverse?reverse_stamp:0)
+      <<",\"xy_distance\":"<<(latest_goal_pos.head<2>()-odom_pos.head<2>()).norm()
+      <<",\"xy_tolerance\":"<<finish_dist
+      <<",\"actual_position\":["<<odom_pos.x()<<','<<odom_pos.y()<<','<<odom_pos.z()<<']'
+      <<",\"stable_duration\":"<<(stop_stable_since.isZero()?0.:(now-stop_stable_since).toSec())
+      <<",\"required_stable_duration\":"<<stop_stable_seconds
+      <<",\"linear_threshold\":"<<stop_linear_threshold<<",\"angular_threshold\":"<<stop_angular_threshold
+      <<",\"stop_timeout\":"<<stop_timeout;
+  if(std::isfinite(measured_linear_speed))out<<",\"actual_speed\":"<<measured_linear_speed
+      <<",\"actual_velocity_xyz\":["<<measured_velocity.x()<<','<<measured_velocity.y()<<','<<measured_velocity.z()<<']';
+  if(std::isfinite(measured_angular_speed))out<<",\"actual_angular_speed\":"<<measured_angular_speed
+      <<",\"actual_rotation_rate_xyz\":["<<measured_rotation_rate.x()<<','<<measured_rotation_rate.y()<<','<<measured_rotation_rate.z()<<']';
   out<<'}';std_msgs::msg::String msg;msg.data=out.str();stop_status_pub.publish(msg);
+  ROS_INFO("[scan_go2_cmd_adapter] controlled_stop %s",msg.data.c_str());
 }
 void beginControlledStop(StopOwner owner) {
   if(stop_owner==owner)return;
   stop_owner=owner;stop_started=legbot::Time::now();stop_stable_since=stop_status_at=legbot::Time();
+  reportStop("started",true);
 }
 void processControlledStop() {
   const auto now=legbot::Time::now();
   if(!have_odom || (now-last_odom_time).toSec()>odom_timeout) {
+    reportStop("odometry_stale",true);
     if(stop_owner==StopOwner::goal)failNavigation("execution_stop_odometry_stale");
     else if(stop_owner==StopOwner::turn)finishTurn("turn_odometry_stale",false);
     else finishReverse("reverse_odometry_stale",false);
@@ -797,6 +818,7 @@ void processControlledStop() {
   }
   reportStop(quiet?"stabilizing":"braking");
   if((now-stop_started).toSec()>stop_timeout) {
+    reportStop("timeout",true);
     if(stop_owner==StopOwner::turn)finishTurn("turn_stop_timeout",false);
     else if(stop_owner==StopOwner::reverse)finishReverse("reverse_stop_timeout",false);
     else failNavigation("execution_stop_timeout");

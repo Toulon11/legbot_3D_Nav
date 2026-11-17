@@ -4,6 +4,7 @@ import weakref
 import time
 from collections import OrderedDict
 import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 
 def observation_effort(distance, gain):
@@ -71,7 +72,8 @@ class FrontierObservers:
             values = np.asarray(cells)
             lo, hi = entry['bounds']
             distance = np.linalg.norm(np.maximum(np.maximum(lo-values[:, :2], values[:, :2]-hi), 0), axis=1)
-            if ((distance <= index.radius / s.resolution + 1e-6) &
+            clearance=max(s.robot_radius+s.safety_margin,s.ground_lidar_min_range)+.15
+            if ((distance <= (index.radius+clearance)/s.resolution + 1e-6) &
                 (values[:, 2] >= entry['heights'][0]-s.step_max-1e-5) &
                 (values[:, 2] <= entry['heights'][1]+s.step_max+1e-5)).any():
                 self.drop(key)
@@ -103,6 +105,9 @@ class FrontierObservers:
             high = np.floor((hi+half)/b).astype(int)
             dependencies = set()
             choices = []
+            clearance_radius=max(s.robot_radius+s.safety_margin,s.ground_lidar_min_range)+.15
+            halo=math.ceil(clearance_radius/s.resolution)+1
+            from .map_costs import gather
             for bx in range(low[0], high[0]+1):
                 for by in range(low[1], high[1]+1):
                     dependency = k, bx, by
@@ -116,13 +121,22 @@ class FrontierObservers:
                     points = np.column_stack(((bx*b+ii)*s.resolution+s.origin_x,
                                               (by*b+jj)*s.resolution+s.origin_y, block['G'][ii, jj]))
                     costs = block['inflated_terrain_cost'][ii, jj]
+                    known=(gather(m,dependency,halo,'measured',False) &
+                           ~gather(m,dependency,halo,'unknown',True) &
+                           ~gather(m,dependency,halo,'solid',True))
+                    clearance=distance_transform_edt(known)[halo:halo+b,halo:halo+b]*s.resolution
+                    margins=clearance[ii,jj]
+                    for dx in (-1,0,1):
+                        for dy in (-1,0,1):
+                            dependencies.add((k,bx+dx,by+dy))
                     for offset in range(0, len(points), 256):
                         batch = points[offset:offset+256]
                         nearest = self.distances(batch, seeds, s.step_max)
                         keep = nearest <= index.radius+1e-8
                         if keep.any():
-                            choices.append(np.column_stack((batch[keep], nearest[keep], costs[offset:offset+256][keep])))
-            values = np.vstack(choices) if choices else np.empty((0, 5))
+                            choices.append(np.column_stack((batch[keep], nearest[keep],
+                                costs[offset:offset+256][keep],margins[offset:offset+256][keep])))
+            values = np.vstack(choices) if choices else np.empty((0, 6))
             cells=np.floor((values[:,:2]-[s.origin_x,s.origin_y])/s.resolution+.5).astype(int)
             cost_rows=[]
             for tile in {tuple(v) for v in cells//b}:
@@ -183,9 +197,18 @@ class FrontierObservers:
                 has_station = True
         return has_station
 
+    def station_cells(self, members, floor):
+        m=self._index().map
+        cells=set()
+        for (fid,k),group in self.groups(members).items():
+            xyz=self.candidates(fid,k,group)[:,:3]
+            cells.update(tuple(m.indices(p)) for p in xyz if abs(p[2]-floor[0])<=floor[1]+1e-7)
+        return sorted(cells)
+
     def select(self, members, base=None, minimum_distance=0., completed=(), component=None,
                window=None, deadline=None, continuation=None, floor=None, minimum_gain=1, physical=None,
-               connectivity=None, admission=None, rejected=(), ascent_limits=None):
+               connectivity=None, admission=None, rejected=(), ascent_limits=None,
+               direction_search=None, direction_deadline=None):
         began=time.monotonic()
         self.pending=False;self.geometry_ms=self.visibility_ms=0.
         self.phase_ms={}
@@ -196,9 +219,14 @@ class FrontierObservers:
         groups = self.groups(members)
         connectivity = connectivity if connectivity is not None else index.map.connectivity
         choices = {}
+        terrain = {}
         self.last_views = {}
         unreachable = set()
         for (fid, k), group in sorted(groups.items()):
+            if direction_deadline is not None and time.monotonic()>=direction_deadline:
+                self.pending=True
+                self.geometry_ms=1000*(time.monotonic()-began)
+                return []
             data = self.candidates(fid, k, group)
             if not len(data):
                 continue
@@ -215,9 +243,11 @@ class FrontierObservers:
                     direction=np.array([math.cos(yaw),math.sin(yaw)])
                     delta=xyz[:,:2]-base[:2]
                     valid &= (xyz[:,2]>=minimum_height) & (delta@direction>=-backward_slack)
-                    if ascent_limits is not None:
-                        max_step,_=ascent_limits
-                        valid &= xyz[:,2]<=base[2]+max_step+1e-7
+                if ascent_limits is not None:
+                    max_step,min_rise=ascent_limits
+                    valid &= xyz[:,2]<=base[2]+max_step+1e-7
+                    if continuation is None:
+                        valid &= xyz[:,2]>=base[2]+min_rise
             for done in completed:
                 if len(done)>3:continue
                 valid &= (np.linalg.norm(xyz[:, :2]-done[:2], axis=1) > s.observation_revisit_radius) | \
@@ -231,11 +261,37 @@ class FrontierObservers:
                 rank += np.linalg.norm(xyz-base, axis=1)
             for n in np.flatnonzero(valid):
                 point = tuple(map(float, xyz[n]))
+                if point in rejected:
+                    continue
+                if direction_search is not None:
+                    selected=direction_search.direction_poses
+                    if selected is not None and point not in selected:
+                        continue
+                    margin=min(float(data[n,5]),max(s.robot_radius+s.safety_margin,s.ground_lidar_min_range)+.15)
+                    score=(-margin,float(data[n,4]))
+                    terrain[point]=min(terrain.get(point,(math.inf,math.inf)),score)
                 choices[point] = min(choices.get(point, math.inf), float(rank[n]))
         def order(p):
             level=ascent_limits is not None and p[2]-base[2]<ascent_limits[1]
             return level,choices[p],p
 
+        if direction_search is not None and direction_search.direction_poses is None:
+            cx,cy=direction_search.direction_center
+            sectors={}
+            for pose in choices:
+                sector=int(pose[0]>=cx)+2*int(pose[1]>=cy)
+                incumbent=sectors.get(sector)
+                if incumbent is None or (terrain[pose],order(pose))<(terrain[incumbent],order(incumbent)):
+                    sectors[sector]=pose
+            ranked=sorted(sectors.values(),key=order)
+            if direction_search.pose_limit is not None:
+                # Prefer a different direction, then another station in a
+                # previously used direction when all quadrants were tried.
+                preferred=[pose for pose in direction_search.resume_poses if pose in choices]
+                remaining=sorted(choices,key=order)
+                ranked=list(dict.fromkeys(preferred+ranked+remaining))[:direction_search.pose_limit]
+            direction_search.direction_poses=tuple(ranked)
+            choices={pose:choices[pose] for pose in direction_search.direction_poses}
         ordered = sorted(choices,key=order)
         self.last_unreachable = len(unreachable)
         self.geometry_ms=1000*(time.monotonic()-began)
@@ -260,15 +316,17 @@ class FrontierObservers:
             admission=(engine.observation_poses,engine._arrival_geometry,.15,True)
         return self._safe_views(ordered,choices,seeds,done,search,admission,rejected,
                                 minimum_gain,deadline,base,visibility_started,order,
-                                continuation[0] if ascent_limits is not None else None,
-                                floor is not None and continuation is None)
+                                continuation[0] if continuation is not None and ascent_limits is not None else None,
+                                floor is not None and continuation is None,direction_search)
 
     def _safe_views(self, ordered, costs, seeds, done, search, admission, rejected,
-                    minimum_gain, deadline, base, began, order, ascent_yaw, prefer_gain):
+                    minimum_gain, deadline, base, began, order, ascent_yaw, prefer_gain,
+                    direction_search=None):
         index=self._index()
         m,model=index.map,index.observation_model
         find_poses,geometry,tolerance,allow_new=admission
-        memo=search.setdefault('admitted',{})
+        memo=(search.setdefault('admitted',{}) if direction_search is None
+              else direction_search.direction_results)
         views={}
         computed=False
         for pose in ordered:
@@ -279,14 +337,21 @@ class FrontierObservers:
                 continue
             prior=memo.get(pose)
             body=tuple(np.asarray(pose)+[0.,0.,m.settings.observer_reference_height])
-            stamp=geometry(body,tolerance)[2] if prior else None
-            if prior and prior[0]==stamp and all(model.column_blockers(xy)==bands for xy,bands in prior[2].items()):
+            stamp=geometry(body,tolerance)[2] if prior and (prior[1] or direction_search is None) else None
+            reusable=prior and prior[0]==stamp and all(
+                model.column_blockers(xy)==bands for xy,bands in prior[2].items())
+            if prior and direction_search is not None and prior[1] and not reusable:
+                continue
+            if reusable or (prior and direction_search is not None):
                 _,view,_,blockers=prior
             else:
-                if not allow_new or (computed and deadline is not None and time.monotonic()>=deadline):
+                if not allow_new or ((computed or direction_search is not None) and
+                                     deadline is not None and time.monotonic()>=deadline):
                     self.pending=True
                     break
                 computed=True
+                if direction_search is not None:
+                    direction_search.tested_poses.add(pose)
                 near=(np.linalg.norm(seeds[:,:2]-pose[:2],axis=1)<=index.radius)&(
                     abs(seeds[:,2]-pose[2])<=m.settings.step_max)
                 if coarse is None:
@@ -306,7 +371,7 @@ class FrontierObservers:
                 memo[pose]=(stamp,view,rays,blockers)
             if view:
                 views[pose]=view
-                if len(views)>=3:
+                if direction_search is not None or len(views)>=3:
                     break
             elif blockers:
                 self.unknown_blockers=m.merge_unknown_blockers(self.unknown_blockers+blockers,pose if base is None else base)

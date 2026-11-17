@@ -1,5 +1,7 @@
 #include "legbot_exploration/route_orchestrator.hpp"
 #include "legbot_exploration/cross_layer_task.hpp"
+#include "legbot_exploration/recovery_planner.hpp"
+#include "../cpp/src/exploration_controller_modules.hpp"
 
 #include <cassert>
 #include <algorithm>
@@ -8,10 +10,138 @@
 
 namespace le = legbot_exploration;
 
-int main() {
+int main(int argc,char **argv) {
+  assert(argc==2);
+  {
+    le::RecoveryController recovery;
+    le::RecoveryController::BlockerRecovery first,other;
+    first.cross_layer=true;first.floor_attempt=2;
+    first.goal.id=11;first.goal.frontier={1.,0.,.13};
+    first.blockers={{{1.5,0.,.26},1,1}};
+    first.retry_wait=le::RecoveryController::BlockerRecovery::RetryWait{
+        {1.,0.,.45},10,20,.13,false};
+    first.replan=true;
+    other=first;other.goal.id=12;other.goal.frontier={2.,0.,.26};
+    recovery.postpone(first);recovery.postpone(other);
+    // Re-numbering a physical frontier refreshes only that pending task.
+    first.goal.id=99;first.goal.frontier={1.05,0.,.13};
+    first.blockers.front().version=2;
+    recovery.postpone(first);
+    auto resumed=recovery.take_pending();
+    assert(resumed && resumed->goal.id==99 && resumed->floor_attempt==0);
+    assert(resumed->blockers.front().version==2);
+    assert(resumed->replan && resumed->retry_wait && resumed->retry_wait->geometry==10 &&
+           resumed->retry_wait->support_height==.13 && !resumed->retry_wait->stable_contacts);
+    resumed=recovery.take_pending();
+    assert(resumed && resumed->goal.id==12);
+    assert(!recovery.take_pending());
+    recovery.postpone(first);
+    // Nearby independent blockers must not disappear through spatial dedup.
+    other.goal.id=13;other.goal.frontier=first.goal.frontier;
+    other.blockers.front().point[1]+=.1;
+    recovery.postpone(other);
+    assert(recovery.take_pending()->goal.id==99);
+    assert(recovery.take_pending()->goal.id==13);
+    recovery.postpone(other);recovery.clear_pending();
+    assert(!recovery.take_pending());
+  }
+
+  {
+    // A pending surface inside the near blind region cannot be resolved by
+    // turning. Short actions are unavailable; the shared pose search must
+    // still find a routed observation stance without relaxing arrival safety.
+    le::SharedLayerMap shared;
+    shared.pct=std::make_shared<le::PctBackend>(argv[1],.32,100000,200000,
+                                             "{\"maturity_min_points\":1}");
+    std::vector<le::LayerPoint> plane;
+    for(int x=-30;x<=30;++x)for(int y=-30;y<=30;++y)plane.push_back({x*.1,y*.1,0.});
+    shared.pct->append(plane);shared.pct->refresh(1);shared.current_version.store(1);
+    const le::Point base{0.,0.,.32};
+    const std::vector<le::PctUnknownBlocker> blockers{{{.5,0.,.13},1,1}};
+    assert(shared.pct->observation_task(1,"begin_blocker_review",0,base,0.,0.,&blockers).ready);
+    assert(shared.pct->observation_task(1,"arm_blocker_review",0,base).ready);
+    std::unordered_map<le::Cell,int,le::CellHash> grid;
+    std::vector<le::XY> obstacles;
+    le::Settings settings;
+    le::PlanningSnapshot snapshot{grid,obstacles,settings,base,.32,true,nullptr,&shared,1,nullptr};
+    le::PctRecoveryConstraints limits;limits.ascent=0.;
+    limits.permits_goal=[](const le::Point &){return false;};
+    le::PctBlockerRecovery recovery;
+    const auto action=recovery.next(snapshot,1,{0.,0.,0.},blockers,limits,true,
+                                     [](const le::Point &){return true;});
+    assert(action && action->kind==le::PctRecoveryAction::Kind::delegate && action->targeted);
+    assert(action->gap==blockers.front().point);
+    assert(shared.pct->arrival_area(1,action->position,.15,action->yaw).ready);
+    assert(shared.pct->plan(1,base,action->position).reason=="ok");
+    limits.permits_scan=[](const le::Point &){return false;};
+    assert(!recovery.next(snapshot,1,{0.,0.,0.},blockers,limits,true,
+                          [](const le::Point &){return true;}));
+  }
+  {
+    // C++ recovery must select a stationary view even when a hole in the
+    // outer arrival disc prevents navigating to this same pose anew.
+    le::SharedLayerMap shared;
+    shared.pct=std::make_shared<le::PctBackend>(argv[1],.32,100000,200000,
+                                             "{\"maturity_min_points\":1}");
+    std::vector<le::LayerPoint> plane;
+    for(int x=-30;x<=30;++x)for(int y=-30;y<=30;++y)
+      if(x!=7 || y!=0)plane.push_back({x*.1,y*.1,0.});
+    shared.pct->append(plane);shared.pct->refresh(1);shared.current_version.store(1);
+    const le::Point base{0.,0.,.32};
+    const std::vector<le::PctUnknownBlocker> blockers{{{1.4,0.,.13},1,1}};
+    assert(shared.pct->observation_task(1,"begin_blocker_review",0,base,0.,0.,&blockers).ready);
+    assert(shared.pct->observation_task(1,"arm_blocker_review",0,base).ready);
+    assert(!shared.pct->arrival_area(1,base,.15,0.).ready);
+    std::unordered_map<le::Cell,int,le::CellHash> grid;
+    std::vector<le::XY> obstacles;
+    le::Settings settings;
+    le::PlanningSnapshot snapshot{grid,obstacles,settings,base,.32,true,nullptr,&shared,1,nullptr};
+    le::PctBlockerRecovery recovery;le::PctRecoveryConstraints limits;
+    const auto action=recovery.next(snapshot,1,{0.,0.,0.},blockers,limits,false,
+                                     [](const le::Point &){return true;});
+    assert(action && action->kind==le::PctRecoveryAction::Kind::scan && action->position==base);
+  }
+  {
+    // Startup near filtering can leave a hole beneath the robot. Failed PCT
+    // observer routes must not consume safe endpoints of SCAN recovery.
+    le::SharedLayerMap shared;
+    shared.pct=std::make_shared<le::PctBackend>(argv[1],.32,100000,200000,
+                                             "{\"maturity_min_points\":1}");
+    std::vector<le::LayerPoint> ring;
+    for(int x=-30;x<=30;++x)for(int y=-30;y<=30;++y)
+      if(std::hypot(x*.1,y*.1)>=.8)ring.push_back({x*.1,y*.1,.13});
+    shared.pct->append(ring);shared.pct->refresh(1);shared.current_version.store(1);
+    const le::Point base{0.,0.,.32},goal{-1.9,0.,.45};
+    std::unordered_map<le::Cell,int,le::CellHash> grid;
+    std::vector<le::XY> obstacles;
+    le::Settings settings;
+    le::PlanningSnapshot snapshot{grid,obstacles,settings,base,.32,true,nullptr,&shared,1,nullptr};
+    assert(!shared.pct->start_ready(1,base));
+    le::PctRecoveryConstraints limits;limits.height_band=le::XY{0.,.16};
+    le::PctBlockerRecovery recovery;
+    const std::vector<le::PctUnknownBlocker> blockers{{{0.,0.,0.},1,1}};
+    assert(!recovery.next(snapshot,1,{0.,0.,0.},blockers,limits,true,
+                          [](const le::Point &){return true;}));
+    assert(!recovery.pending());
+    assert(recovery.rejections().count("targeted_route_start_unverified"));
+    auto floor_band=limits;floor_band.height_band=le::XY{0.,.08};
+    assert(!recovery.delegate(snapshot,1,floor_band,{goal},.15));
+    const auto delegated=recovery.delegate(snapshot,1,limits,{goal},.15);
+    assert(delegated && !delegated->targeted && delegated->position==goal);
+    assert(shared.pct->arrival_area(1,goal,.15,M_PI).ready);
+  }
   {
     le::CrossLayerTask task;
     assert(task.accept({0.,0.,0.},{{1.,0.,.13}}));
+    // Recovery can retreat one step inside the corridor; normal ascent
+    // targets must still obey monotonic progress and height.
+    const le::Point support{1.,0.,.13}, retreat{.6,0.,-.01};
+    task.update(support);
+    assert(!task.allows(retreat));
+    assert(task.allows_recovery(support,retreat,.16));
+    assert(!task.allows_recovery(support,retreat,.12));
+    assert(!task.allows_recovery(support,{.6,0.,-.04},.16));
+    assert(!task.allows_recovery(support,{.6,2.,.13},.16));
     task.exploring_platform(.13);
     task.exploring_platform(.16);
     assert(task.platform_height() && *task.platform_height()==.13);

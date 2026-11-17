@@ -3,6 +3,7 @@
 The owner holds its write lock for integrate/build and read lock for queries.
 Dense export is explicitly diagnostic; production consumers read blocks.
 """
+from bisect import bisect_left
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, fields
@@ -11,7 +12,7 @@ import math
 import time
 import numpy as np
 from pct_layer_selection import rank_layers
-from .map_evidence import SurfaceColumn, changed_slice_indices
+from .map_evidence import SurfaceColumn, changed_slice_indices, same_ground_surface
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class MapSettings:
     slice_update_workers: int = 0  # Auto: up to four workers on available CPUs.
     maturity_min_points: int = 3
     surface_noise_tolerance: float = .05
+    new_height_threshold: float = .10
     surface_normal_radius: float = .25
     surface_normal_min_points: int = 6
     surface_normal_vertical: float = .5
@@ -38,6 +40,10 @@ class MapSettings:
     floor_min_resolved_frontier_cells: int = 5
     fast_exploration: bool = False
     fast_min_visible_cells: int = 3
+    floor_failed_small_cluster_max_cells: int = 0
+    floor_global_review_enabled: bool = True
+    floor_four_direction_search: bool = False
+    floor_direction_search_timeout: float = 1.5
     landing_support_radius: float = .60
     landing_min_area: float = 1.50
     landing_min_width: float = .80
@@ -84,6 +90,8 @@ class MapSettings:
             raise ValueError('pct_invalid_geometry_or_threshold')
         if self.surface_noise_tolerance >= self.minimum_clearance:
             raise ValueError('pct_surface_noise_tolerance_exceeds_clearance')
+        if self.new_height_threshold <= 0:
+            raise ValueError('pct_invalid_new_height_threshold')
         if self.surface_normal_radius<=0 or self.surface_normal_thickness<=0 or not 0<self.surface_normal_vertical<=1:
             raise ValueError('pct_invalid_surface_orientation')
         if int(self.slice_update_workers)!=self.slice_update_workers or not 0<=self.slice_update_workers<=16:
@@ -92,6 +100,11 @@ class MapSettings:
             raise ValueError('pct_invalid_surface_normal_samples')
         if self.planning_budget_seconds <= 0:
             raise ValueError('pct_invalid_planning_budget')
+        if (not 0<=self.floor_failed_small_cluster_max_cells or
+                int(self.floor_failed_small_cluster_max_cells)!=self.floor_failed_small_cluster_max_cells):
+            raise ValueError('pct_invalid_floor_failed_small_cluster_max_cells')
+        if not math.isfinite(self.floor_direction_search_timeout) or self.floor_direction_search_timeout<=0:
+            raise ValueError('pct_invalid_floor_direction_search_timeout')
         if min(self.landing_support_radius,self.landing_min_area,
                self.landing_min_width,self.landing_min_depth) <= 0:
             raise ValueError('pct_invalid_landing_support')
@@ -106,7 +119,7 @@ class MapSettings:
 
 
 
-FLOATS = ('G', 'C', 'passage_cost', 'relief_cost', 'terrain_cost', 'inflated_terrain_cost',
+FLOATS = ('G', 'C', 'pending_ceiling_z', 'passage_cost', 'relief_cost', 'terrain_cost', 'inflated_terrain_cost',
           'gx', 'gy', 'q', 'm', 'terrain_inflation_reference')
 CELL_DTYPE = np.dtype([(n, '<f8') for n in FLOATS] +
     [('g_surface_id', '<i8'), ('c_surface_id', '<i8')] + [
@@ -163,6 +176,11 @@ class FixedLayerMap:
         self.evidence_revision = self.revision = 0
         self.last_sensor_time = self.last_integration_time = self.last_commit_time = None
         self.dirty, self.geometry_changed = set(), set()
+        self.evidence_dirty = set()
+        self._floor_ground_pending = {}
+        self._floor_ceiling_pending = {}
+        self._floor_ground_refresh = defaultdict(set)
+        self._new_floor_bands = set()
         self.error, self.stats, self.last_work = '', {}, {}
         self.lower = self.upper = self.first_layer = self.last_layer = None
         self.ignored_static_points = 0
@@ -170,9 +188,14 @@ class FixedLayerMap:
         self.orientation_counts={}
         self.orientation_ms=0.
 
+        from .surface_relations import SurfaceRelations
+        self.surface_relations=SurfaceRelations(self)
+        from .surface_observation import SurfaceObservation
+        self.surface_observation = SurfaceObservation(self)
         from .pct_frontier_index import FrontierIndex
         self.frontier_index = FrontierIndex(self)
-        from .pct_stairs import StairIndex
+        from .pct_stairs import StairIndex, StairCandidateCache
+        self.stair_candidates=StairCandidateCache(self.settings)
         self.stair_index = StairIndex()
         self.stair_scout_index = StairIndex(include_unclassified=True)
         from .pct_connectivity import ConnectivityIndex
@@ -186,6 +209,99 @@ class FixedLayerMap:
             self._floor_connectivity=ConnectivityIndex(self,floor)
             self._floor_connectivity.update_tiles({(x,y) for _,x,y in self.blocks})
         return self._floor_connectivity
+
+    def ground_pending(self, xy, layer):
+        return layer in self._floor_ground_pending.get(xy,())
+
+    def schedule_floor_ground(self, band):
+        self._new_floor_bands.add(band)
+
+    @property
+    def floor_ground_update_pending(self):
+        return bool(self._new_floor_bands or self._floor_ground_refresh)
+
+    def _queue_floor_ground_resets(self):
+        """Queue the affected G and C of existing cells on both sides of the floor."""
+        b=self.settings.block_size
+        for band in self._new_floor_bands:
+            for (layer,bx,by),block in self.blocks.items():
+                ground=block['G']
+                if layer>=band.first_slice:
+                    affected=block['measured'] & (~np.isfinite(ground) | (ground<=band.upper_ground+1e-7))
+                else:
+                    demand=self._required_slice_masks.get((bx,by),{}).get(band.first_slice)
+                    if demand is None:
+                        continue
+                    ceiling=block['C']
+                    affected=demand & np.isfinite(ground) & (
+                        ~np.isfinite(ceiling) | (ceiling>=band.height-self.settings.surface_noise_tolerance))
+                for x,y in np.argwhere(affected):
+                    xy=(bx*b+int(x),by*b+int(y))
+                    self._floor_ground_refresh[xy].add(layer)
+
+    def _has_lower_ground_at_arrival(self, layers, records, band):
+        first = bisect_left(layers, band.first_slice)
+        if not first:
+            return False
+        cut = self.settings.origin_z+layers[first-1]*self.settings.slice_dh
+        # An allocated lower cut without a ground sample does not count.
+        return any(record.orientation != -1 and record.height <= cut+1e-7 and
+                   record.first_seen <= band.arrival_frame for record in records)
+
+    def _working_surfaces(self, xy, layer, ground, ceiling, layers, records):
+        """Select the committed G/C for this cut from cumulative evidence."""
+        height=ground.height if ground is not None else math.nan
+        band=next((scope for scope in self.surface_observation.ground_bands
+                   if scope.includes(layer,height)),None)
+        pending = band is not None and not band.ground_seen(ground) and (
+            ground is None or self._has_lower_ground_at_arrival(layers, records, band))
+        if pending:
+            self._floor_ground_pending.setdefault(xy,set()).add(layer)
+            self._clear_pending_cut(self._floor_ceiling_pending,xy,layer)
+            return None,None,math.nan
+        self._clear_pending_cut(self._floor_ground_pending,xy,layer)
+        pending_ceiling=self._pending_ceiling(xy,layer,ground,ceiling)
+        if math.isfinite(pending_ceiling):
+            self._floor_ceiling_pending.setdefault(xy,set()).add(layer)
+        else:
+            self._clear_pending_cut(self._floor_ceiling_pending,xy,layer)
+        return ground,ceiling,pending_ceiling
+
+    @staticmethod
+    def _clear_pending_cut(pending,xy,layer):
+        layers=pending.get(xy)
+        if layers:
+            layers.discard(layer)
+            if not layers:del pending[xy]
+
+    def _pending_ceiling(self,xy,layer,ground,ceiling):
+        if ground is None:
+            return math.nan
+        s=self.settings
+        x,y=xy
+        demands=self._required_slice_masks.get((x//s.block_size,y//s.block_size),{})
+        for band in reversed(self.surface_observation.ground_bands):
+            if layer>=band.first_slice or ground.height>=band.height-s.surface_noise_tolerance:
+                continue
+            affected=demands.get(band.first_slice)
+            if affected is None or not affected[x%s.block_size,y%s.block_size]:
+                continue
+            if ceiling is not None:
+                difference=ceiling.height-band.height
+                if difference < -s.surface_noise_tolerance:
+                    break
+                if abs(difference)<=s.surface_noise_tolerance and (
+                        ceiling.orientation==-1 or ceiling.last_seen>band.cutoff):
+                    break
+            if self.surface_observation.ceiling_band_seen_free(xy,band.height,band.cutoff):
+                continue
+            return band.height
+        return math.nan
+
+    def clearance_needs_observation(self,row):
+        return (row is not None and math.isfinite(row['pending_ceiling_z']) and
+                row['pending_ceiling_z']-row['G']<self.settings.minimum_clearance and
+                (not math.isfinite(row['C']) or row['C']-row['G']>=self.settings.minimum_clearance))
 
     def cell(self, key, create=False):
         k, x, y = map(int, key)
@@ -289,6 +405,7 @@ class FixedLayerMap:
         staged={} if self.surface_records+len(points)>s.max_surface_records else None
         total=self.surface_records
         used=0;changed=set()
+        evidence=self.surface_observation
         for i,xy_key in enumerate(keys):
             key=tuple(map(int,xy_key))
             existing=self.columns.get(key)
@@ -319,6 +436,23 @@ class FixedLayerMap:
         if staged is not None:
             self.columns.update(staged)
         self.integrated_serial += 1
+        # A frozen surface can get a new hit without changing its geometry.
+        if self._floor_ground_pending or self._floor_ceiling_pending:
+            for x,y in keys:
+                xy=(int(x),int(y))
+                if xy in self._floor_ground_pending:
+                    self._floor_ground_refresh[xy].update(self._floor_ground_pending[xy])
+                if xy in self._floor_ceiling_pending:
+                    self._floor_ground_refresh[xy].update(self._floor_ceiling_pending[xy])
+        affected=self.surface_relations.invalidate(changed)
+        self.evidence_dirty.update(affected)
+        self.surface_observation.refresh_relations(affected)
+        observed=self.surface_observation.observe_frame(
+            points,None if sensor_origin is None else origin,self.integrated_serial,orientations)
+        self.evidence_dirty.update(observed)
+        for xy in observed:
+            if xy in self._floor_ceiling_pending:
+                self._floor_ground_refresh[xy].update(self._floor_ceiling_pending[xy])
         self.surface_records=total
         self.dirty.update(changed)
         self.ignored_static_points+=len(points)-used
@@ -347,6 +481,9 @@ class FixedLayerMap:
         self.layers.clear()
         self.column_layers.clear()
         self._column_geometry.clear()
+        self._floor_ground_pending.clear()
+        self._floor_ceiling_pending.clear()
+        self._floor_ground_refresh.clear()
         self._native_slice_masks.clear()
         self._required_slice_masks.clear()
         self.planning_block_versions.clear()
@@ -362,7 +499,7 @@ class FixedLayerMap:
 
     def _build(self, now):
         now = self.clock() if now is None else now
-        if not self.dirty:
+        if not self.dirty and not self.evidence_dirty and not self.floor_ground_update_pending:
             if self.first_layer is None:
                 raise ValueError('pct_empty_cloud')
             self.last_work = dict(base_cells=0, feature_cells=0, terrain_cells=0, inflation_cells=0,
@@ -374,7 +511,8 @@ class FixedLayerMap:
         s = self.settings
         from .map_costs import expand_layers
         started=time.perf_counter()
-        evidence_columns=set(self.dirty)
+        self._queue_floor_ground_resets()
+        evidence_columns=set(self.dirty) | self.evidence_dirty
         work=expand_layers(self,self.dirty)
         batches=defaultdict(dict)
         pending_geometry={}
@@ -382,26 +520,38 @@ class FixedLayerMap:
         geometry_candidate_cells=0
         missing_blocks=set()
         b=s.block_size
-        for xy in work:
+        frontier_resets=defaultdict(set)
+        for xy in work | self._floor_ground_refresh.keys():
             column=self.columns.get(xy)
             if not column:
                 continue
             geometry=column.observed_geometry(s.surface_noise_tolerance)
             _,records=geometry
-            signature=tuple((r.height,r.id,r.mature) for r in records)
+            signature=tuple((r.height,r.id,r.mature,r.orientation) for r in records)
             layers=tuple(sorted(self.column_layers[xy]))
             previous,previous_layers=self._column_geometry.get(xy,((),()))
-            changed=changed_slice_indices(previous,signature,layers,previous_layers,s.origin_z,s.slice_dh)
+            changed=set(changed_slice_indices(previous,signature,layers,previous_layers,s.origin_z,s.slice_dh))
+            changed.update(self._floor_ground_refresh.get(xy,()))
+            added=set(layers).difference(previous_layers)
+            for band in self.surface_observation.ground_bands:
+                if band.first_slice in added:
+                    changed.update(k for k in layers if k<band.first_slice)
             pending_geometry[xy]=(signature,layers)
             geometry_candidate_cells+=len(layers)
-            # Frontier observations and sensor footprints can change even
-            # when this column selects the same G/C on every retained cut.
-            for k in layers:
-                frontiers[k].add(xy)
+            # Frontier observations can change while each retained cut keeps the same G/C.
+            if xy in work:
+                for k in layers:
+                    frontiers[k].add(xy)
             for k in changed:
-                ground,ceiling=column.at(s.origin_z+k*s.slice_dh,geometry)
-                batches[k][xy]=tuple((r.height,r.id,r.mature) if r else (np.nan,0,False)
-                                    for r in (ground,ceiling))
+                ground,ceiling=column.at(s.origin_z+k*s.slice_dh,geometry,s.surface_noise_tolerance)
+                was_pending=self.ground_pending(xy,k)
+                ground,ceiling,pending_ceiling=self._working_surfaces(xy,k,ground,ceiling,layers,records)
+                if was_pending!=self.ground_pending(xy,k):
+                    frontiers[k].add(xy)
+                    frontier_resets[k].add(xy)
+                surfaces=tuple((r.height,r.id,r.mature) if r else (np.nan,0,False)
+                               for r in (ground,ceiling))
+                batches[k][xy]=(*surfaces,pending_ceiling)
                 block_key=(k,xy[0]//b,xy[1]//b)
                 if block_key not in self.blocks:
                     missing_blocks.add(block_key)
@@ -433,9 +583,8 @@ class FixedLayerMap:
                         frontiers.setdefault(k,set()).add((x,y))
             for key in self.frontier_index.by_column.get((x,y),()):
                 frontiers.setdefault(key[0],set()).add((x,y))
-
         def update_frontiers(index, columns):
-            return index,index.update(columns,self._boundary_kernel)
+            return index,index.update(columns,self._boundary_kernel,frontier_resets.get(index.layer,()))
 
         frontier_results,frontier_workers=self._run_slice_tasks(update_frontiers,
             [(self.layers[k].frontiers,columns) for k,columns in sorted(frontiers.items()) if k in self.layers])
@@ -449,8 +598,13 @@ class FixedLayerMap:
         self.connectivity.update(self.geometry_changed)
         if self._floor_connectivity is not None:
             self._floor_connectivity.update(self.geometry_changed)
-        self.stair_index.update(self,evidence_columns)
-        self.stair_scout_index.update(self,evidence_columns)
+        scout_columns = evidence_columns | {(x,y) for _,x,y in self.geometry_changed}
+        self.stair_index.update(self,scout_columns)
+        self.stair_scout_index.update(self,scout_columns)
+        qualification_columns={(x,y) for _,x,y in self.geometry_changed}
+        qualification_columns.update(xy for xy,geometry in pending_geometry.items()
+                                     if self._column_geometry.get(xy)!=geometry)
+        self.stair_candidates.invalidate(qualification_columns)
         revision=self.revision+bool(self.geometry_changed)
         for key in {(k,x//b,y//b) for k,x,y in self.geometry_changed}:
             self.planning_block_versions[key]=revision
@@ -477,6 +631,9 @@ class FixedLayerMap:
             self.last_commit_time=now
         self._column_geometry.update(pending_geometry)
         self.dirty.clear()
+        self.evidence_dirty.clear()
+        self._floor_ground_refresh.clear()
+        self._new_floor_bands.clear()
         return bool(self.geometry_changed)
 
     def point_safe_check(self, xyz, reference_height=.32, relaxed=False, *,
@@ -490,7 +647,7 @@ class FixedLayerMap:
                 s = self.settings
                 k = math.floor((requested-s.origin_z)/s.slice_dh)+1
                 k = min(self.last_layer, max(self.first_layer, k))
-                result['unknown_blockers'] = list(self.unknown_blockers(k, [(x, y)], requested))
+                result['unknown_blockers'] = list(self.unknown_blockers(k,[(x,y)],requested))
             return result
 
         if not options:
@@ -511,7 +668,10 @@ class FixedLayerMap:
                 cost=float(row['inflated_terrain_cost']), source=1,
                 solid=bool(row['solid']), unknown_inflated=bool(row['hard']),
                 clearance=float(ceiling-row['G']) if np.isfinite(ceiling) else None,
-                clearance_observed=bool(np.isfinite(ceiling)), mature=bool(row['g_mature']),
+                clearance_observed=bool(np.isfinite(ceiling) and not np.isfinite(row['pending_ceiling_z'])),
+                clearance_review_height=(float(row['pending_ceiling_z'])
+                                         if np.isfinite(row['pending_ceiling_z']) else None),
+                mature=bool(row['g_mature']),
                 surface_id=int(row['g_surface_id']))
 
         def safe_cost(k):
@@ -521,14 +681,23 @@ class FixedLayerMap:
                 check['reason'] = 'surface_outside_current_floor'
             elif row['solid']:
                 check['reason'] = 'solid_or_steep_surface'
+            elif self.clearance_needs_observation(row):
+                check['reason'] = 'ceiling_observation_pending'
+                unknown_footprints.setdefault(k,set()).add((x,y))
+            elif not self.surface_observation.is_ground_source((x,y),int(row['g_surface_id'])):
+                check['reason'] = 'ground_surface_unverified'
+                unknown_footprints.setdefault(k,set()).add((x,y))
+            elif not relaxed and not self.surface_observation.ground_observed((x,y),check['ground_z'],k):
+                check['reason'] = 'surface_observation_pending'
+                unknown_footprints.setdefault(k,set()).add((x,y))
             elif not relaxed:
                 if collect_blockers:
-                    unknown_keys, solid_keys, count = self.footprint_conflicts(xyz, k, separate=True)
+                    unknown_keys, solid_keys, count = self.footprint_conflicts(xyz,k,separate=True)
                     unknown, solid = (bool(unknown_keys), count), (bool(solid_keys), len(solid_keys))
                     if unknown_keys or solid_keys:
                         unknown_footprints[k] = unknown_keys | solid_keys
                 else:
-                    unknown, solid = self.footprint_conflicts(xyz, k)
+                    unknown, solid = self.footprint_conflicts(xyz,k)
                 check.update(checked_cells=unknown[1], physical_footprint_conflict=bool(solid[0]))
                 if unknown[0]:
                     check['reason'] = 'unknown_footprint'
@@ -548,10 +717,9 @@ class FixedLayerMap:
         safe = rank_layers(options, requested, tolerance, read_height, safe_cost)
         if safe:
             best = checked[safe[0]]
-            surface_id = best['surface_id']
             aliases = [k for k, row in options.items() if
-                       (int(row['g_surface_id']) == surface_id if surface_id else
-                        abs(row['G']-best['ground_z']) <= 1e-7)]
+                       same_ground_surface(row['g_surface_id'], row['G'],
+                                           best['surface_id'], best['ground_z'])]
             return dict(best, safe_layers=safe, equivalent_surface_slices=len(aliases),
                         equivalent_safe_layers=[k for k in safe if k in aliases])
         if not checked:
@@ -561,10 +729,12 @@ class FixedLayerMap:
             c['reason']=='surface_outside_current_floor', c.get('physical_footprint_conflict', False),
             abs(c['ground_z']-requested)))
         result = dict(failure, safe_layers=[])
+        if result['reason'] in ('ground_surface_unverified','surface_observation_pending','unknown_footprint'):
+            result['surface_evidence']=self.surface_observation.describe_ground((x,y),requested)
         if unknown_footprints:
             result['unknown_blockers'] = self.merge_unknown_blockers(
                 (record for k, keys in unknown_footprints.items()
-                 for record in self.unknown_blockers(k, keys, read_height(k))), xyz)
+                 for record in self.unknown_blockers(k,keys,read_height(k))), xyz)
         return result
 
     def footprint_cells(self, xyz, radius):
@@ -585,7 +755,8 @@ class FixedLayerMap:
         for x,y,_ in self.footprint_cells(xyz,s.robot_radius+s.safety_margin):
             count += 1
             row = self.cell((layer,x,y))
-            if row is None or row['unknown']:
+            if (row is None or row['unknown'] or self.clearance_needs_observation(row) or
+                    (not row['solid'] and not self.surface_observation.is_ground_source((x,y),int(row['g_surface_id'])))):
                 unknown.add((x,y))
             if row is not None and row['solid']:
                 solid.add((x,y))
@@ -596,15 +767,27 @@ class FixedLayerMap:
     def unknown_blockers(self, layer, cells, reference):
         """Targets for missing ground or blocked geometry; never change traversability."""
         s = self.settings
+        relations = self.surface_relations
         for x, y in sorted(cells):
+            for pending in self.surface_observation.pending_at((x,y),reference,layer):
+                yield [*self.position((layer,x,y)),pending.height,int(layer)]
             row = self.cell((layer,x,y))
+            if self.clearance_needs_observation(row):
+                yield [*self.position((layer,x,y)),float(row['pending_ceiling_z']),int(layer)]
+                continue
+            if row is not None and not row['unknown'] and np.isfinite(row['G']) and not self.surface_observation.is_ground_source((x,y),int(row['g_surface_id'])):
+                yield [*self.position((layer,x,y)),reference,int(layer)]
+                continue
             if row is not None and not row['unknown'] and np.isfinite(row['G']):
                 if any(not other['unknown'] and not other['solid'] and
+                       self.surface_observation.is_ground_source((x,y),int(other['g_surface_id'])) and
                        abs(other['G']-row['G'])<=s.surface_noise_tolerance+1e-7 and
                        0<=other['inflated_terrain_cost']<=20 and not other['hard']
                        for _,other in self.layers_at(x,y)):
                     continue
                 if row['passage_cost']>=50 and np.isfinite(row['C']):
+                    if self.surface_relations.fresh_clearance_barrier((x,y),reference) is not None:
+                        continue
                     yield [*self.position((layer,x,y)),float(row['C']),int(layer)]
                     continue
                 if row['passage_cost']<0 or row['relief_cost']<50:
@@ -616,9 +799,11 @@ class FixedLayerMap:
                           np.isfinite(other['G']) and 0<=other['passage_cost']<50]
                 height=max(float(row['G']),reference,
                            max((float(other['G']) for _,_,other in observed),default=reference))
-                yield [*self.position((layer,x,y)),height,int(layer)]
+                if relations.classify((x,y),height).state!='known_step':
+                    yield [*self.position((layer,x,y)),height,int(layer)]
                 for nx,ny,other in observed:
-                    if height-other['G']>s.surface_noise_tolerance+1e-7:
+                    if (height-other['G']>s.surface_noise_tolerance+1e-7 and
+                            relations.classify((nx,ny),height).state!='known_step'):
                         yield [*self.position((layer,nx,ny)),height,int(layer)]
                 continue
             heights = []
@@ -632,7 +817,8 @@ class FixedLayerMap:
             if any(not row['unknown'] and abs(row['G']-height) <= s.surface_noise_tolerance
                    for _, row in self.layers_at(x, y)):
                 continue
-            yield [s.origin_x+x*s.resolution, s.origin_y+y*s.resolution, height, int(layer)]
+            if relations.classify((x,y),height).state!='known_step':
+                yield [s.origin_x+x*s.resolution, s.origin_y+y*s.resolution, height, int(layer)]
 
     def merge_unknown_blockers(self, records, point):
         ordered = sorted(records, key=lambda p: (math.hypot(p[0]-point[0], p[1]-point[1]), *p))
@@ -667,6 +853,15 @@ class FixedLayerMap:
                     distance = min(distance, math.hypot(max(abs(px-xyz[0])-s.resolution*.5, 0),
                                                        max(abs(py-xyz[1])-s.resolution*.5, 0)))
         return distance
+
+    def support_samples(self, x, y):
+        """Measured, non-underside G represented by a traversable upper cut."""
+        s=self.settings
+        return tuple((k,float(row['G']),int(row['g_surface_id'])) for k,row in self.layers_at(x,y)
+                     if row['measured'] and not row['unknown'] and np.isfinite(row['G']) and
+                     s.origin_z+k*s.slice_dh>float(row['G']) and
+                     self.surface_observation.is_ground_source((x,y),int(row['g_surface_id'])) and
+                     0<=self.planning_cost((k,x,y))<=20)
 
     def target_candidates(self, xyz, reference_height):
         if getattr(self,'_target_revision',None)!=self.revision:

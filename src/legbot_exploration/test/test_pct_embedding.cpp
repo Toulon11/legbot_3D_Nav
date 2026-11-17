@@ -84,5 +84,18 @@ int main(int argc,char **argv) {
   assert(raw_check.metadata.find("ready")!=std::string::npos);
   auto on_raw=raw.plan(1,{-.8,0,.32},{.8,0,.32});
   assert(on_raw.reason=="ok" && !on_raw.points.empty());
+  le::PctBackend heights(argv[1],0.32,100000,200000,"{\"maturity_min_points\":1}");
+  std::vector<le::LayerPoint> floor_only;
+  for(const auto &point:cloud)if(point.z==0.)floor_only.push_back(point);
+  heights.append(floor_only);
+  assert(!heights.observation_task(1,"observe_height",0,{0.,0.,.32}).ready);
+  std::vector<le::LayerPoint> upper_floor;
+  for(int i=-5;i<=5;++i)for(int j=-5;j<=5;++j)upper_floor.push_back({i*.1,j*.1,1.46});
+  heights.append(upper_floor);
+  const auto review=heights.observation_task(2,"observe_height",0,{0.,0.,1.78});
+  assert(review.ready && review.metadata.find("new_measured_height")!=std::string::npos);
+  assert(!heights.observation_task(2,"observe_height",0,{0.,0.,1.78}).ready);
+  const auto still_high=heights.point_check(2,{0.,0.,1.78},false,std::nullopt,0.,false,std::nullopt,true);
+  assert(still_high.ready && still_high.ground_z && std::abs(*still_high.ground_z-1.46)<1e-5);
   std::cout << "PASS embedded C++ -> fixed online PCT -> native A* -> XYZ\n";
 }

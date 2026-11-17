@@ -20,7 +20,7 @@ using Keys = std::set<XY>;
 enum Field {
   F_G, F_C, F_passage_cost, F_relief_cost, F_terrain_cost, F_inflated_terrain_cost, F_gx, F_gy, F_q, F_m,
   F_terrain_inflation_reference, F_measured, F_feature_valid, F_flat, F_solid, F_unknown, F_solid_hard,
-  F_unknown_hard, F_hard, F_g_surface_id, F_c_surface_id, F_g_mature, F_c_mature, field_count
+  F_unknown_hard, F_hard, F_g_surface_id, F_c_surface_id, F_g_mature, F_c_mature, F_pending_ceiling_z, field_count
 };
 
 // Borrow only one slice's existing sparse buffers. No Python calls are made
@@ -48,7 +48,7 @@ struct Grid {
                                     "inflated_terrain_cost", "gx", "gy", "q", "m",
                                     "terrain_inflation_reference", "measured", "feature_valid", "flat",
                                     "solid", "unknown", "solid_hard", "unknown_hard", "hard",
-                                    "g_surface_id", "c_surface_id", "g_mature", "c_mature" };
+                                    "g_surface_id", "c_surface_id", "g_mature", "c_mature", "pending_ceiling_z" };
         for (size_t i = 0; i < names.size(); ++i) {
           offsets[i] = fields[names[i]].cast<py::tuple>()[1].cast<int>();
         }
@@ -104,7 +104,7 @@ bool different(double a, double b)
 using Surface = std::tuple<double, std::int64_t, bool>;
 
 std::pair<Keys, Keys> update_geometry(
-  py::dict input, int block_size, const std::map<XY, std::pair<Surface, Surface>> &evidence)
+  py::dict input, int block_size, const std::map<XY, std::tuple<Surface, Surface, double>> &evidence)
 {
   Grid grid(input, block_size);
   Keys base_changed, ground_changed;
@@ -127,12 +127,15 @@ std::pair<Keys, Keys> update_geometry(
       throw std::invalid_argument("missing slice geometry block");
     }
     grid.flag(row, F_measured) = true;
-    const bool ground = commit(row, surfaces.first, F_G, F_g_surface_id, F_g_mature);
-    const bool ceiling = commit(row, surfaces.second, F_C, F_c_surface_id, F_c_mature);
+    const auto &[ground_surface,ceiling_surface,pending_ceiling] = surfaces;
+    const bool ground = commit(row,ground_surface,F_G,F_g_surface_id,F_g_mature);
+    const bool ceiling = commit(row,ceiling_surface,F_C,F_c_surface_id,F_c_mature);
+    const bool pending_changed=different(grid.f(row,F_pending_ceiling_z),pending_ceiling);
+    grid.f(row,F_pending_ceiling_z)=pending_ceiling;
     if (ground) {
       ground_changed.insert(xy);
     }
-    if (ground || ceiling) {
+    if (ground || ceiling || pending_changed) {
       base_changed.insert(xy);
     }
   }
@@ -281,6 +284,7 @@ py::dict update_costs(py::dict input, int block_size, const Keys &base, const Ke
       }
       ++relief_work;
       bool old_solid = g.flag(p, F_solid), old_unknown = g.flag(p, F_unknown);
+      const bool old_pending=g.f(p,F_passage_cost)<0.;
       bool has_ground = std::isfinite(g.f(p, F_G));
       double passage = -1, terrain_relief = -1;
       if (has_ground) {
@@ -289,6 +293,7 @@ py::dict update_costs(py::dict input, int block_size, const Keys &base, const Ke
                                                                                        20. *
                                                                                        (s.desired -
                                                                                         clearance))) : 0.;
+        if(passage<50. && g.f(p,F_pending_ceiling_z)-g.f(p,F_G)<s.minimum)passage=-1.;
       }
       if (g.flag(p, F_feature_valid)) {
         if (g.flag(p, F_flat)) {
@@ -330,7 +335,8 @@ py::dict update_costs(py::dict input, int block_size, const Keys &base, const Ke
       }
       g.flag(p, F_solid) = terrain >= 50;
       g.flag(p, F_unknown) = !has_ground;
-      if (old_solid != g.flag(p, F_solid) || old_unknown != g.flag(p, F_unknown)) {
+      if (old_solid != g.flag(p, F_solid) || old_unknown != g.flag(p, F_unknown) ||
+          old_pending!=(passage<0.)) {
         state_changed.emplace(x, y);
       }
     }
@@ -384,7 +390,7 @@ py::dict update_costs(py::dict input, int block_size, const Keys &base, const Ke
       bool unknown = false, solid = false;
       for (auto [dx, dy] : disk) {
         char *n = g.at(x + dx, y + dy);
-        unknown |= !n || g.flag(n, F_unknown);
+        unknown |= !n || g.flag(n, F_unknown) || g.f(n,F_passage_cost)<0.;
         solid |= n && g.flag(n, F_solid);
       }
       if (unknown != g.flag(p, F_unknown_hard) || solid != g.flag(p, F_solid_hard)) {
@@ -557,5 +563,6 @@ std::map<XY, std::vector<Boundary> > find_boundaries(
 PYBIND11_MODULE(_legbot_layer_kernels, m) {
   m.def("update_geometry", &update_geometry);
   m.def("update_costs", &update_costs);
-  m.def("find_boundaries", &find_boundaries);
+  m.def("find_boundaries", &find_boundaries, py::arg("columns"), py::arg("summaries"),
+        py::arg("tolerance"), py::arg("step"), py::arg("clearance"));
 }

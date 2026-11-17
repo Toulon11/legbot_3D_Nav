@@ -37,7 +37,7 @@ def main():
     node.create_subscription(PoseStamped, '/scan/goal_stop_ack', acks.append, 10)
     node.create_subscription(String, '/scan/goal_plan_failed', lambda m: failures.append(m.data), 10)
     sim = 10.0
-    x = y = yaw = 0.0
+    x = y = yaw = pitch = 0.0
     z = .32
     simulate = False
     process = None
@@ -68,8 +68,10 @@ def main():
             msg.header.frame_id = 'map'
             msg.header.stamp = stamp(sim)
             msg.pose.pose.position = Point(x=x,y=y,z=z)
-            msg.pose.pose.orientation.z = math.sin(yaw/2)
-            msg.pose.pose.orientation.w = math.cos(yaw/2)
+            msg.pose.pose.orientation.x = -math.sin(pitch/2)*math.sin(yaw/2)
+            msg.pose.pose.orientation.y = math.sin(pitch/2)*math.cos(yaw/2)
+            msg.pose.pose.orientation.z = math.cos(pitch/2)*math.sin(yaw/2)
+            msg.pose.pose.orientation.w = math.cos(pitch/2)*math.cos(yaw/2)
             odom_pub.publish(msg)
             until = time.monotonic()+.006
             while time.monotonic()<until:
@@ -224,6 +226,26 @@ def main():
         assert any(r.get('actual_speed',0)>.03 and r['command_speed']<.001 for r in recent)
         wait(lambda:arrived(braking),2.)
         assert any(r['phase']=='settled' and r.get('actual_speed',1)<=.03 for r in stops[stop_count:])
+        settled=next(r for r in reversed(stops) if r['phase']=='settled')
+        assert settled['stable_duration']>=settled['required_stable_duration']
+        assert len(settled['actual_velocity_xyz'])==len(settled['actual_rotation_rate_xyz'])==3
+        assert settled['stop_timeout']==5., 'diagnostics must not extend the stop budget'
+
+        # A fixed XY position is insufficient while the body heaves/pitches.
+        x=y=yaw=0.;z=.32;pump(.3)
+        rocking=goal(distance=.70)
+        wait(lambda:commands[-1].linear.x>.20)
+        stop_count=len(stops);x=.31
+        for _ in range(100):
+            z=.32+.012*math.sin(sim*8.)
+            pitch=.08*math.sin(sim*8.)
+            pump(.02)
+        assert not arrived(rocking), 'body height/pitch motion was ignored during settling'
+        recent=stops[stop_count:]
+        assert any(abs(r.get('actual_velocity_xyz',[0,0,0])[2])>.03 for r in recent)
+        assert any(abs(r.get('actual_rotation_rate_xyz',[0,0,0])[1])>.1 for r in recent)
+        pitch=0.;z=.32
+        wait(lambda:arrived(rocking),2.)
 
         # A frozen yaw must produce one specific failure, never eternal spinning.
         x=y=0.;yaw=1.;pump(.1)

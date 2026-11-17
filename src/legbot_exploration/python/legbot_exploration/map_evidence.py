@@ -7,10 +7,16 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 
 
+def same_ground_surface(first_id, first_height, second_id, second_height):
+    """Compare the G sources of two cuts at the same XY."""
+    return first_id == second_id and (first_id != 0 or abs(first_height-second_height) <= 1e-7)
+
+
 def changed_slice_indices(previous, current, layers, previous_layers, origin_z, slice_dh):
     """Find cuts whose selected height, surface identity or maturity can change.
 
-    A record at h supplies C on [previous_height, h) and G on [h, next_height).
+    A record at h supplies C below h; eligible support can supply G from h
+    up to the next support. Undersides may still bound clearance below a cut.
     Include those intervals in both sequences, since a mean can move, a group
     can merge, and noise filtering can remove a record. Newly allocated cuts
     always read the complete accumulated column.
@@ -28,7 +34,10 @@ def changed_slice_indices(previous, current, layers, previous_layers, origin_z, 
             if record not in changed:
                 continue
             low = records[i-1][0] if i else -float('inf')
-            high = records[i+1][0] if i+1 < len(records) else float('inf')
+            # A skipped underside does not terminate G's dependency range.
+            # Its ceiling barrier can likewise affect cuts up to the next
+            # real support. Legacy 3-tuples describe unclassified geometry.
+            high=next((r[0] for r in records[i+1:] if len(r)<4 or r[3]!=-1),float('inf'))
             intervals.append((bisect_left(boundaries, low), bisect_left(boundaries, high)))
     end = 0
     for first, last in sorted(intervals):
@@ -50,6 +59,7 @@ class SurfaceRecord:
     orientation: int = 1  # +1 support, -1 underside, -2 vertical, 0 ambiguous.
     footprint: int = 0  # 4 by 4 mask of measured hit locations within the XY cell.
     top_cm: int | None = None
+    first_seen: int = 0
 
     @property
     def mature(self):
@@ -67,7 +77,7 @@ class SurfaceRecord:
     def clone(self):
         return SurfaceRecord(self.id,self.height,self.count,self.low,self.high,
                              self.mature_at,list(self.pending),self.last_seen,self.orientation,
-                             self.footprint,self.top_cm)
+                             self.footprint,self.top_cm,self.first_seen)
 
     def __getitem__(self, index):
         return (self.low, self.high)[index]
@@ -127,6 +137,7 @@ class SurfaceColumn:
                 kept.mature_at=samples[-1][0] if kept.count>=num else None
                 kept.pending=[] if kept.mature else samples
             kept.last_seen=max(a.last_seen,b.last_seen)
+            kept.first_seen=min(a.first_seen,b.first_seen)
             kept.footprint=a.footprint | b.footprint
             tops=[top for top in (a.top_cm,b.top_cm) if top is not None]
             kept.top_cm=max(tops,default=None)
@@ -171,7 +182,7 @@ class SurfaceColumn:
         else:
             self.sequence+=1
             surface=SurfaceRecord(self.next_id,z,0,z,z,last_seen=frame,orientation=orientation,
-                                  footprint=footprint,top_cm=top_cm)
+                                  footprint=footprint,top_cm=top_cm,first_seen=frame)
             self.next_id+=1
             surface.add(z,self.sequence,num)
             self.surfaces.insert(at,surface)
@@ -194,12 +205,18 @@ class SurfaceColumn:
             records.append(record)
         return tuple(r.height for r in records),records
 
-    def at(self, cut, geometry):
-        # The cut, rather than the support surface, separates G from C.
-        # Heights are the existing noise-filtered surface group means.
-        boundary=cut+1e-7
+    def at(self, cut, geometry, noise_tolerance=.05):
+        # G must describe a possible support, never an observed underside.
+        # Keep all original evidence for ceiling and line-of-sight queries.
         heights,records=geometry
-        at=bisect_right(heights,boundary)
-        ground=records[at-1] if at else None
+        at=bisect_right(heights,cut+1e-7)
+        ground=next((r for r in reversed(records[:at]) if r.orientation!=-1),None)
         ceiling=records[at] if at<len(records) else None
+        if ground is not None:
+            # Skipping an underside must not erase a real low ceiling below
+            # the cut. Near-coincident faces remain one height-resolution band;
+            # their real support supplies G, not the underside's identity.
+            barrier=next((r for r in records[:at] if r.orientation==-1 and
+                          r.height>ground.height+noise_tolerance+1e-7),None)
+            if barrier is not None:ceiling=barrier
         return ground,ceiling

@@ -92,32 +92,35 @@ std::vector<XY> stair_recovery_repositions(
   const auto inflated=[&](const Point &p) {
     return scan_inflated(p,std::atan2(forward[1]-p[1],forward[0]-p[0]));
   };
+  const XY height_band{tread_height,std::min(.16,max_step)};
   std::vector<XY> out;
   if(reverse) {
-    const double step=std::min(.16,max_step);
     for(double length:{.25,.30,.35,.40}) {
       const XY target{base[0]-length*c,base[1]-length*s};
       Point stop{target[0],target[1],base[2]};
-      const auto landing=map.point_check(version,stop,false,std::nullopt,0.,false,XY{tread_height,step});
+      const auto landing=map.point_check(version,stop,false,std::nullopt,0.,false,height_band);
       if(!landing.ready || !landing.ground_z)continue;
       stop[2]=base[2]+*landing.ground_z-tread_height;
       if(!inflated({target[0]+.06*c,target[1]+.06*s,stop[2]}) &&
          !map.observation_poses(version,base,Point{0.,0.,yaw},
              {Point{target[0],target[1],*landing.ground_z}},std::nullopt,std::nullopt,
-             XY{tread_height,step},stop,.15,0).empty())out.push_back(target);
+             height_band,stop,.15,0).empty())out.push_back(target);
     }
   } else {
     for(double offset:{.22,-.22}) {
-      const Point target{base[0]-offset*std::sin(ascent),base[1]+offset*std::cos(ascent),base[2]};
+      Point target{base[0]-offset*std::sin(ascent),base[1]+offset*std::cos(ascent),base[2]};
+      const auto landing=map.point_check(version,target,false,std::nullopt,0.,false,height_band);
+      if(!landing.ready || !landing.ground_z)continue;
+      target[2]+=*landing.ground_z-tread_height;
       if(inflated(target))continue;
       const auto support=[&](double distance) {
         const Point p{target[0]+distance*c,target[1]+distance*s,target[2]};
-        return map.point_check(version,p,false,std::nullopt,0.,false,XY{tread_height,.04}).ready;
+        return map.point_check(version,p,false,std::nullopt,0.,false,height_band).ready;
       };
       if(support(-.20) && support(.20) &&
          !map.observation_poses(version,base,Point{0.,0.,yaw},
-             {Point{target[0],target[1],tread_height}},std::nullopt,std::nullopt,
-             XY{tread_height,.04},target,.15,0).empty())out.push_back({target[0],target[1]});
+             {Point{target[0],target[1],*landing.ground_z}},std::nullopt,std::nullopt,
+             height_band,target,.15,0).empty())out.push_back({target[0],target[1]});
     }
   }
   return out;
@@ -132,15 +135,16 @@ std::optional<PctRecoveryAction> plan_pct_landing_shift(
   base[2]=tread_height+s.body_height;
   const auto platform=map.point_check(version,base,false,departure_floor,ascent,true);
   if(!platform.ready)return std::nullopt;
+  const double step_limit=std::min(.16,s.shared_layer->max_step_height);
   for(double distance:{.35,.50,.60,.22}) {
     for(int i=0;i<8;++i) {
       const double angle=ascent+i*M_PI/4.;
       const Point stop{base[0]+distance*std::cos(angle),base[1]+distance*std::sin(angle),base[2]};
       const auto landing=map.point_check(version,stop,false,departure_floor,ascent);
-      if(landing.ready && landing.ground_z && std::abs(*landing.ground_z-tread_height)<=.04 &&
+      if(landing.ready && landing.ground_z && std::abs(*landing.ground_z-tread_height)<=step_limit+1e-7 &&
          !map.observation_poses(version,s.base,Point{0.,0.,angle},
              {Point{stop[0],stop[1],tread_height}},std::nullopt,std::nullopt,
-             XY{tread_height,.04},stop,.15,0).empty() &&
+             XY{tread_height,step_limit},stop,.15,0).empty() &&
          verified_pct_short_move(s,version,{stop[0],stop[1],s.base[2]},false))
         return PctRecoveryAction{PctRecoveryAction::Kind::shift,stop};
     }
@@ -162,7 +166,7 @@ std::optional<double> PctBlockerRecovery::scan_heading(
     if(std::find(gaps.begin(),gaps.end(),blocker.point)==gaps.end())gaps.push_back(blocker.point);
   }
   const auto views=map.observation_poses(
-      version,position,attitude,gaps,false,constraints.ascent,constraints.floor);
+      version,position,attitude,gaps,false,constraints.ascent,constraints.height_band,std::nullopt,.15,1,true);
   const auto selected=std::find_if(views.begin(),views.end(),[&](const auto &view){return view.gap==gap;});
   if(selected==views.end() || scans_.count(blocker_scan_key(*selected)))return std::nullopt;
   for(const auto &view:views)
@@ -175,9 +179,13 @@ std::optional<PctRecoveryAction> PctBlockerRecovery::next(
     const PlanningSnapshot &s,std::uint64_t version,const Point &attitude,
     const std::vector<PctUnknownBlocker> &blockers,const PctRecoveryConstraints &constraints,
     bool can_move,
-    const std::function<bool(const Point &)> &stance_clear,const std::vector<Point> &review) {
+    const std::function<bool(const Point &)> &stance_clear,const std::vector<Point> &review,double arrival_tolerance) {
+  rejections_.clear();
+  pending_=false;
   if(!s.layer_fresh || !s.shared_layer || !s.shared_layer->pct ||
-     version!=s.shared_layer->current_version.load())return std::nullopt;
+     version!=s.shared_layer->current_version.load()) {
+    ++rejections_["map_unavailable_or_changed"];return std::nullopt;
+  }
   LayerRead read(*s.shared_layer);
   auto &map=*s.shared_layer->pct;
   std::vector<Point> gaps;
@@ -209,9 +217,10 @@ std::optional<PctRecoveryAction> PctBlockerRecovery::next(
   }),gaps.end());
   if(!gaps.empty() && scans_.size()<24) {
     const auto standing=map.observation_poses(
-        version,s.base,attitude,gaps,false,constraints.ascent,constraints.floor);
+        version,s.base,attitude,gaps,false,constraints.ascent,constraints.height_band,std::nullopt,.15,1,true);
+    if(standing.empty())++rejections_["no_safe_stationary_view"];
     for(const auto &view:standing) {
-      if(scans_.count(blocker_scan_key(view)))continue;
+      if(scans_.count(blocker_scan_key(view))) {++rejections_["stationary_view_already_attempted"];continue;}
       for(const auto &other:standing)
         if(std::abs(std::remainder(view.yaw-other.yaw,2*M_PI))<=.06)
           scans_.insert(blocker_scan_key(other));
@@ -219,10 +228,11 @@ std::optional<PctRecoveryAction> PctBlockerRecovery::next(
     }
     if(can_move && moves_.size()<6) {
       const auto views=map.observation_poses(
-          version,s.base,attitude,gaps,true,constraints.ascent,constraints.floor);
+          version,s.base,attitude,gaps,true,constraints.ascent,constraints.height_band);
+      if(views.empty())++rejections_["no_safe_short_move_view"];
       for(const auto &view:views) {
-        if(view.motion==PctObservationPose::Motion::stationary ||
-           scans_.count(blocker_scan_key(view)) || !stance_clear(view.stance))continue;
+        if(view.motion==PctObservationPose::Motion::stationary || scans_.count(blocker_scan_key(view)))continue;
+        if(!stance_clear(view.stance)) {++rejections_["short_move_scan_inflated"];continue;}
         const auto key=blocker_stance_key(view.gap,view.stance);
         if(moves_.count(key))continue;
         const XY stop{view.stance[0],view.stance[1]};
@@ -234,24 +244,61 @@ std::optional<PctRecoveryAction> PctBlockerRecovery::next(
           for(int i=0;i<=samples && supported;++i) {
             const double t=static_cast<double>(i)/samples;
             for(const auto &contact:constraints.contacts) {
-              const Point foot{contact[0]+t*dx,contact[1]+t*dy,contact[2]+s.body_height};
+              const Point foot{contact[0]+t*dx,contact[1]+t*dy,
+                               contact[2]+s.body_height+t*(view.stance[2]-s.base[2])};
               if(!map.point_check(version,foot,false,std::nullopt,0.,false,
-                                  XY{contact[2],.04},true).ready) {
+                                  XY{contact[2],std::min(.16,s.shared_layer->max_step_height)},true).ready) {
                 supported=false;
                 break;
               }
             }
           }
-          if(!supported)continue;
+          if(!supported) {++rejections_["shift_contact_support_unverified"];continue;}
         }
-        const Point target=reverse?view.stance:Point{stop[0],stop[1],s.base[2]};
-        if(!verified_pct_short_move(s,version,target,reverse))continue;
+        const Point target=view.stance;
+        if(!verified_pct_short_move(s,version,target,reverse)) {
+          ++rejections_[reverse?"short_reverse_rejected":"short_shift_rejected"];continue;
+        }
         moves_.insert(key);
         return PctRecoveryAction{reverse?PctRecoveryAction::Kind::reverse:PctRecoveryAction::Kind::shift,
                                  target,view.gap,attitude[2]};
       }
     }
   }
+  // A near-filtered gap can remain invisible from every short-action stance.
+  // Reuse the public pose search around that gap, then verify its native route.
+  // This recovery may return one step down; ascent progress filters apply to
+  // exploration goals, not to a verified observation reposition.
+  if(can_move && !gaps.empty()) {
+    // Native routes cannot start inside an unobserved footprint. Preserve
+    // the existing SCAN recovery handoff instead of exhausting its endpoints
+    // while trying the same invalid PCT start against different destinations.
+    if(!map.start_ready(version,s.base,constraints.height_band)) {
+      ++rejections_["targeted_route_start_unverified"];return std::nullopt;
+    }
+    const std::vector<Point> targets(gaps.begin(),gaps.begin()+std::min<std::size_t>(3,gaps.size()));
+    const auto views=map.observation_poses(version,s.base,attitude,targets,std::nullopt,
+                                         constraints.ascent,constraints.height_band,std::nullopt,arrival_tolerance);
+    if(views.empty())++rejections_["no_safe_targeted_observer"];
+    for(const auto &view:views) {
+      if(std::hypot(view.stance[0]-s.base[0],view.stance[1]-s.base[1])<=arrival_tolerance ||
+         scans_.count(blocker_scan_key(view)))continue;
+      if(!stance_clear(view.stance)) {++rejections_["targeted_observer_scan_inflated"];continue;}
+      if(std::any_of(observer_routes_.begin(),observer_routes_.end(),[&](const Point &old) {
+        return std::hypot(old[0]-view.stance[0],old[1]-view.stance[1])<=.20 &&
+               std::abs(old[2]-view.stance[2])<=.05;
+      }))continue;
+      observer_routes_.push_back(view.stance);
+      const auto route=map.plan(version,s.base,view.stance,false,constraints.height_band);
+      if(route.reason!="ok") {
+        ++rejections_["observer_route:"+route.reason];
+        pending_=true;return std::nullopt; // Try another stance next cycle, release the map lock now.
+      }
+      delegated_.push_back(view.stance);
+      return PctRecoveryAction{PctRecoveryAction::Kind::delegate,view.stance,view.gap,view.yaw,true};
+    }
+  } else if(!can_move)++rejections_["motion_not_ready"];
+  if(gaps.empty())++rejections_["no_pending_observation_target"];
   return std::nullopt;
 }
 
@@ -277,11 +324,11 @@ std::optional<PctRecoveryAction> PctBlockerRecovery::delegate(
         return std::hypot(goal[0]-previous[0],goal[1]-previous[1])<=separation &&
                std::abs(goal[2]-previous[2])<=.08;
       }))continue;
-      const auto checked=map.point_check(version,goal,false,std::nullopt,0.,false,constraints.floor);
+      const auto checked=map.point_check(version,goal,false,std::nullopt,0.,false,constraints.height_band);
       if(checked.ready && checked.ground_z && std::abs(*checked.ground_z+s.body_height-goal[2])<=.02 &&
          !map.observation_poses(version,s.base,Point{0.,0.,bearing(goal)},
              {Point{goal[0],goal[1],*checked.ground_z}},std::nullopt,constraints.ascent,
-             constraints.floor,goal,arrival_tolerance,0).empty()) {
+             constraints.height_band,goal,arrival_tolerance,0).empty()) {
         delegated_.push_back(goal);
         return PctRecoveryAction{PctRecoveryAction::Kind::delegate,goal};
       }
@@ -315,7 +362,8 @@ std::vector<PlannerResult> plan_recovery_request(const PlanningGoal &goal,const 
     if(!short_action_clear_of_scan_obstacles(s,goal.observation,.07)) {
       r.reason="shift_scan_occupied_corridor";return {r};
     }
-    const Point target{goal.observation[0],goal.observation[1],s.base[2]};
+    const Point target=goal.observation_xyz.value_or(
+        Point{goal.observation[0],goal.observation[1],s.base[2]});
     auto checked=s.shared_layer->pct->plan_shift(goal.layer_version,s.base,target);
     r.reason=checked.reason;r.backend_metadata=std::move(checked.metadata);
     if(r.reason=="ok") {
@@ -371,7 +419,8 @@ std::vector<PlannerResult> plan_recovery_request(const PlanningGoal &goal,const 
       LayerRead read(*s.shared_layer);
       if(goal.layer_version!=s.shared_layer->current_version.load()) {r.reason="layer_map_version_changed";out.push_back(r);continue;}
       if(goal.recovery_request==RecoveryRequest::reverse) {
-        const Point target{goal.observation[0],goal.observation[1],s.base[2]};
+        const Point target=goal.observation_xyz.value_or(
+        Point{goal.observation[0],goal.observation[1],s.base[2]});
         if(!s.scan_raw_obstacles || !short_action_clear_of_scan_obstacles(s,goal.observation,.04)) {
           r.reason="stair_reverse_scan_corridor_unverified";out.push_back(r);continue;
         }

@@ -74,6 +74,9 @@ class OnlinePct:
         self._pending_stairs = {}
         self._stair_recognitions = {}
         self._local_stair_task=None
+        self._passive_stair_scout=False
+        self._passive_stair_records={}
+        self._passive_stair_floor=None
 
     def configure(self, settings):
         if self.map.accepted_frames:
@@ -95,10 +98,15 @@ class OnlinePct:
         self.prepare(buffer, version, allow_rebuild=True)
 
     def prepare(self, buffer, version, _unused_start=None, *, allow_rebuild=False):
-        if isinstance(self.map,FixedLayerMap) and self.map._rebuild_pending and not allow_rebuild:
-            raise RuntimeError('pct_map_commit_failed')
+        if isinstance(self.map,FixedLayerMap) and not allow_rebuild:
+            if self.map._rebuild_pending:
+                raise RuntimeError('pct_map_commit_failed')
+            if self.map.floor_ground_update_pending:
+                raise RuntimeError('pct_floor_geometry_pending')
         # Static surfaces update only in response to incoming point evidence.
-        if self.version==version and self.planner is not None and not self.map.dirty: return
+        if (self.version==version and self.planner is not None and not self.map.dirty and
+                not self.map.evidence_dirty and not getattr(self.map,'floor_ground_update_pending',False)):
+            return
         started=time.monotonic()
         # C++ integrates each accepted frame exactly once; buffer here is empty.
         changed=self.map.build()
@@ -126,6 +134,45 @@ class OnlinePct:
         admission=self._admission(xyz)
         return admission['ready'],admission['layer']
 
+    def _measured_ground(self, base):
+        ground=np.asarray(base,dtype=float)-[0.,0.,self.reference_height]
+        check=self._ground_support(base)
+        if check['ready'] and check.get('ground_z') is not None:
+            ground[2]=check['ground_z']
+        return ground
+
+    def _ground_support(self, base, floor=None):
+        check=self._admission(base,floor=floor,relaxed=True)
+        if check['ready']:
+            row=self.map.cell((check['layer'],*self.map.indices(base)))
+            if row is None or not row['measured'] or row['unknown']:
+                return dict(check,ready=False,reason='tread_ground_unobserved')
+            identity=check.get('surface_id',0)
+            if not self.map.surface_observation.is_ground_source(tuple(self.map.indices(base)),identity):
+                return dict(check,ready=False,reason='tread_ground_unobserved')
+        return check
+
+    def _tread_layers(self, x, y, height):
+        """A historical return alone is not a currently usable tread."""
+        m,s=self.map,self.map.settings
+        return tuple(k for k,h,_ in m.support_samples(x,y)
+                     if s.origin_z+k*s.slice_dh>height and
+                     abs(h-height)<=s.surface_noise_tolerance+1e-7)
+
+    def _tread_margin(self, point, yaw, tolerance=.15):
+        """Rank interior stances including early arrival anywhere in the XY tolerance."""
+        m,s=self.map,self.map.settings
+        direction=np.array([math.cos(yaw),math.sin(yaw)])
+        margins=[]
+        for sign in (-1,1):
+            distance=0.
+            for step in range(1,9):
+                cell=m.indices(np.asarray(point[:2])+sign*step*s.resolution*direction)
+                if not self._tread_layers(*cell,point[2]):break
+                distance=step*s.resolution
+            margins.append(max(0.,distance+.5*s.resolution-tolerance))
+        return min(margins)
+
     def start_ready(self, buffer, version, xyz, floor=None):
         self.prepare(buffer, version)
         return self._admission(xyz,floor=floor)['ready']
@@ -134,29 +181,30 @@ class OnlinePct:
         self.prepare(buffer, version)
         m,s=self.map,self.map.settings
         if forward is None:
-            return m.revision
+            return hash((m.revision,m.surface_observation.revision)) & ((1<<52)-1)
         radius=s.robot_radius+s.safety_margin
         lo,hi=m.indices(np.minimum(base,forward)-radius),m.indices(np.maximum(base,forward)+radius)
-        first=math.floor((base[2]-self.reference_height-s.origin_z)/s.slice_dh)
+        first=math.floor((self._measured_ground(base)[2]-s.origin_z)/s.slice_dh)
         bounds=lo//s.block_size,hi//s.block_size
         revisions=tuple(m.planning_block_versions.get((k,x,y),0)
             for k in range(first,first+3)
             for x in range(bounds[0][0],bounds[1][0]+1)
             for y in range(bounds[0][1],bounds[1][1]+1))
-        return hash((tuple(bounds[0]),tuple(bounds[1]),first,revisions)) & ((1<<52)-1)
+        observations=tuple(m.surface_observation.block_versions.get((x,y),0)
+            for x in range(bounds[0][0],bounds[1][0]+1) for y in range(bounds[0][1],bounds[1][1]+1))
+        return hash((tuple(bounds[0]),tuple(bounds[1]),first,revisions,observations)) & ((1<<52)-1)
 
     def frontiers(self, buffer, version, start=None, minimum_distance=0., window_size=None,
                   query_budget=0., continuation=None, floor=None, geometry_only=False, platform_floor=None,
-                  floor_selection=None, stair_heading=None):
+                  floor_selection=None, stair_heading=None, seek_ascent=False, review_remaining=None):
         self.prepare(buffer, version)
         if isinstance(self.map,FixedLayerMap):
-            ground=None if start is None else np.asarray(start,dtype=float)-[0,0,self.reference_height]
+            ground=None if start is None else self._measured_ground(start)
             start_check = {}
             if ground is not None and (window_size is not None or continuation is not None or floor is not None):
-                start_check=self._admission(start,floor=platform_floor if platform_floor is not None else
-                                            floor if continuation is None and not geometry_only else None,
-                                            collect_blockers=platform_floor is None and not geometry_only)
-                if start_check.get('ground_z') is not None:ground[2]=start_check['ground_z']
+                start_check=self._admission(start,floor=platform_floor,
+                                            collect_blockers=platform_floor is None and
+                                                (not geometry_only or continuation is not None))
             managed_cross=continuation is not None and floor_selection is not None and len(floor_selection)>4
             selection=(self.observation_poses,self._arrival_geometry,*floor_selection[:4]
                        ) if floor_selection is not None and not geometry_only else None
@@ -167,35 +215,66 @@ class OnlinePct:
                             ascent_limits=(max_step,min_rise) if platform_floor is None else None)
             elif floor_selection is not None and len(floor_selection)>4:
                 policy=dict(max_attempts=floor_selection[4])
+            if seek_ascent:
+                attempts,max_step,min_rise=floor_selection[4:]
+                min_rise=max(min_rise,self.map.settings.surface_noise_tolerance+1e-7)
+                return dict(self.map.frontier_index.query(ground,minimum_distance,window_size,query_budget,
+                    floor_selection=selection,attempt_scope=('floor_ascent',floor),max_attempts=attempts,
+                    ascent_limits=(max_step,min_rise)),version=version,map=self.metadata)
             if platform_floor is not None:
                 result=self.map.frontier_index.query(ground,minimum_distance,window_size,query_budget,
                     floor=platform_floor,floor_selection=selection,
                     prune_disconnected=start_check.get('ready',False),fast=self.map.settings.fast_exploration,
-                    max_attempts=2)
+                    max_attempts=2,ordinary_floor=False)
                 return dict(result,version=version,map=self.metadata)
             stair_started=time.monotonic()
             bounded=query_budget>0
             focus=(self.map.indices(ground),stair_heading) if ground is not None and bounded else None
-            stair_deadline=stair_started+query_budget*.5 if bounded else None
-            flights=self.map.stair_index.query(self.map,*floor,deadline=stair_deadline,
-                tile_limit=4 if bounded else None,focus=focus) if floor is not None else ()
-            confirmed=[flight for flight in flights if flight.confirmed]
-            hints=()
-            if bounded and floor is not None:
-                hints=self.map.stair_scout_index.query(self.map,*floor,
-                    deadline=time.monotonic()+query_budget*.5,tile_limit=4,focus=focus)
+            passive=floor is not None and continuation is None and not geometry_only
+            stair_index=self.map.stair_index
+            if floor is None:
+                raw_flights=()
+            elif passive and bounded:
+                self.map.stair_candidates.set_floor(floor)
+                raw_flights=self.map.stair_candidates.confirmed.values()
+            else:
+                raw_flights=stair_index.query(self.map,*floor,deadline=stair_started+query_budget*.5 if bounded else None,
+                    tile_limit=4 if bounded else None,focus=focus)
             stair_index_ms=1000*(time.monotonic()-stair_started)
-            if floor is not None and continuation is None and not geometry_only:
-                self._record_stair_candidates(floor,(*flights,*hints),ground,stair_heading,
-                                              start_check.get('ready',False))
-            saved=[flight for flight in self._saved_stairs.get(floor,())
-                   if self._upward_stair_check(flight,floor)['ready']]
+            qualification_started=time.monotonic()
+            flights=(raw_flights if passive and bounded else
+                     [qualified for flight in raw_flights
+                      if (qualified:=self._qualified_stair(flight,floor)) is not None])
+            confirmed=[flight for flight in flights if flight.confirmed]
+            qualification_ms=1000*(time.monotonic()-qualification_started)
             fast=self.map.settings.fast_exploration and floor is not None and continuation is None and not geometry_only
             result=self.map.frontier_index.query(ground,minimum_distance,window_size,query_budget,
                 continuation,floor if continuation is None else None,flights,
                 evaluate_observers=not geometry_only and (continuation is None or floor is None or managed_cross),fast=fast,
-                prune_disconnected=start_check.get('ready',False),
-                floor_selection=selection,**policy)
+                prune_disconnected=start_check.get('ready',False) and (floor is None or
+                    abs(ground[2]-floor[0])<=floor[1]),
+                floor_selection=selection,review_remaining=review_remaining,**policy)
+            record_ms=0.
+            if passive:
+                on_departure=start_check.get('ready',False) and abs(ground[2]-floor[0])<=floor[1]
+                if bounded:
+                    work=self._maintain_stair_candidates(floor,ground,stair_heading,on_departure,
+                                                        min(.020,query_budget*.25))
+                    stair_index_ms+=work['stair_index_ms']
+                    qualification_ms+=work['stair_qualification_ms']
+                    record_ms=work['stair_candidate_record_ms']
+                    result.setdefault('observer_phase_ms',{}).update(work)
+                else:
+                    began=time.monotonic()
+                    self._record_stair_candidates(floor,flights,ground,stair_heading,on_departure)
+                    record_ms=1000*(time.monotonic()-began)
+            began=time.monotonic()
+            saved=(list(self._saved_stairs.get(floor,())) if passive and bounded else
+                   [flight for flight in self._saved_stairs.get(floor,())
+                    if self._upward_stair_check(flight,floor)['ready']])
+            qualification_ms+=1000*(time.monotonic()-began)
+            result.setdefault('observer_phase_ms',{}).update(stair_index_ms=stair_index_ms,
+                stair_qualification_ms=qualification_ms,stair_candidate_record_ms=record_ms)
             result['stair_targets']=[]
             result['stair_flights']=len(confirmed)
             result['stair_index_ms']=stair_index_ms
@@ -240,7 +319,58 @@ class OnlinePct:
 
     def _stair_priority(self, flight, ground):
         distance=math.dist(self._stair_xyz(flight.entry)[:2],ground[:2]) if ground is not None else 0.
-        return -len(flight.treads),distance,flight.entry,flight.direction
+        return -len(flight.usable_treads),-len(flight.treads),distance,flight.entry,flight.direction
+
+    def _qualified_stair(self, flight, floor):
+        check=self._upward_stair_check(flight,floor)
+        if not check['ready'] and not check.get('reviewable'):return None
+        count=check.get('usable_count',len(flight.treads))
+        return replace(flight,usable_count=None if count==len(flight.treads) else count)
+
+    def _maintain_stair_candidates(self, floor, ground, yaw, on_floor, budget=.020):
+        m=self.map;cache=m.stair_candidates
+        cache.set_floor(floor)
+        if self._passive_stair_floor!=floor:
+            self._passive_stair_records={}
+            self._passive_stair_floor=floor
+        began=time.monotonic();deadline=began+budget
+        work=dict(stair_index_ms=0.,stair_qualification_ms=0.,stair_candidate_record_ms=0.)
+        pending=self._pending_stairs.setdefault(floor,{})
+
+        def publish(group,flight):
+            started=time.monotonic()
+            old=self._passive_stair_records.pop(group,None)
+            approach=pending.pop(old,None) if old is not None else None
+            if flight is not None:
+                if approach is None and on_floor and math.dist(self._stair_xyz(flight.treads[0])[:2],ground[:2])<=STAIR_PROBE_RADIUS:
+                    approach=(*map(float,ground),float(yaw or 0.))
+                pending[flight]=approach
+                self._passive_stair_records[group]=flight
+            work['stair_candidate_record_ms']+=1000*(time.monotonic()-started)
+
+        def qualify(flight,scope):
+            started=time.monotonic()
+            result=self._qualified_stair(flight,scope)
+            work['stair_qualification_ms']+=1000*(time.monotonic()-started)
+            return result
+
+        while cache.changes and time.monotonic()<deadline:
+            group,flight=cache.changes.popitem(last=False)
+            publish(group,flight)
+        # Start with qualification work already queued by the last map commit.
+        checked,published=cache.process(qualify,ground,began+budget*.5,publish)
+        if time.monotonic()<deadline:
+            worker=m.stair_scout_index if self._passive_stair_scout else m.stair_index
+            self._passive_stair_scout=not self._passive_stair_scout
+            started=time.monotonic()
+            worker.advance(m,*floor,deadline=deadline,tile_limit=1,focus=(m.indices(ground),yaw))
+            work['stair_index_ms']=1000*(time.monotonic()-started)
+        more_checked,more_published=cache.process(qualify,ground,deadline,publish)
+        work.update(stair_candidates_checked=checked+more_checked,
+                    stair_candidates_updated=published+more_published,
+                    stair_candidates_pending=len(cache.pending),
+                    stair_maintenance_ms=1000*(time.monotonic()-began))
+        return work
 
     def _rank_stair_entrances(self, flights, ground):
         representatives=[]
@@ -261,15 +391,17 @@ class OnlinePct:
         return ranks
 
     def _remember_stairs(self, task, ground, yaw):
-        flight,floor=task['flight'],task['floor']
+        floor=task['floor']
+        flight=self._qualified_stair(task['flight'],floor)
+        if flight is None or not flight.confirmed:return False
         approach=self._stair_approach(task,task['home'],current=(*ground,yaw),search=True)
         if approach is None or not self._upward_stair_check(flight,floor)['ready']:
             return False
         saved=self._saved_stairs.setdefault(floor,{})
         match=next((f for f in saved if self._same_probe_entrance(f,flight)),None)
-        if (match is not None and len(match.treads)>len(flight.treads) and
-                self._upward_stair_check(match,floor)['ready']):
-            flight=match
+        previous=self._qualified_stair(match,floor) if match is not None else None
+        if previous is not None and len(previous.usable_treads)>len(flight.usable_treads):
+            flight=previous
         if match is not None and match!=flight:
             del saved[match]
         saved[flight]=approach
@@ -295,32 +427,45 @@ class OnlinePct:
         """Keep geometric hints and observed approach poses; never plan or scan."""
         pending=self._pending_stairs.setdefault(floor,{})
         ranked=self._rank_stair_entrances(
-            [f for f in flights if self._upward_stair_check(f,floor)['ready']],ground)
+            [qualified for f in flights if (qualified:=self._qualified_stair(f,floor)) is not None],ground)
         seen=set()
         for flight,group in ranked.items():
             # The ranker orders longer observed flights first. One physical
             # entrance is sufficient; the normal map indices retain the rest.
             if group in seen:continue
             seen.add(group)
-            match=next((f for f in pending if self._same_probe_entrance(f,flight)),None)
+            match=flight if flight in pending else next((f for f in pending if self._same_probe_entrance(f,flight)),None)
             approach=pending.get(match)
-            if match is not None and len(match.treads)>len(flight.treads):
-                flight=match
-            elif match is not None and match!=flight:
+            previous=(self._qualified_stair(match,floor) if match is not None and match!=flight else None)
+            if previous is not None and len(previous.usable_treads)>len(flight.usable_treads):
+                flight=previous
+            if match is not None and match!=flight:
                 del pending[match]
             if (approach is None and start_ready and ground is not None and
                     math.dist(self._stair_xyz(flight.treads[0])[:2],ground[:2])<=STAIR_PROBE_RADIUS):
                 approach=(*map(float,ground),float(yaw or 0.))
             pending[flight]=approach
 
-    def _stair_candidates(self, floor, ground, yaw):
+    def _stair_candidates(self, floor, ground, yaw, incremental=False):
         m=self.map
+        if incremental:
+            on_floor=abs(ground[2]-floor[0])<=floor[1]
+            self._maintain_stair_candidates(floor,ground,yaw,on_floor)
+            return tuple(dict.fromkeys((*m.stair_candidates.candidates.values(),
+                         *self._pending_stairs.get(floor,()),*self._saved_stairs.get(floor,()))))
         focus=(m.indices(ground),yaw)
         flights=m.stair_index.query(m,*floor,deadline=time.monotonic()+.10,tile_limit=4,focus=focus)
         hints=m.stair_scout_index.query(m,*floor,deadline=time.monotonic()+.10,tile_limit=4,focus=focus)
-        return tuple(f for f in (*flights,*hints,*self._pending_stairs.get(floor,()),
+        for cache in (self._pending_stairs.get(floor,{}),self._saved_stairs.get(floor,{})):
+            for old,approach in list(cache.items()):
+                qualified=self._qualified_stair(old,floor)
+                if qualified is None or qualified!=old:
+                    del cache[old]
+                if qualified is not None:
+                    cache[qualified]=approach
+        return tuple(dict.fromkeys(qualified for f in (*flights,*hints,*self._pending_stairs.get(floor,()),
                                 *self._saved_stairs.get(floor,()))
-                     if self._upward_stair_check(f,floor)['ready'])
+                     if (qualified:=self._qualified_stair(f,floor)) is not None))
 
     def _upward_stair_check(self, flight, floor, origin=None, approach=None):
         """One qualification rule for fresh, cached and retried stair flights."""
@@ -330,14 +475,16 @@ class OnlinePct:
                     direction=list(map(int,flight.direction)),
                     treads=[list(map(float,self._stair_xyz(t))) for t in flight.treads])
         reason=None
+        usable=0
+        tail_reason=None
         if abs(flight.entry[2]-floor[0])>min(floor[1],noise)+1e-7:
             reason='stair_entry_outside_floor'
         elif not flight.treads or not noise-1e-7<=flight.treads[0][2]-floor[0]<=maximum+1e-7:
             reason='stair_first_tread_not_above_floor'
-        else:
-            heights=[flight.entry[2],*(t[2] for t in flight.treads)]
-            if any(not 1e-7<b-a<=maximum+1e-7 for a,b in zip(heights,heights[1:])):
-                reason='stair_nonascending_or_unclimbable'
+        elif flight.treads[0][2]-flight.entry[2]<=noise-1e-7:
+            reason='stair_first_tread_within_entry_noise'
+        elif not 1e-7<flight.treads[0][2]-flight.entry[2]<=maximum+1e-7:
+            reason='stair_nonascending_or_unclimbable'
         if reason is None:
             if not any(row['measured'] and not row['unknown'] and
                        abs(float(row['G'])-flight.entry[2])<=noise+1e-7
@@ -347,12 +494,18 @@ class OnlinePct:
         if reason is None:
             tread_tolerance=min(.035,noise)+1e-7
             for x,y,height in flight.treads:
-                column=m.columns.get((x,y))
-                if column is None or not any(
-                        record.orientation in (0,1) and abs(record.height-height)<=tread_tolerance
-                        for record in column.values()):
-                    reason='stair_tread_unobserved'
+                previous=flight.entry[2] if usable==0 else flight.treads[usable-1][2]
+                if not noise-1e-7<=height-previous<=maximum+1e-7:
+                    tail_reason='stair_nonascending_or_unclimbable'
                     break
+                column=m.columns.get((x,y))
+                if not self._tread_layers(x,y,height):
+                    observed=column is not None and any(
+                        record.orientation in (0,1) and abs(record.height-height)<=tread_tolerance
+                        for record in column.values())
+                    tail_reason='stair_tread_no_traversable_slice' if observed else 'stair_tread_unobserved'
+                    break
+                usable+=1
         if reason is None and origin is not None:
             connectivity=m.floor_connectivity(floor)
             component=connectivity.component(m.indices(origin))
@@ -362,7 +515,11 @@ class OnlinePct:
                 reason='stair_entry_disconnected'
         if approach is not None:
             detail['approach']=list(approach)
-        return dict(detail,ready=reason is None,reason=reason or 'upward_stair_candidate')
+        detail.update(usable_count=usable,usable_treads=detail['treads'][:usable],
+                      pending_treads=detail['treads'][usable:],tail_reason=tail_reason)
+        return dict(detail,ready=reason is None and usable>0,
+                    reviewable=reason is None and tail_reason is not None,
+                    reason=reason or (tail_reason if not usable else 'upward_stair_candidate'))
 
     def _stair_approach_safe(self, stance, floor, tolerance):
         band=min(floor[1],self.map.settings.surface_noise_tolerance)
@@ -443,23 +600,27 @@ class OnlinePct:
         if candidates is None:
             candidates=self._stair_candidates(task['floor'],ground,yaw)
         compatible=[f for f in candidates if self._same_probe_entrance(f,task['flight'])]
-        if self._upward_stair_check(task['flight'],task['floor'])['ready']:
-            compatible.insert(0,task['flight'])
+        previous=self._qualified_stair(task['flight'],task['floor'])
+        if previous is not None:
+            compatible.insert(0,previous)
         if compatible:
-            task['flight']=max(compatible,key=lambda f:len(f.treads))
+            task['flight']=max(compatible,key=lambda f:(len(f.usable_treads),len(f.treads)))
 
     def floor_stair_probe(self, buffer, version, base, floor, yaw, depart=False, review=False,
                           tolerance=.15):
         """Advance the same stair-recognition task during exploration and departure."""
         self.prepare(buffer,version)
         m,s=self.map,self.map.settings
-        ground=np.asarray(base,dtype=float).copy()
-        check=self._admission(base,relaxed=True)
-        ground[2]=check.get('ground_z',base[2]-self.reference_height)
-        candidates=self._stair_candidates(floor,ground,yaw)
+        ground=self._measured_ground(base)
+        candidates=self._stair_candidates(floor,ground,yaw,incremental=True)
         saved=self._saved_stairs.get(floor,{})
         pending=self._pending_stairs.get(floor,{})
         task=self._local_stair_task
+        indexing=(m.stair_candidates.floor==floor and (m.stair_candidates.needs_work() or
+                  m.stair_index.pending or m.stair_scout_index.pending or
+                  m.stair_index.floor!=floor or m.stair_scout_index.floor!=floor))
+        if task is None and indexing and not any(f.usable_treads for f in candidates):
+            return dict(ready=False,active=True,reason='stair_index_pending')
         if task is not None and task['floor']!=floor:
             self._local_stair_task=None
             task=None
@@ -505,7 +666,8 @@ class OnlinePct:
             return next((task for task in records if self._same_probe_entrance(flight,task['flight'])),None)
 
         ranked=sorted((group[0] for group in self._entrance_groups(nearby,ground)),
-                      key=lambda flight:(previous_attempt(flight) or {}).get('failures',0))
+                      key=lambda flight:(depart and not flight.confirmed,
+                                         (previous_attempt(flight) or {}).get('failures',0)))
         if depart:
             departures=sorted((flight for flight in saved if flight in candidates),
                               key=lambda flight:self._stair_priority(flight,ground))
@@ -515,6 +677,8 @@ class OnlinePct:
         attempted=set()
         for flight in ranked:
             original=flight
+            flight=self._qualified_stair(flight,floor)
+            if flight is None:continue
             previous=previous_attempt(flight)
             if previous is not None and id(previous) in attempted:
                 continue
@@ -523,7 +687,8 @@ class OnlinePct:
                     continue
                 task=previous
                 if self._upward_stair_check(task['flight'],floor)['ready']:
-                    flight=max((task['flight'],flight),key=lambda f:len(f.treads))
+                    previous=self._qualified_stair(task['flight'],floor)
+                    flight=max((previous,flight),key=lambda f:(len(f.usable_treads),len(f.treads)))
                 task['flight']=flight
                 failures=task.get('failures',0)
                 if task.get('finished') and failures:
@@ -579,15 +744,29 @@ class OnlinePct:
             last_failure=task
         if last_failure is not None:
             return self._stair_probe_result(last_failure,ready=False,finished=True,reason=last_failure['reason'])
+        if indexing:
+            return dict(ready=False,active=True,reason='stair_index_pending')
         return dict(ready=False,reason='no_local_stair_probe')
 
     def _local_stair_observers(self, task, ground, yaw, depart=False):
         """Use a safe tread stance as the stopping condition for each observation."""
         m,s=self.map,self.map.settings
         flight=task['flight']
+        if flight.pending_treads:
+            # Only the next blocked part becomes a local review target. The
+            # complete geometric tail remains cached for later advancement.
+            x,y,height=flight.pending_treads[0]
+            point=self._stair_xyz((x,y,height))
+            if math.dist(point[:2],ground[:2])<=STAIR_PROBE_RADIUS:
+                sources=[(x,y,r.id) for r in m.surface_observation.matching((x,y),height)]
+                layers=[k for k,row in m.layers_at(x,y) if abs(float(row['G'])-height)<=s.surface_noise_tolerance]
+                m.surface_observation.expect(point,sources=sources,slices=layers,review=True)
+                for layer in layers:
+                    for target in m.unknown_blockers(layer,[(x,y)],height):
+                        m.surface_observation.expect(target[:3],slices=[layer],review=True)
         if task.get('approach_pending'):
             geometry=self._upward_stair_check(flight,task['floor'])
-            if not geometry['ready']:
+            if not geometry['ready'] and not geometry.get('reviewable'):
                 task['diagnostic']=geometry
                 return dict(ready=False,reason=geometry['reason'])
             approach=self._stair_approach(task,ground,search=True)
@@ -603,17 +782,29 @@ class OnlinePct:
         task['diagnostic']=self._stair_task_check(task)
         task['diagnostic'].update(observer_ground=list(map(float,ground)),
             saved_candidate=flight in self._saved_stairs.get(task['floor'],()))
-        if not task['diagnostic']['ready']:
+        if not task['diagnostic']['ready'] and not task['diagnostic'].get('reviewable'):
             return dict(ready=False,reason=task['diagnostic']['reason'])
         direction=math.atan2(flight.direction[1],flight.direction[0])
         if not flight.confirmed and self._stair_ends_on_known_level(flight,ground):
             return dict(ready=False,reason='stair_known_level_continuation')
         stance=self._verified_stair_stance(ground,direction,
             allow_level=ground[2]>task['floor'][0]+s.surface_noise_tolerance,
-            targets=[self._stair_xyz(t) for t in flight.treads],rejected=task.get('rejected',()),
+            targets=[self._stair_xyz(t) for t in (flight.usable_treads or flight.treads[:1])],rejected=task.get('rejected',()),
             floor_reference=task['floor'][0],diagnostic=task['diagnostic'])
         if stance is not None:
             x,y,height,heading=stance
+            # The geometric representative may be at a rough/unsampled edge.
+            # Replace only its representation with the actual, fully verified
+            # stance on that same tread; never invent a new height or skip a
+            # blocked earlier tread when counting the continuous safe prefix.
+            at=min(range(len(flight.treads)),key=lambda i:abs(flight.treads[i][2]-height))
+            if abs(flight.treads[at][2]-height)<=s.surface_noise_tolerance+1e-7:
+                treads=list(flight.treads)
+                treads[at]=(*map(int,m.indices((x,y))),float(height))
+                qualified=self._qualified_stair(replace(flight,treads=tuple(treads)),task['floor'])
+                if qualified is not None:
+                    flight=task['flight']=qualified
+                    task['diagnostic'].update(self._stair_task_check(task))
             task['verified']=True
             task['last_stance']=stance[:3]
             task['diagnostic']['verified_stance']=list(map(float,stance[:3]))
@@ -655,7 +846,26 @@ class OnlinePct:
             observed_targets.append([tx,ty,tz])
         task['diagnostic']['observation_targets']=observed_targets
         if not observations:
-            return dict(ready=False,reason='stair_no_safe_observation')
+            # A new stance can require evidence the current stance is able to
+            # collect. Keep the actual-body and sight checks for that scan.
+            diagnostic=task['diagnostic']
+            # Keep the gaps local to the rejected tread stance as well as
+            # the gaps closest to the robot returned by the wider search.
+            blockers=[p for rejected in diagnostic.get('rejected_poses',())
+                      for p in rejected.get('unknown_blockers',())]
+            blockers.extend(diagnostic.get('arrival_blockers',[]))
+            blockers.extend(views['unknown_blockers'])
+            targets=list(dict.fromkeys(tuple(p[:3]) for p in blockers))
+            start=(*ground[:2],ground[2]+self.reference_height)
+            completed=[(*point,heading,.35) for point,heading in task['views']]
+            stationary=self.observation_poses(start,(0.,0.,yaw),targets,
+                ascent=direction,motions=False,purpose='current_observation',completed=completed)
+            if not stationary['poses']:
+                return dict(ready=False,reason='stair_no_safe_observation')
+            tx,ty,tz,_,_,_,heading,_=stationary['poses'][0]
+            task['diagnostic']['observation_targets']=[[tx,ty,tz]]
+            return dict(ready=True,active=True,observations=[list(ground)],yaws=[heading],
+                        yaw=heading,reason='stair_current_observation_ready')
         return dict(ready=True,active=True,observations=observations,yaws=headings,yaw=headings[0],
                     reason='stair_observation_ready')
 
@@ -681,6 +891,7 @@ class OnlinePct:
                                floor_reference=None,diagnostic=None):
         """Share target admission, observed arrival area and native route verification."""
         s=self.map.settings
+        max_rise=min(.16,s.step_max)
         steps,_,_=self._stair_step_targets(ground,.15+s.resolution,
             (yaw,ground[2]-s.surface_noise_tolerance,.15))
         start=tuple(np.asarray(ground)+[0.,0.,self.reference_height])
@@ -693,7 +904,9 @@ class OnlinePct:
         reasons={}
         def eligible(x,y,height):
             reason=None
-            if floor_reference is not None and height<floor_reference+s.surface_noise_tolerance-1e-7:
+            if height-ground[2]>max_rise+1e-7:
+                reason='stance_above_next_step'
+            elif floor_reference is not None and height<floor_reference+s.surface_noise_tolerance-1e-7:
                 reason='stance_not_above_floor'
             elif any(math.dist((x,y),p[:2])<.20 and abs(height-p[2])<.04 for p in rejected):
                 reason='previously_rejected_stance'
@@ -705,17 +918,25 @@ class OnlinePct:
                 reason='stance_not_forward'
             if reason:reasons[reason]=reasons.get(reason,0)+1
             return reason is None
-        for x,y,height,heading in (*centers,*steps):
+        margins={}
+        def priority(point):
+            key=tuple(point[:3])
+            if key not in margins:margins[key]=self._tread_margin(key,yaw)
+            return -margins[key]
+        for x,y,height,heading in sorted((*centers,*steps),key=priority):
             if not eligible(x,y,height):continue
             candidates.append((np.asarray((x,y,height+self.reference_height)),0,True))
         search=self.observation_poses(start,(0.,0.,yaw),goals,stances=candidates,
             ascent=yaw,headings=[yaw],minimum_gain=0,max_results=12,diagnostics=diagnostic is not None)
+        blockers=search['unknown_blockers']
         samples=search.get('rejected_poses',[])
         checked=search.get('stances_checked',0)
         if not search['poses']:
             first_search=search
+            lower=ground[2]-s.surface_noise_tolerance if allow_level else ground[2]
+            upper=ground[2]+max_rise
             search=self.observation_poses(start,(0.,0.,yaw),goals,
-                floor=(ground[2]+s.step_max*.5,s.step_max*.5+s.surface_noise_tolerance),
+                floor=((lower+upper)*.5,(upper-lower)*.5),
                 ascent=yaw,headings=[yaw],
                 preferred=next((p for p in goals if p[2]>ground[2]+s.surface_noise_tolerance),None),
                 diagnostics=diagnostic is not None)
@@ -723,11 +944,14 @@ class OnlinePct:
                 reasons[reason]=reasons.get(reason,0)+count
             samples=(samples+search.get('rejected_poses',[]))[:3]
             checked+=search.get('stances_checked',0)
+            blockers=self.map.merge_unknown_blockers(blockers+search['unknown_blockers'],ground)
         for reason,count in search.get('rejections',{}).items():reasons[reason]=reasons.get(reason,0)+count
         if diagnostic is not None:
             diagnostic.update(stance_candidates=len(centers)+len(steps),admitted_stances=len(search['poses']),
-                              stances_checked=checked,rejections=reasons,rejected_poses=samples,route_rejections={})
-        for _,_,_,x,y,z,heading,_ in search['poses']:
+                              stances_checked=checked,rejections=reasons,rejected_poses=samples,
+                              arrival_blockers=blockers,route_rejections={})
+        for _,_,_,x,y,z,heading,_ in sorted(search['poses'],
+                key=lambda view:priority((view[3],view[4],view[5]-self.reference_height))):
             height=z-self.reference_height
             if not eligible(x,y,height):continue
             began=time.monotonic()
@@ -745,11 +969,11 @@ class OnlinePct:
 
     def observation_poses(self, base, attitude, targets, stances=None, floor=None, ascent=None,
                           preferred=None, tolerance=.15, completed=(), minimum_gain=1,
-                          max_results=3, motions=None, headings=None, version=None, diagnostics=False):
+                          max_results=3, motions=None, headings=None, version=None, diagnostics=False, purpose='arrival'):
         if version is not None:self.prepare(b'',version)
         return self.map.frontier_index.observation_model.pose_search.observation_poses(
             base,attitude,targets,stances,floor,ascent,preferred,tolerance,completed,
-            minimum_gain,max_results,motions,headings,diagnostics)
+            minimum_gain,max_results,motions,headings,diagnostics,purpose)
 
     def _arrival_geometry(self, xyz, xy_tolerance):
         return self.map.frontier_index.observation_model.pose_search._arrival_geometry(xyz,xy_tolerance)
@@ -761,7 +985,9 @@ class OnlinePct:
         """Observation targets at the expected height of the next tread."""
         self.prepare(buffer, version)
         m, s = self.map, self.map.settings
-        reference = self._admission(base, relaxed=True).get('ground_z',base[2]-self.reference_height)
+        support=self._ground_support(base)
+        if not support['ready']:return []
+        reference = support['ground_z']
         start = np.asarray(base[:2], dtype=float)
         forward = np.array([math.cos(heading),math.sin(heading)])
         side = np.array([-forward[1],forward[0]])
@@ -776,16 +1002,28 @@ class OnlinePct:
                                                if not row['unknown']])
         higher = [(d,l,h) for d,l,heights in cells.values() for h in heights
                   if min_rise<h-reference<=max_rise]
-        first,_,height = min(higher,default=(width,0.,reference+max_rise*.65))
+        search_range=(reference+min_rise,reference+max_rise)
+        # Aiming at the middle of the search band does not assert a tread at
+        # that height. Only actual returns may supply the next G.
+        first,_,height = min(higher,default=(width,0.,sum(search_range)*.5))
         points = []
         for xy,(d,l,heights) in cells.items():
             if d<first-2*s.resolution:
                 continue
             plausible = [h for h in heights if min_rise<h-reference<=2*max_rise]
-            expected = min(plausible,key=lambda z:abs(z-height),default=height)
+            expected = min(plausible,key=lambda z:abs(z-height),default=sum(search_range)*.5)
+            if (m.surface_relations.explains_step(xy,expected) or
+                    m.surface_relations.fresh_clearance_barrier(xy,reference) is not None):
+                continue
             point = (*m.position((0,*xy)),expected)
-            points.append((abs(d-max(first,2.5*width))+l,point))
-        return [list(point) for _,point in sorted(points)[:12]]
+            points.append((abs(d-max(first,2.5*width))+l,point,not plausible))
+        result=[]
+        source=[(*map(int,m.indices(base)),support['surface_id'])] if support['ready'] else []
+        for _,point,search in sorted(points)[:12]:
+            if search:
+                m.surface_observation.expect(point,sources=source,kind='search',height_range=search_range)
+            result.append(list(point))
+        return result
 
     def _stair_targets(self, flights, ground, continuation=None, rejected=None,
                        departure_height=None):
@@ -812,7 +1050,7 @@ class OnlinePct:
                                                   s.resolution,s.surface_noise_tolerance)):
                     continue
             dx,dy=flight.direction
-            for x,y,z in flight.treads:
+            for x,y,z in flight.usable_treads:
                 if not next_height(z):
                     continue
                 offsets = (0,-1,-2,-3,-4,-5,-6,1,2,3)
@@ -876,7 +1114,8 @@ class OnlinePct:
         same_tread = []
         unsafe = 0
         blockers = []
-        for point in sorted(candidates, key=candidates.get):
+        for point in sorted(candidates,key=lambda p:(candidates[p][0],-self._tread_margin(p,yaw),
+                                                       *candidates[p][1:])):
             x, y, height = point
             level = point[2]-ground[2] <= min_rise
             views = same_tread if level else targets
@@ -907,10 +1146,80 @@ class OnlinePct:
         self.prepare(buffer,version)
         self.map.frontier_index.complete(cluster_id,revision,point)
 
+    def _local_stair_heading(self, ground):
+        """Direction from nearby measured, traversable tread edges, never a whole-map query."""
+        m,s=self.map,self.map.settings
+        radius=max(3*(s.robot_radius+s.safety_margin),4*s.resolution)
+        extent=math.ceil(radius/s.resolution)
+        cx,cy=map(int,m.indices(ground))
+        lo=np.array([cx-extent,cy-extent])//s.block_size
+        hi=np.array([cx+extent,cy+extent])//s.block_size
+        key=(cx,cy,float(ground[2]),m.first_layer,m.last_layer,tuple(
+            m.planning_block_versions.get((k,bx,by),0)
+            for k in range(m.first_layer,m.last_layer+1)
+            for bx in range(lo[0],hi[0]+1) for by in range(lo[1],hi[1]+1)))
+        cached=getattr(self,'_stair_heading_cache',None)
+        if cached is not None and cached[0]==key:return cached[1]
+        tolerance=s.surface_noise_tolerance
+        min_rise,max_rise=tread_rise_bounds(s)
+        heights={}
+        for x in range(cx-extent,cx+extent+1):
+            for y in range(cy-extent,cy+extent+1):
+                if math.hypot(x-cx,y-cy)*s.resolution>radius:continue
+                samples=[h for _,h,_ in m.support_samples(x,y)
+                         if abs(h-ground[2])<=max_rise+tolerance]
+                if samples:heights[x,y]=min(samples,key=lambda h:abs(h-ground[2]))
+        direction=np.zeros(2);total=0.;edges=0
+        for (x,y),height in heights.items():
+            for dx,dy in ((1,0),(0,1)):
+                other=heights.get((x+dx,y+dy))
+                if other is None:continue
+                rise=other-height
+                if not min_rise<abs(rise)<=max_rise+1e-7:continue
+                if not min(height,other)-tolerance<=ground[2]<=max(height,other)+tolerance:continue
+                distance=math.hypot(x+.5*dx-cx,y+.5*dy-cy)*s.resolution
+                weight=abs(rise)/(.2+distance)**2
+                direction+=math.copysign(weight,rise)*np.array([dx,dy])
+                total+=weight;edges+=1
+        confidence=float(np.linalg.norm(direction))/total if total else 0.
+        result=dict(ready=edges>=3 and confidence>=.65,reason='measured_tread_direction',
+                    yaw=math.atan2(direction[1],direction[0]),edges=edges,confidence=confidence)
+        if not result['ready']:result['reason']='stair_direction_unobserved'
+        self._stair_heading_cache=key,result
+        return result
+
     def observation_task(self, buffer, version, operation, cid, xyz, yaw, half_angle, blockers=None):
         self.prepare(buffer,version)
         model=self.map.frontier_index.observation_model
         ground=np.asarray(xyz,dtype=float)-[0,0,self.reference_height]
+        if operation=='floor_work_available':
+            pending=self.map.frontier_index.floor_work_available((float(xyz[2]),half_angle))
+            return dict(ready=pending,reason='floor_work_available' if pending else 'floor_work_unchanged')
+        if operation=='begin_frontier_crossing':
+            self.map.surface_observation.begin_crossing()
+            return dict(ready=True,reason='frontier_crossing_started')
+        if operation=='cancel_frontier_crossing':
+            self.map.surface_observation.cancel_crossing()
+            return dict(ready=True,reason='frontier_crossing_cancelled')
+        if operation=='enter_frontier_floor':
+            evidence=self.map.surface_observation
+            new=evidence.enter_frontier_floor(xyz,half_angle)  # xyz already contains measured ground height.
+            return dict(ready=True,reason='frontier_floor_entered' if new else 'frontier_floor_revisited',
+                        **evidence.status())
+        if operation=='stair_heading':
+            if self.map.first_layer is None:return dict(ready=False,reason='map_unavailable')
+            support=self._ground_support(xyz)
+            if not support['ready']:return dict(ready=False,reason=support['reason'])
+            ground[2]=support['ground_z']
+            return self._local_stair_heading(ground)
+        if operation=='observe_height':
+            support=self._ground_support(xyz)
+            evidence=self.map.surface_observation
+            if not support['ready']:
+                return dict(ready=False,reason='height_support_unobserved',**evidence.status())
+            ground[2]=support['ground_z']
+            result=evidence.visit_height(ground)
+            return dict(result,ready=result['triggered'])
         if operation=='arrival_area':
             return self._arrival_area(xyz,half_angle,yaw)
         if operation=='blocker_available':
@@ -937,14 +1246,27 @@ class OnlinePct:
                         for target in targets)
             return dict(ready=pending,reason='observation_pending' if pending else 'blocker_resolved')
         if operation in ('floor_reject_view','floor_reject_view_timeout'):
-            ready=self.map.frontier_index.reject_floor_view(cid,xyz,operation.endswith('_timeout'),blockers or ())
+            ready=self.map.frontier_index.reject_floor_view(cid,xyz,operation.endswith('_timeout'),blockers or (),half_angle)
             return dict(ready=ready,reason=operation)
         if operation in ('arm_floor_stair_probe','floor_stair_probe_progress','finish_floor_stair_probe',
                          'finish_local_stair_return','cancel_local_stair_probe_scan','finish_stair_recognition',
-                         'reject_stair_stance'):
+                         'reject_stair_stance','recover_stair_stop'):
             task=self._local_stair_task
             if task is None:
                 return dict(ready=False,reason='floor_stair_probe_not_started')
+            if operation=='recover_stair_stop':
+                ground=self._measured_ground(xyz)
+                stand=ground+[0.,0.,self.reference_height]
+                check=self._arrival_area(stand,task['tolerance'],yaw)
+                if not check['ready'] or task.get('stop_recoveries',0)>=2:
+                    return dict(check,ready=False,reason='stair_stop_recovery_unavailable')
+                # A timeout is not an arrived receipt. Keep the physical task,
+                # reject this stance and replan locally without resetting scan budgets.
+                rejected='rejected_approaches' if task.get('approach_pending') else 'rejected'
+                task.setdefault(rejected,[]).append(tuple(map(float,ground)))
+                task.update(stop_recoveries=task.get('stop_recoveries',0)+1,
+                            finished=False,verified=False,reason='stair_stop_safe_replan')
+                return self._stair_probe_result(task,ready=True,reason='stair_stop_safe_replan')
             if operation=='reject_stair_stance':
                 if task.get('approach_pending'):
                     task.setdefault('rejected_approaches',[]).append(tuple(ground))
@@ -999,22 +1321,32 @@ class OnlinePct:
             stance=self._verified_stair_stance(ground,yaw,allow_level=True)
             return dict(ready=stance is not None,reason='stair_stance_ready' if stance else 'stair_stance_missing')
         if operation=='arm_stair_view':
-            self.stair_view = (self.map.integrated_serial,ground,yaw)
+            m,s=self.map,self.map.settings
+            ground=self._measured_ground(xyz)
+            forward=np.array([math.cos(yaw),math.sin(yaw)])
+            side=np.array([-forward[1],forward[0]])
+            width=s.robot_radius+s.safety_margin
+            lateral=np.arange(-width,width+s.resolution*.5,s.resolution)
+            if half_angle:
+                lateral=lateral[lateral*math.copysign(1.,half_angle)>=-.5*s.resolution]
+            cells={tuple(m.indices(ground[:2]+distance*forward+offset*side))
+                   for distance in np.arange(s.resolution,3*width+s.resolution*.5,s.resolution)
+                   for offset in lateral}
+            limit=min(.16,s.step_max)+1e-7
+            next_tread={xy:tuple(r.height for r in m.surface_observation.observed(xy,kind='ground')
+                                if s.surface_noise_tolerance<r.height-ground[2]<=limit) for xy in cells}
+            targets={xy:heights for xy,heights in next_tread.items() if heights}
+            self.stair_view=(m.integrated_serial,ground[2],targets or dict.fromkeys(cells,()))
             return dict(ready=True,reason='stair_view_armed')
         if operation=='stair_view_progress':
             if not hasattr(self,'stair_view'):
                 return dict(ready=False,reason='stair_view_not_armed')
-            serial, origin, heading = self.stair_view
+            serial, height, targets = self.stair_view
             m,s = self.map,self.map.settings
-            forward = np.array([math.cos(heading),math.sin(heading)])
-            side = np.array([-forward[1],forward[0]])
-            width = s.robot_radius+s.safety_margin
-            cells = {tuple(m.indices(origin[:2]+d*forward+l*side))
-                     for d in np.arange(s.resolution,3*width+s.resolution*.5,s.resolution)
-                     for l in np.arange(-width,width+s.resolution*.5,s.resolution)}
-            fresh = any(record.last_seen>serial and
-                        -s.surface_noise_tolerance<=record.height-origin[2]<=2*s.step_max
-                        for xy in cells for record in (m.columns[xy].values() if xy in m.columns else ()))
+            fresh=any(any(abs(record.height-expected)<=s.surface_noise_tolerance for expected in heights)
+                      if heights else -s.surface_noise_tolerance<=record.height-height<=min(.16,s.step_max)+s.surface_noise_tolerance
+                      for xy,heights in targets.items()
+                      for record in m.surface_observation.observed(xy,after=serial,kind='ground'))
             return dict(ready=fresh,fresh=fresh,
                         reason='stair_view_observed' if fresh else 'stair_view_no_local_returns')
         if operation in ('floor_attempt','floor_recovery_attempt'):
@@ -1039,7 +1371,8 @@ class OnlinePct:
                      if attempt is not None and attempt.cluster==cid else 'untracked')
             return dict(ready=outcome in ('first_no_progress','deferred','blacklisted','cluster_changed'),
                         reason=operation,floor_attempt=outcome)
-        if operation in ('floor_no_observation','floor_observer_timeout','floor_disconnected','floor_route_timeout','floor_no_route'):
+        if operation in ('floor_no_observation','floor_observer_timeout','floor_disconnected','floor_route_timeout',
+                         'floor_no_route','floor_missing_connection','floor_known_barrier'):
             index=self.map.frontier_index
             attempt=model.floor_attempt
             if attempt is not None and attempt.cluster==cid:
@@ -1048,7 +1381,8 @@ class OnlinePct:
                 attempt=index.begin_floor_attempt(cid)
             outcome=index.settle_floor_attempt(attempt,True,tuple(ground) if half_angle>0. else None,
                                                failure_reason=operation)
-            return dict(ready=outcome in ('first_no_progress','deferred','blacklisted'),reason=operation,floor_attempt=outcome)
+            return dict(ready=outcome in ('first_no_progress','deferred','blacklisted','review_timed_out'),
+                        reason=operation,floor_attempt=outcome)
         if operation=='begin':return model.begin(cid,ground)
         if operation in ('begin_flat','begin_floor'):
             return model.begin(cid,ground,half_angle=half_angle,current_yaw=yaw,
@@ -1076,8 +1410,13 @@ class OnlinePct:
         return self.plan(buffer,version,start,target,floor,goal_height_tolerance=.02,
                          collect_blockers=True,dense=True)
 
+    def plan_review_surface(self, buffer, version, start, target, floor, budget):
+        return self.plan(buffer,version,start,target,floor,goal_height_tolerance=.02,
+                         collect_blockers=True,budget=budget)
+
     def plan(self, buffer, version, start, target, floor=None, *, goal_height_tolerance=None,
-             collect_blockers=False, dense=False):
+             collect_blockers=False, dense=False, budget=None):
+        deadline=None if budget is None else time.monotonic()+max(0.,budget)
         self.prepare(buffer, version)
         start_check=self._admission(start,floor=floor,collect_blockers=collect_blockers)
         goal_check=self._admission(target,floor=floor,height_tolerance=goal_height_tolerance,
@@ -1098,7 +1437,7 @@ class OnlinePct:
         ground_goal[2] -= self.reference_height
         route = self.planner.plan(ground_start, ground_goal, optimize=False,
                                   start_check=start_check, goal_check=goal_check, floor=floor,
-                                  collect_blockers=collect_blockers, dense=dense)
+                                  collect_blockers=collect_blockers, dense=dense, deadline=deadline)
         metadata['anchor_search'] = self.planner.search_diagnostics
         if route is None or len(route) == 0:
             if collect_blockers:
@@ -1121,9 +1460,9 @@ class OnlinePct:
         self.prepare(buffer,version)
         return self._admission(point,floor=floor)
 
-    def tread_support_check(self, buffer, version, point, floor):
+    def tread_support_check(self, buffer, version, point, floor=None):
         self.prepare(buffer, version)
-        return self._admission(point, floor=floor, relaxed=True)
+        return self._ground_support(point,floor)
 
     def platform_check(self, buffer, version, point, floor=None):
         self.prepare(buffer,version)
@@ -1145,6 +1484,11 @@ class OnlinePct:
         center=self._admission(point,height_tolerance=PLATFORM_HEIGHT_TOLERANCE)
         return self._landing_geometry(point, departure_floor, heading, center,reference_height)
 
+    def descending_landing_check(self, buffer, version, point, departure_floor, heading=0.):
+        self.prepare(buffer,version)
+        center=self._admission(point,height_tolerance=PLATFORM_HEIGHT_TOLERANCE)
+        return self._landing_geometry(point,departure_floor,heading,center,direction=-1)
+
     def landing_recovery_check(self, buffer, version, point, departure_floor, heading=0., reference_height=None):
         self.prepare(buffer,version)
         # Only assess the platform geometry. The shift planner must separately
@@ -1152,10 +1496,12 @@ class OnlinePct:
         center=self._admission(point,relaxed=True,height_tolerance=.04)
         return self._landing_geometry(point, departure_floor, heading, center,reference_height)
 
-    def _landing_geometry(self, point, departure_floor, heading, center,reference_height=None):
+    def _landing_geometry(self, point, departure_floor, heading, center,reference_height=None,*,direction=1):
         if not center['ready']:return center
         ground=center['ground_z']
-        if ground<=departure_floor[0] or point[2]-self.reference_height<=departure_floor[0]:
+        boundary=departure_floor[0]
+        minimum=departure_floor[1] if direction<0 else 0.
+        if min(direction*(ground-boundary),direction*(point[2]-self.reference_height-boundary))<=minimum:
             return dict(center,ready=False,reason='still_on_departure_floor')
         m=self.map;s=m.settings
         xy=tuple(m.indices(point))
@@ -1176,7 +1522,7 @@ class OnlinePct:
         if cells is None:
             return dict(center,ready=False,reason='platform_not_confirmed')
         platform_height=median(heights[xy] for xy in cells)
-        if platform_height<=departure_floor[0]:
+        if direction*(platform_height-boundary)<=minimum:
             return dict(center,ready=False,reason='still_on_departure_floor')
         return dict(center,reason='safe_platform',platform_height=platform_height)
 
@@ -1341,5 +1687,7 @@ class OnlinePct:
         metadata['early_stop_check']=early
         if not goal['ready'] or not early['ready']:
             return 'pct_unsafe_shift_stop',[],metadata
-        reason=self._reverse_check([a,b],level=first['ground_z'])
+        reason=self._reverse_check([a,b],level=first['ground_z'],
+                                   level_failure='shift_exceeds_step',
+                                   height_tolerance=min(.16,self.map.settings.step_max))
         return ('pct_'+reason,[],metadata) if reason else ('ok',[list(start),list(target)],metadata)

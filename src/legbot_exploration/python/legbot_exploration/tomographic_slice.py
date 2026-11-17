@@ -41,11 +41,13 @@ class TomographicSlice:
     def update_geometry(self, evidence):
         size = self.settings.block_size
         ground_changed, base_changed = set(), set()
-        for (x,y), (ground,ceiling) in evidence.items():
+        for (x,y), (ground,ceiling,pending_ceiling) in evidence.items():
             row = self.blocks[x//size,y//size][x%size,y%size]
             row['measured'] = True
             g = self._commit_surface(row, 'G', ground)
             c = self._commit_surface(row, 'C', ceiling)
+            c |= different(float(row['pending_ceiling_z']),pending_ceiling)
+            row['pending_ceiling_z']=pending_ceiling
             if g:
                 ground_changed.add((x,y))
             if g or c:

@@ -121,6 +121,10 @@ class CrossLayerTask {
     highest_=std::max(highest_,base[2]);
     if(phase_=="approaching" && rise()>=minimum_rise*.5)phase_="ascending";
   }
+  bool allows_recovery(const Point &base,const Point &point,double step_limit) const {
+    return std::abs(point[2]-base[2])<=std::min(.16,step_limit)+1e-7 &&
+        ((!engaged() && !deferred()) || project(point).distance<=corridor_radius);
+  }
   bool allows(const Point &point) const {
     if(!engaged() && !deferred())return true;
     if(point[2]<highest_-height_slack)return false;

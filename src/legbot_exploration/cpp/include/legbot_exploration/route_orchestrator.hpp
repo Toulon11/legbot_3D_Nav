@@ -31,6 +31,7 @@ struct PlanningGoal {
   std::optional<Point> observation_xyz;  // Explicit body-reference XYZ for PCT targets.
   std::optional<double> observation_yaw;
   std::optional<XY> pct_floor; // Latched reference G and the allowed height deviation.
+  std::optional<double> pct_planning_deadline; // Steady-clock time in seconds.
   bool request_occupancy = true;
   bool request_layer = true;
   RecoveryRequest recovery_request = RecoveryRequest::position;

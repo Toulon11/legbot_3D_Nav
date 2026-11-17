@@ -21,8 +21,13 @@ class ObservationPoseSearch:
 
     def observation_poses(self, base, attitude, targets, stances=None, floor=None, ascent=None,
                           preferred=None, tolerance=.15, completed=(), minimum_gain=1,
-                          max_results=3, motions=None, headings=None, diagnostics=False):
-        """XYZ inputs use body height; targets use surface height. No safety bypass."""
+                          max_results=3, motions=None, headings=None, diagnostics=False, purpose='arrival'):
+        """New arrivals require full coverage; current scans require actual support."""
+        if purpose not in ('arrival','current_observation'):
+            raise ValueError('invalid observation purpose')
+        current=purpose=='current_observation'
+        if current and (motions is not False or stances is not None or minimum_gain<1):
+            raise ValueError('current observation only admits the actual stationary pose')
         m,s=self.map,self.map.settings
         base=np.asarray(base,dtype=float)
         targets=np.asarray(targets,dtype=float).reshape(-1,3)
@@ -48,7 +53,8 @@ class ObservationPoseSearch:
                         cost=float(row['inflated_terrain_cost']) if np.isfinite(row['inflated_terrain_cost']) else None,
                         unknown=bool(row['unknown']),solid=bool(row['solid'])))
                 result['rejected_poses'].append(dict(stance=list(map(float,stand)),reason=reason,
-                    layers=layers,unknown_blockers=(check or {}).get('unknown_blockers',[])[:8]))
+                    layers=layers,unknown_blockers=(check or {}).get('unknown_blockers',[])[:8],
+                    observation_failures=(check or {}).get('observation_failures',[])))
         if m.first_layer is None or (not len(targets) and minimum_gain>0):return result
         if stances is None:
             stances=self._stances(base,attitude,targets,floor,ascent,preferred,motions)
@@ -59,12 +65,13 @@ class ObservationPoseSearch:
             if floor is not None and abs(stand[2]-self.reference_height-floor[0])>floor[1]+1e-7:
                 reject('stance_outside_floor',stand)
                 continue
-            stop=timed('stop_ms',self._arrival_area,stand,tolerance,None)
+            stop=(timed('stop_ms',self._arrival_stop,stand,s.robot_radius+s.safety_margin)[2] if current else
+                  timed('stop_ms',self._arrival_area,stand,tolerance,None))
             if not stop['ready']:
                 reject(stop['reason'],stand,stop)
                 result['unknown_blockers'].extend(stop.get('unknown_blockers',()))
                 continue
-            if not roll and not pitch:
+            if not current and not roll and not pitch:
                 blind_area = timed('blind_ms',self._arrival_area,stand,tolerance,yaw)
                 if not blind_area['ready'] and blind_area.get('heading_independent',False):
                     reject(blind_area['reason'],stand,blind_area)
@@ -104,7 +111,7 @@ class ObservationPoseSearch:
                     result['view_counts']['max_visible']=max(result['view_counts']['max_visible'],int(mask.sum()))
                 gain=int(mask.sum())
                 if gain<minimum_gain or (best is not None and gain<=best['gain']):continue
-                check=timed('blind_ms',self._arrival_area,stand,tolerance,heading,
+                check=stop if current else timed('blind_ms',self._arrival_area,stand,tolerance,heading,
                                          sensor_origin=None if sensor_pose is None else sensor_pose[:3])
                 if not check['ready']:
                     rejected_area=check
@@ -153,7 +160,7 @@ class ObservationPoseSearch:
                           2 if i==4 else 1) for d in (.22,.35,.50,.60) for i in range(8)]
             for delta,action in offsets:
                 stand=base+delta
-                tolerance=min(.16,s.step_max) if action==2 else .04
+                tolerance=min(.16,s.step_max)
                 check=self._admission(stand,floor=(ground,tolerance) if ascent is not None else floor)
                 if check['ready']:
                     stand[2]=check['ground_z']+self.reference_height
@@ -171,6 +178,8 @@ class ObservationPoseSearch:
                               (block['inflated_terrain_cost']>=0) & (block['inflated_terrain_cost']<=20)
                         if floor is not None:valid &= abs(block['G']-floor[0])<=floor[1]
                         for i,j in zip(*np.nonzero(valid)):
+                            cell=(bx*s.block_size+int(i),by*s.block_size+int(j))
+                            if not m.surface_observation.is_ground_source(cell,int(block['g_surface_id'][i,j])):continue
                             ground=(s.origin_x+(bx*s.block_size+i)*s.resolution,
                                     s.origin_y+(by*s.block_size+j)*s.resolution,float(block['G'][i,j]))
                             if math.dist(ground[:2],target[:2])>2.:continue
@@ -191,7 +200,9 @@ class ObservationPoseSearch:
             m.planning_block_versions.get((k,bx,by),0)
             for k in range(m.first_layer,m.last_layer+1)
             for bx in range(lo[0],hi[0]+1) for by in range(lo[1],hi[1]+1)
-        ) if m.first_layer is not None else ())
+        ) if m.first_layer is not None else (),tuple(
+            m.surface_observation.block_versions.get((bx,by),0)
+            for bx in range(lo[0],hi[0]+1) for by in range(lo[1],hi[1]+1)))
         return stop_radius,observation_radius,revision
 
     def _arrival_area(self, xyz, xy_tolerance, heading=0., sensor_origin=None):
@@ -276,8 +287,10 @@ class ObservationPoseSearch:
                     if cell in visited or cell not in area:
                         continue
                     if cell not in column_heights:
-                        column_heights[cell] = tuple(float(row['G']) for _, row in mapping.layers_at(*cell)
-                                                     if row['measured'] and not row['unknown'])
+                        column_heights[cell] = tuple(float(row['G']) for cut, row in mapping.layers_at(*cell)
+                                                     if row['measured'] and not row['unknown'] and
+                                                     mapping.surface_observation.is_ground_source(cell,int(row['g_surface_id'])) and
+                                                     mapping.surface_observation.ground_observed(cell,float(row['G']),cut))
                     compatible = [height for height in column_heights[cell]
                                   if abs(height - reference) <= mapping.settings.step_max + 1e-5]
                     if compatible:
@@ -300,7 +313,9 @@ class ObservationPoseSearch:
             missing,known,unsafe={},[],0
             for x,y in stopping:
                 row=m.cell((layer,x,y))
-                if row is None or row['unknown'] or not row['measured']:
+                if (row is None or row['unknown'] or not row['measured'] or
+                        not m.surface_observation.is_ground_source((x,y),int(row['g_surface_id'])) or
+                        not m.surface_observation.ground_observed((x,y),float(row['G']),layer)):
                     missing[x,y]=height
                 elif row['solid'] or abs(float(row['G'])-height)>s.step_max+1e-5:
                     unsafe+=1
@@ -326,5 +341,7 @@ class ObservationPoseSearch:
                     reason='arrival_unsafe_stop_area' if unsafe else
                            'arrival_unobserved_blind_area' if missing else 'arrival_area_ready',
                     stop_radius=radius,blind_radius=blind_radius,unobserved_cells=len(missing),
-                    unsafe_cells=unsafe,unknown_blockers=m.merge_unknown_blockers(blockers,xyz))
+                    unsafe_cells=unsafe,unknown_blockers=m.merge_unknown_blockers(blockers,xyz),
+                    observation_failures=[m.surface_observation.describe_ground((x,y),height,None if blind_radius else layer)
+                        for (x,y),height in sorted(missing.items())[:12]])
 

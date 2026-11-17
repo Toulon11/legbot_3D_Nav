@@ -2,6 +2,7 @@
 import unittest
 from collections import deque
 from contextlib import ExitStack
+from dataclasses import replace
 from unittest.mock import patch
 import numpy as np
 from legbot_exploration.fixed_layer_map import FixedLayerMap,MapSettings
@@ -68,39 +69,108 @@ class FrontierIndexTest(unittest.TestCase):
         self.assertTrue(any(any(k[1:3]==(0,0) for k in index.floor_query_members[c['id']])
                             for c in result['clusters']))
 
-    def test_fully_observed_tread_boundary_does_not_extend_into_other_tread(self):
-        points=np.asarray([(x*.1,y*.1,.915 if y>=0 else 1.025)
-                           for x in range(-4,5) for y in range(-4,5)],dtype='float32')
+    def test_same_column_ground_incrementally_closes_the_tread_stripe_on_all_slices(self):
+        height=1.425
+        stripe={(x,0) for x in range(-9,10)}
+        points=floor((height,),hole=stripe,bound=10).tolist()
+        # Local high returns retain multiple cuts over the measured tread.
+        points.append((-.9,-.2,2.8))
         results=[]
         for native in (False,True):
             with self.subTest(native=native):
-                m=FixedLayerMap(MapSettings(robot_radius=0.,safety_margin=0.,maturity_min_points=1),
-                                native_updates=native)
-                # Missing one nearby hit must retain the boundary task.
-                m.integrate([p for p in points if not (abs(p[0]-.1)<1e-6 and abs(p[1]-.1)<1e-6)])
-                m.build()
-                self.assertTrue(m.frontier_index.by_column.get((0,0)))
-                m.integrate([(.1,.1,.915)])
-                m.build()
-                for xy in ((0,0),(0,-1)):
-                    self.assertFalse(m.frontier_index.by_column.get(xy),str(xy))
-                # Outer map boundaries remain legitimate unknown frontiers.
-                self.assertTrue(m.frontier_index.nodes)
+                m=FixedLayerMap(MapSettings(robot_radius=0.,safety_margin=0.,maturity_min_points=1,
+                                            step_max=.12),native_updates=native)
+                if native:self.assertIsNotNone(m._boundary_kernel)
+                m.integrate(points);m.build()
+                index=m.frontier_index
+                before={xy:set(index.by_column[xy]) for xy in stripe}
+                self.assertGreater(len({key[0] for keys in before.values() for key in keys}),1)
+                # Representative field stripe: already observed, even though
+                # the return is a different height group and there is no edge fit.
+                near=[(x*.1,0.,height-(.16 if x==-9 else .110)) for x in range(-9,9)]
+                with patch.object(m,'iter_cells',side_effect=AssertionError('whole-map scan')):
+                    m.integrate(near+[(.9,0.,height-.161)]);m.build()
+                for xy in stripe-{(9,0)}:
+                    self.assertFalse(before[xy] & index.nodes.keys(),str(xy))
+                self.assertTrue(before[(9,0)] <= index.nodes.keys())
+                self.assertTrue(index.nodes)
                 self.assert_full_equal(m)
-                results.append(dict(m.frontier_index.nodes))
+                results.append(dict(index.nodes))
         self.assertEqual(len(results),2)
-        self.assertEqual(results[0],results[1])
+        self.assertEqual(*results)
 
-    def test_tread_boundary_keeps_separate_overlapping_sheets(self):
+    def test_tread_boundary_suppresses_nearby_ordinary_frontier_overlapping_sheets(self):
         points=[(x*.1,y*.1,.915 if y>=0 else 1.025)
                 for x in range(-3,4) for y in range(-3,4)]
-        # The lower sheet continues below the high one. It could be a thin
-        # floor, so a low return must not discharge its missing upper sheet.
         points.extend((x*.1,y*.1,.915) for x in range(-3,4) for y in range(-3,0))
         m=create(points)
-        self.assertTrue(any(abs(m.frontier_index.nodes[k].height-1.025)<1e-5
-                            for k in m.frontier_index.by_column[(0,0)]))
+        self.assertFalse(m.frontier_index.by_column.get((0,0)))
+        self.assertTrue(m.surface_observation.matching((0,-1),.915))
+        self.assertTrue(m.surface_observation.matching((0,-1),1.025))
         self.assert_full_equal(m)
+
+    def test_first_floor_entry_treats_old_ground_as_unknown_until_its_source_is_reobserved(self):
+        for native in (False,True):
+            with self.subTest(native=native):
+                m=FixedLayerMap(MapSettings(maturity_min_points=1),native_updates=native)
+                if native:self.assertIsNotNone(m._boundary_kernel)
+                evidence=m.surface_observation
+                high=2.95
+                old={(0,0):2.82,(2,0):2.93}
+                plane=[(x*.1,y*.1,high) for x in range(-3,4) for y in range(-3,4)
+                       if (x,y) not in old]
+                self.assertTrue(evidence.enter_frontier_floor((0.,0.,1.45),.08))
+                evidence.visit_height((0.,0.,1.45))
+                m.integrate([(x*.1,0,ground) for (x,_),z in old.items() for ground in (1.45,z)]);m.build()
+                evidence.begin_crossing()
+                cutoff=m.integrated_serial
+                m.integrate(plane);m.build()
+                index=m.frontier_index
+                def members(xy):
+                    return {key for key in index.by_column.get(xy,())
+                            if abs(index.nodes[key].height-high)<1e-5}
+
+                self.assertFalse(members((0,0)))
+                self.assertFalse(members((2,0)))
+                target=(0.,0.,high)
+                inferred=evidence.expect(target,review=True,neighbor_inferred=True)
+                view=evidence.expect((.1,.4,high),kind='frontier')
+                blocker=evidence.expect(target,review=True)
+                stair=evidence.expect((.1,.4,high+.2),kind='search',height_range=(high+.1,high+.3))
+                with patch.object(m,'iter_cells',side_effect=AssertionError('whole-map scan')):
+                    self.assertTrue(evidence.enter_frontier_floor((-.1,0.,high),.08))
+                    m.build()
+                self.assertEqual(evidence.floor_ground_band(high).cutoff,cutoff)
+                self.assertEqual(set(evidence.records),{blocker.id,stair.id})
+                self.assertEqual(evidence.by_column[(0,0)],[blocker.id])
+                self.assertNotIn(view.id,evidence.by_column[(1,4)])
+                self.assertNotIn(inferred.id,{identity for tile in evidence.pending_tiles.values() for identity in tile})
+                self.assertEqual(evidence.visit_height((-.1,0.,high))['registered_targets'],0)
+                self.assertTrue(members((0,0)))
+                self.assertTrue(members((2,0)),'the 5 cm matching path must also honor the frame cutoff')
+                key=next(iter(members((0,0))))
+                model=index.observation_model
+                model.task=dict(keys=[key],heights=[high])
+                self.assertTrue(model.arm((-.1,0.,high),0.))
+                self.assertEqual(set(evidence.records),{blocker.id,stair.id})
+                self.assertFalse(model.progress()['ready'])
+                m.integrate([(0.,0.,1.45)]);m.build()
+                self.assertTrue(members((0,0)))
+                self.assertFalse(model.progress()['ready'])
+                version=m.revision
+                m.integrate([(0.,0.,2.82)]);m.build()
+                self.assertGreater(m.revision,version,'a new hit restores even a frozen raw G')
+                self.assertFalse(members((0,0)))
+                self.assertTrue(model.progress()['ready'])
+                self.assertTrue(members((2,0)))
+                m.integrate([(0.,0.,high),(0.2,0.,2.93)]);m.build()
+                self.assertFalse(members((0,0)))
+                self.assertTrue(model.progress()['ready'])
+                self.assertFalse(members((2,0)),'a new hit restores even a frozen raw G')
+                evidence.begin_crossing()
+                self.assertFalse(evidence.enter_frontier_floor((-.1,0.,high),.08))
+                self.assertEqual(evidence.floor_ground_band(high).cutoff,cutoff)
+                self.assert_full_equal(m)
 
     def assert_full_equal(self,m):
         reference=rebuild_frontiers(m);index=m.frontier_index
@@ -159,7 +229,11 @@ class FrontierIndexTest(unittest.TestCase):
         index=m.frontier_index
         before={key for key in index.by_column[(0,0)] if abs(index.nodes[key].height-top)<1e-6}
         self.assertTrue(before)
-        m.integrate(np.asarray([[0,0,bottom]]*3,dtype='float32'));m.build()
+        for orientation in (-1,-2):
+            with patch('legbot_exploration.surface_orientation.classify',
+                       return_value=np.full(3,orientation)):
+                m.integrate([[0,0,bottom]]*3,sensor_origin=(0.,-.6,1.7))
+            m.build()
         after={key for key in index.by_column[(0,0)] if abs(index.nodes[key].height-top)<1e-6}
         self.assertEqual(before,after)
         self.assert_full_equal(m)
@@ -195,14 +269,14 @@ class FrontierIndexTest(unittest.TestCase):
         self.assertEqual(len({index.membership[key] for key in keys}),2)
         self.assert_full_equal(m)
 
-    def test_one_ambiguous_height_cannot_finish_two_surface_tasks(self):
+    def test_one_measured_ground_can_cover_two_ordinary_frontiers(self):
         points=np.asarray([[x*.1,y*.1,.1 if x<0 else .18]
                            for x in range(-3,4) for y in range(-3,4) if x],dtype='float32')
         m=create(points);index=m.frontier_index
         before={key for key in index.by_column[(0,0)] if key[0]==1}
         self.assertEqual(len(before),2)
         m.integrate(np.asarray([[0,0,.14]],dtype='float32'));m.build()
-        self.assertTrue(before<=index.nodes.keys())
+        self.assertFalse(before & index.nodes.keys())
         self.assert_full_equal(m)
 
     def test_small_stair_rises_still_form_a_continuous_frontier(self):
@@ -312,17 +386,24 @@ class FrontierIndexTest(unittest.TestCase):
         m=self.disconnected_rooms();index=m.frontier_index
         base,band,gap=(0.,0.,0.),(0.,.08),(70,0)
         with patch.object(index,'_observers',return_value=[]):
-            first=index.query(base,floor=band,prune_disconnected=True)
+            first=index.query(base,floor=band,prune_disconnected=True,review_remaining=8.)
         for cid in first['no_view_clusters']:
             entry=next(c for c in first['clusters'] if c['id']==cid)
             index.settle_floor_attempt(index.begin_floor_attempt(cid),True,
                                       failure_reason=entry.get('floor_failure'))
+        gap_id=index.task_id(next(key for key in index.by_column[gap] if index.nodes[key].height<.08))
+        self.assertTrue(any(c['id']==gap_id and c['floor_failure']=='floor_missing_connection'
+                            for c in first['clusters']))
+        with patch.object(index,'_observers',return_value=[]) as before:
+            waiting=index.query(base,floor=band,prune_disconnected=True,review_remaining=8.)
+        self.assertGreater(waiting['missing_connection_clusters'],0)
+        self.assertFalse(any(key[1:3]==gap for call in before.call_args_list for key in call.args[0]))
         m.integrate(np.asarray([(x*.1,y*.1,0.) for x in range(21,50)
                                 for y in range(-15,16)],dtype='float32'));m.build()
         self.assertTrue(m.floor_connectivity(band).possible((0,0),(70,1)))
         with patch.object(index,'_observers',return_value=[]) as observers:
             for _ in range(3):
-                result=index.query(base,floor=band,prune_disconnected=True)
+                result=index.query(base,floor=band,prune_disconnected=True,review_remaining=8.)
                 if result['reviewing']:break
                 for cid in result['no_view_clusters']:
                     index.settle_floor_attempt(index.begin_floor_attempt(cid),True)
@@ -358,6 +439,197 @@ class FrontierIndexTest(unittest.TestCase):
         self.assertEqual(done['scoped_frontier_cells'],0)
         self.assertFalse(done['pending_review_clusters'] or done['query_pending'])
         self.assertTrue(all(xy in index.by_column for xy in holes),'retiring tasks must preserve map evidence')
+
+    def test_bounded_review_keeps_small_tasks_until_an_actual_failure(self):
+        holes={(0,0),(6,0)}
+        wall=[(x*.1,y*.1,.3) for x in range(-16,17) for y in range(-16,17)
+              if abs(x)==16 or abs(y)==16]
+        m=create(np.vstack((floor(hole=holes,bound=15),wall)))
+        m.settings=replace(m.settings,floor_failed_small_cluster_max_cells=2)
+        index=m.frontier_index
+        base,band=(0.,-.5,0.),(0.,.08)
+        with patch.object(index,'_observers',return_value=[]) as observers:
+            first=index.query(base,floor=band,fast=True,review_remaining=8.)
+            for cid in first['no_view_clusters']:
+                index.settle_floor_attempt(index.begin_floor_attempt(cid),True)
+            expired=index.query(base,floor=band,fast=True,review_remaining=0.)
+            self.assertEqual(expired['deferred_review_clusters'],2)
+            self.assertFalse(expired['query_pending'])
+            self.assertEqual(expired['small_skipped_cells'],0)
+            second=index.query(base,floor=band,fast=True,review_remaining=8.)
+            self.assertEqual(sorted(c['cells'] for c in second['clusters']),[1,1])
+            self.assertEqual([c.kwargs['minimum_gain'] for c in observers.call_args_list],[1]*4)
+            failed,timed_out=second['no_view_clusters']
+            self.assertEqual(index.settle_floor_attempt(index.begin_floor_attempt(failed),True,
+                failure_reason='floor_no_observation'),'blacklisted')
+            self.assertEqual(index.settle_floor_attempt(index.begin_floor_attempt(timed_out),True,
+                failure_reason='floor_observer_timeout'),'review_timed_out')
+            done=index.query(base,floor=band,fast=True,review_remaining=8.)
+        self.assertEqual(done['small_skipped_cells'],1)
+        self.assertEqual(done['deferred_review_clusters'],1)
+        self.assertTrue(all(xy in index.by_column for xy in holes))
+
+    def test_diagnostic_requires_a_sealed_measured_barrier(self):
+        import time
+        from legbot_exploration.map_evidence import SurfaceColumn
+        m=create(floor(bound=8))
+        band=(0.,.08)
+        connectivity=m.floor_connectivity(band)
+        ring={(x,y) for x in range(3,8) for y in range(-2,3)
+              if x in (3,7) or y in (-2,2)}
+        with patch.object(connectivity,'node',return_value=None), patch.object(
+                m.surface_relations,'measured_floor_barrier',side_effect=lambda xy,*a: xy in ring):
+            self.assertTrue(connectivity.known_barrier((0,0),[(5,0)],time.monotonic()+1.))
+            ring.remove((3,0))
+            self.assertFalse(connectivity.known_barrier((0,0),[(5,0)],time.monotonic()+1.))
+            self.assertFalse(connectivity.known_barrier((0,0),[(5,0)],time.monotonic()-1.))
+        wall=SurfaceColumn()
+        m.columns[(3,0)]=wall
+        for z in np.arange(.05,.56,.05):
+            wall.add(float(z),.05,1,1,orientation=-2)
+        self.assertTrue(m.surface_relations.measured_floor_barrier((3,0),0.,0))
+        self.assertFalse(m.surface_relations.measured_floor_barrier((3,0),0.,1))
+
+    def test_known_barrier_retires_only_the_affected_task_on_its_first_attempt(self):
+        m=self.disconnected_rooms()
+        index=m.frontier_index
+        base,band=(0.,0.,0.),(0.,.08)
+        connectivity=m.floor_connectivity(band)
+        remote=next(key for key in index.by_column[(70,0)] if index.nodes[key].height<.08)
+        cid=index.task_id(remote)
+        with patch.object(index,'_observers',return_value=[]), patch.object(
+                connectivity,'known_barrier',side_effect=lambda start,stations,deadline:
+                bool(stations) and all(x>=45 for x,y in stations)):
+            first=index.query(base,floor=band,prune_disconnected=True,review_remaining=8.)
+        row=next(c for c in first['clusters'] if c['id']==cid)
+        self.assertEqual(row['floor_failure'],'floor_known_barrier')
+        self.assertEqual(index.settle_floor_attempt(index.begin_floor_attempt(cid),True,
+            failure_reason=row['floor_failure']),'blacklisted')
+        self.assertTrue(index._disconnected_on_floor(band,remote))
+        self.assertIn(remote,index.nodes)
+        with patch.object(index,'_observers',return_value=[]):
+            after=index.query(base,floor=band,prune_disconnected=True,review_remaining=8.)
+        self.assertFalse(any(c['id']==cid for c in after['clusters']))
+
+    def test_failed_small_clusters_are_dropped_only_after_first_attempt(self):
+        holes={(0,0),(1,0),(8,0),(9,0),(10,0)}
+        wall=[(x*.1,y*.1,.3) for x in range(-16,17) for y in range(-16,17)
+              if abs(x)==16 or abs(y)==16]
+        m=create(np.vstack((floor(hole=holes,bound=15),wall)))
+        m.settings=replace(m.settings,floor_failed_small_cluster_max_cells=2)
+        index=m.frontier_index
+        base,band=(0.,0.,0.),(0.,.08)
+        with patch.object(index,'_observers',return_value=[]) as observers:
+            local=index.query(base,window_size=(.25,.2,.2),floor=band)
+            self.assertEqual([c['cells'] for c in local['clusters']],[2])
+            self.assertEqual(local['small_skipped_clusters'],0)
+            small=local['no_view_clusters'][0]
+            index.settle_floor_attempt(index.begin_floor_attempt(small),True)
+            first=index.query(base,floor=band)
+            self.assertEqual([c['cells'] for c in first['clusters']],[3])
+            self.assertFalse(first['reviewing'])
+            self.assertEqual((first['small_skipped_clusters'],first['small_skipped_cells']),(1,2))
+            large=first['no_view_clusters'][0]
+            index.settle_floor_attempt(index.begin_floor_attempt(large),True)
+            # The local window sees two cells from a failed three-cell cluster.
+            clipped=index.query((.8,0.,0.),window_size=(.11,.2,.2),floor=band)
+            self.assertEqual(clipped['small_skipped_clusters'],0)
+            review=index.query(base,floor=band)
+            self.assertTrue(review['reviewing'])
+            self.assertEqual([c['cells'] for c in review['clusters']],[3])
+            m.settings=replace(m.settings,floor_global_review_enabled=False)
+            done=index.query(base,floor=band)
+        self.assertEqual(observers.call_count,3)
+        self.assertFalse(done['query_pending'] or done['pending_review_clusters'])
+        self.assertEqual(done['deferred_floor_frontier_cells'],5)
+        self.assertTrue(all(xy in index.by_column for xy in holes))
+
+    def test_four_direction_search_resumes_after_each_rejected_route(self):
+        m=create(floor(hole={(0,0)},bound=10))
+        m.settings=replace(m.settings,floor_four_direction_search=True)
+        index=m.frontier_index
+        cache=index.observer_cache
+        candidates=np.asarray([(x,y,0.,1.,3.,1.) for x,y in
+                               ((-.5,-.5),(-.5,.5),(.5,-.5),(.5,.5))]+[(-.4,-.4,0.,1.,10.,1.)])
+        tested=[]
+
+        def find_poses(body,*args,**kwargs):
+            tested.append(body[:2])
+            return dict(views={body:dict(gain=1,yaw=0.)},rays={},unknown_blockers=[])
+
+        options=(find_poses,lambda *args:(.5,.5,0),.15,2.,4.,.4)
+        args=dict(base=(0.,0.,0.),floor=(0.,.08),window_size=(.75,.2,.2),floor_selection=options)
+        with (patch.object(cache,'candidates',return_value=candidates),
+              patch.object(index.observation_model,'_visibility_view',return_value=dict(gain=1))):
+            for _ in range(4):
+                result=index.query(**args)
+                cluster,=result['clusters']
+                self.assertTrue(cluster['direction_limited'])
+                pose,=cluster['observations']
+                self.assertTrue(index.reject_floor_view(cluster['id'],pose,False,()))
+            final=index.query(**args)
+        self.assertEqual(len(tested),4)
+        self.assertEqual(set(tested),{(-.5,-.5),(-.5,.5),(.5,-.5),(.5,.5)})
+        self.assertEqual(final['no_view_clusters'],[cluster['id']])
+        self.assertEqual(final['clusters'][0]['floor_failure'],'floor_no_route')
+
+    def test_new_local_ground_reopens_a_failed_frontier_but_distant_updates_do_not(self):
+        m=create(floor(hole={(0,0),(6,0)},bound=12))
+        index=m.frontier_index;band=(0.,.08)
+        with patch.object(index,'_observers',return_value=[]):
+            for _ in range(2):
+                result=index.query((0.,-.5,0.),floor=band)
+                for cid in result['no_view_clusters']:
+                    index.settle_floor_attempt(index.begin_floor_attempt(cid),True,
+                                               failure_reason='floor_no_observation')
+        keys=set(index.by_column[(0,0)])
+        self.assertTrue(all(index._floor_records(index.floor_blacklist,band,key) for key in keys))
+        with patch.object(m,'iter_cells',side_effect=AssertionError('whole-map scan')):
+            m.integrate([(8.,8.,0.)]);m.build()
+            self.assertTrue(all(index._floor_records(index.floor_blacklist,band,key) for key in keys))
+            m.integrate([(.6,0.,0.)]);m.build()
+        remaining=set(index.by_column[(0,0)])
+        self.assertTrue(remaining)
+        self.assertTrue(all(not index._floor_records(index.floor_blacklist,band,key) for key in remaining))
+        self.assertTrue(index.floor_work_available(band))
+        self.assertGreater(index.floor_reopened,0)
+
+    def test_direction_representative_prefers_observed_room_over_a_cheaper_edge(self):
+        m=create(floor(hole={(0,0)},bound=12))
+        m.settings=replace(m.settings,floor_four_direction_search=True)
+        index=m.frontier_index;cache=index.observer_cache;tested=[]
+        candidates=np.array([(.5,.5,0.,1.,0.,.4),(.7,.7,0.,1.,5.,1.)])
+        def observe(body,*args,**kwargs):
+            tested.append(tuple(body[:2]))
+            return dict(views={body:dict(gain=1,yaw=0.)},rays={},unknown_blockers=[])
+        options=(observe,lambda *args:(.55,.85,0),.15,1.5,1.,.2)
+        with (patch.object(cache,'candidates',return_value=candidates),
+              patch.object(index.observation_model,'_visibility_view',return_value=dict(gain=1))):
+            index.query((0.,0.,0.),floor=(0.,.08),window_size=(1.,.2,.2),floor_selection=options)
+        self.assertEqual(tested,[(.7,.7)])
+
+    def test_four_direction_fallback_timeout_accumulates_across_batches(self):
+        m=create(floor(hole={(0,0)},bound=10))
+        m.settings=replace(m.settings,floor_four_direction_search=True,floor_direction_search_timeout=.5)
+        index=m.frontier_index
+        now=50.
+
+        def search(*args,**kwargs):
+            nonlocal now
+            self.assertLessEqual(kwargs['direction_deadline']-now,.5)
+            index.observer_cache.pending=True
+            now+=.3
+            return []
+
+        args=dict(base=(0.,0.,0.),floor=(0.,.08),window_size=(.75,.2,.2),
+                  query_budget=.2,floor_selection=(None,None,.15,2.,4.,.4))
+        with (patch('legbot_exploration.pct_frontier_index.time.monotonic',side_effect=lambda:now),
+              patch.object(index,'_observers',side_effect=search) as observers):
+            self.assertTrue(index.query(**args)['query_pending'])
+            now+=1.
+            final=index.query(**args)
+        self.assertEqual(observers.call_count,2)
+        self.assertEqual(final['clusters'][0]['floor_failure'],'floor_observer_timeout')
 
     def test_split_clusters_inherit_failure_across_map_and_cut_updates(self):
         holes={(x,0) for x in range(5)}
@@ -484,6 +756,34 @@ class FrontierIndexTest(unittest.TestCase):
                 self.assertEqual(entry['floor_failure'],'floor_observer_timeout')
                 self.assertEqual(index.settle_floor_attempt(index.begin_floor_attempt(cid),True),
                                  'blacklisted' if review else 'first_no_progress')
+
+    def test_local_observer_yields_to_another_cluster_without_losing_its_budget(self):
+        index=create(floor(hole={(0,0),(10,0)},bound=20)).frontier_index
+        options=(None,None,.15,2.,4.,.40)
+        viewpoint=(.6,0.,0.)
+        now=100.
+        calls=[]
+
+        def search(members,*args,**kwargs):
+            nonlocal now
+            calls.append(frozenset(members))
+            now+=.25
+            index.observer_cache.pending=len(calls)==1
+            index.observer_cache.last_views={viewpoint:dict(gain=1,yaw=0.)}
+            return [] if len(calls)==1 else [list(viewpoint)]
+
+        args=dict(base=(0.,0.,0.),floor=(0.,.08),window_size=(3.,1.,1.),query_budget=.2,floor_selection=options)
+        with (patch('legbot_exploration.pct_frontier_index.time.monotonic',side_effect=lambda:now),
+              patch.object(index,'_observers',side_effect=search)):
+            initial=index.query(**args)
+            self.assertTrue(initial['query_pending'])
+            self.assertFalse(initial['no_view_clusters'])
+            completed=index.query(**args)
+        self.assertEqual(len(calls),2)
+        self.assertTrue(calls[0].isdisjoint(calls[1]))
+        self.assertTrue(any(cluster['observations'] for cluster in completed['clusters']))
+        suspended=next(s for s in index.floor_view_searches.values() if frozenset(s.members)==calls[0])
+        self.assertAlmostEqual(suspended.elapsed,.25)
 
     def test_near_observers_are_regenerated_and_completion_survives_unrelated_changes(self):
         m=create(floor(hole={(0,0)},bound=20));index=m.frontier_index

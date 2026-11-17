@@ -553,7 +553,8 @@ PYTHONPATH=python python3 -m unittest discover -s test -p test_truth_coverage.py
 ## 清除残留进程
 ```
 # 在新终端执行：
-pkill -INT -f '^/usr/bin/python3 /opt/ros/jazzy/bin/ros2 launch legbot_exploration cross_layer_test\.launch\.py([[:space:]]|$)'
+pkill -TERM -f '/home/likai/[l]egbot_3D_Nav/install/[^[:space:]]*/(combined_exploration_cpp|scan_planner_node|scan_go2_cmd_adapter|scan_waypoint_mission)([[:space:]]|$)|[g]z sim .*BuildingCrossLayerTest[.]sdf|^[g]z sim (server|gui)([[:space:]]|$)'
+
 
 # 等几秒，让 ROS 2 launch 关闭子进程。然后检查是否还有残留：
 pgrep -af 'cross_layer_test\.launch\.py|gz sim|rviz2|combined_exploration_cpp|scan_planner_node|scan_go2_cmd_adapter|scan_waypoint_mission'

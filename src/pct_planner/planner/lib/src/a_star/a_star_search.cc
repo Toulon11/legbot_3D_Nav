@@ -93,6 +93,15 @@ void Astar::Reset() {
 
 void Astar::InitAccessor(double threshold, int layers, int rows, int columns,
                          double resolution, double weight, CellReader reader) {
+  InitSurfaceAccessor(threshold, layers, rows, columns, resolution, weight,
+      [reader = std::move(reader)](int layer, int row, int column) {
+        const auto [cost, ground, gateway] = reader(layer, row, column);
+        return std::make_tuple(cost, ground, gateway, std::int64_t{-1});
+      });
+}
+
+void Astar::InitSurfaceAccessor(double threshold, int layers, int rows, int columns,
+                               double resolution, double weight, SurfaceCellReader reader) {
   timed_out_ = false;
   search_result_.clear();
   sparse_nodes_.clear();
@@ -113,10 +122,14 @@ Node* Astar::NodeAt(int layer, int row, int column) const {
   const auto key = GetHash(Eigen::Vector3i(layer, row, column));
   auto found = sparse_nodes_.find(key);
   if (found != sparse_nodes_.end()) return found->second.get();
-  const auto value = reader_(layer, row, column);
+  const auto [cost, ground, gateway, surface_id] = reader_(layer, row, column);
   auto node = std::make_unique<Node>(Eigen::Vector3i(
-      static_cast<int>(value[1] / resolution_), row, column), nullptr);
-  node->cost = value[0]; node->height = value[1]; node->ele = value[2]; node->layer = layer;
+      static_cast<int>(ground / resolution_), row, column), nullptr);
+  node->cost = cost;
+  node->height = ground;
+  node->ele = gateway;
+  node->layer = layer;
+  node->surface_id = surface_id;
   auto* result = node.get();
   sparse_nodes_.emplace(key, std::move(node));
   return result;
@@ -127,6 +140,16 @@ std::int64_t Astar::GetHash(const Eigen::Vector3i& idx) const {
          static_cast<std::int64_t>(idx[1]) * max_x_ + idx[2];
 }
 
+std::int64_t Astar::VisitKey(const Node* node) const {
+  if (node->surface_id < 0) return GetHash(node->idx);
+  return GetHash(Eigen::Vector3i(node->layer, node->idx[1], node->idx[2]));
+}
+
+// Surface IDs are local to their XY column.
+static bool SameGroundAtXY(const Node* first, const Node* second) {
+  return first->surface_id == second->surface_id &&
+         (first->surface_id > 0 || std::abs(first->height - second->height) <= 1e-7);
+}
 
 
 // 判断坐标是否在地图合法边界内（图层、y轴、x轴）
@@ -207,7 +230,11 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
     open_set.pop();
 
     // 步骤2：判断是否到达终点
-    if (current_node->idx == goal_node->idx) {
+    const bool reached_goal = goal_node->surface_id < 0
+        ? current_node->idx == goal_node->idx
+        : current_node->idx.tail<2>() == goal_node->idx.tail<2>() &&
+          SameGroundAtXY(current_node, goal_node);
+    if (reached_goal) {
       while (current_node->parent != nullptr) {
         search_result_.emplace_back(current_node);
         current_node = current_node->parent;
@@ -222,7 +249,7 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
     }
 
     // 步骤3：将当前节点加入封闭集（标记为已访问）
-    closed_set[GetHash(current_node->idx)] = current_node;
+    closed_set[VisitKey(current_node)] = current_node;
     // 步骤4：确定当前节点所在的图层（基于地形特征动态调整）
     int layer = DecideLayer(current_node);
     // 步骤5：遍历所有邻居节点（8方向+对角线，共9个邻居）
@@ -269,7 +296,7 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
       
 
       // 检查邻居是否已在closed_set中
-      auto p_neighbor = closed_set.find(GetHash(neighbor_node->idx));
+      auto p_neighbor = closed_set.find(VisitKey(neighbor_node));
       if (p_neighbor != closed_set.end()) {
         if (tentative_g >= p_neighbor->second->g) {
           continue; // 若新成本更高，无需更新
@@ -331,11 +358,10 @@ int Astar::DecideLayer(const Node* cur_node) const {
     // const Node& search_node = grid_map_[cur_layer][ni][nj];
     const Node& search_node = *NodeAt(cur_layer,i,j);
 
-    // 筛选：高度差需在合理范围内（避免高度突变）
-    if (std::abs(search_node.height - cur_height) > 0.2) {
-      continue;
-    //便免越界得到空的值
-    }else if (search_node.cost > cost_threshold_ || search_node.cost < 0) {
+    const bool same_ground = cur_node->surface_id < 0
+        ? std::abs(search_node.height - cur_height) <= 0.2
+        : SameGroundAtXY(cur_node, &search_node);
+    if (!same_ground || search_node.cost > cost_threshold_ || search_node.cost < 0) {
       continue;
     }
 

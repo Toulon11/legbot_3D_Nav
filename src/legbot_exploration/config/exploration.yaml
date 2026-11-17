@@ -30,7 +30,7 @@
     cross_layer_enabled: true
     pct_floor_exploration: true          # 当前层收尾后跨层，以连通实测平台确认新层 G。
     skip_start_floor_exploration: false  # 跨层测试。共用普通探索识别楼梯，确认可上行后提前结束起始层；新层正常探索。
-    pct_floor_height_tolerance: 0.08     # 同层前沿及路径节点的高度带半宽，单位米。
+    pct_floor_height_tolerance: 0.08     # 同层前沿的优先高度带半宽，也是上升簇切换跨层的实测升高阈值，单位米。
     pct_foot_contact_force: 12.0        # 用于判定足端接地的受力，单位牛顿。
     cross_layer_height_slack: 0.05        # 上行进度允许的高度误差，单位米。
     cross_layer_corridor_radius: 1.5      # 后续观察位置与当前路线方向的侧向范围，单位米。
@@ -63,7 +63,7 @@
     planner_occupancy_height_tolerance: 0.5 # 只考虑与机体高度差不超过此值的障碍。
     observation_only: true               # true 只计算和显示，不发送运动目标。
     # Position arrival starts a yaw alignment / observation task. Seconds use wall time.
-    observation_frame_wait: 2.0          # 楼梯入口和跨层补扫每个视角的等待时间，单位秒。
+    observation_frame_wait: 2.0          # 定向补扫和跨层单侧等待相关回波的上限，单位秒。
     observation_flat_frame_wait: 1.0     # 普通观察点每个视角的等待时间，单位秒。
     observation_task_timeout: 60.0
     observation_sweep_half_angle: 0.35
@@ -71,5 +71,6 @@
     pct_query_budget_seconds: 0.20      # Per-batch compute slice; total budgets remain 2s/4s.
     pct_query_resume_delay_seconds: 0.10 # Release map locks between unfinished batches.
     pct_floor_view_budget_seconds: 2.0 # Cumulative search time for an ordinary cluster attempt.
-    pct_floor_review_view_budget_seconds: 4.0 # Cumulative search time for a global review attempt.
-    pct_floor_review_query_budget_seconds: 0.40 # Map read slice while reviewing a floor cluster.
+    pct_floor_review_view_budget_seconds: 4.0 # General review ceiling. Bounded ordinary review caps this at 1 second.
+    pct_floor_review_query_budget_seconds: 0.40 # General map read slice. Bounded ordinary review caps this at 0.20 seconds.
+    pct_floor_review_wait_budget_seconds: 8.0 # Cumulative wall wait per floor, excluding execution and observation.

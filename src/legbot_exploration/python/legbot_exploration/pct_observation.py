@@ -54,13 +54,12 @@ class ObservationModel:
         self.pose_search=ObservationPoseSearch(self)
 
     def column_blockers(self, xy):
-        column=self.map.columns.get(xy)
-        if not column:return ()
-        s=self.map.settings
-        pad=min(.5*s.resolution,s.surface_noise_tolerance)
-        return tuple((r.low-pad,max(r.high,.01*r.top_cm if r.top_cm is not None else r.high)+pad)
-                     if r.orientation==-2 else (r.height,r.height)
-                     for r in column.values())
+        cell=tuple(xy[:2])
+        bands=self.map.surface_relations.physical_blockers(cell)
+        if len(xy)>2:
+            barrier=self.map.surface_relations.fresh_clearance_barrier(cell,float(xy[2]))
+            if barrier is not None:bands=(*bands,barrier)
+        return bands
 
     def ray_blocked(self, sensor, target, dependencies=None):
         """Trace observed surfaces, including vertical bands, independently of FOV."""
@@ -122,9 +121,10 @@ class ObservationModel:
                     if xy==target_xy:continue
                     first,last=max(first,1e-7),min(last,1.-1e-7)
                     if first>last:continue
-                    bands=dependencies.get(xy)
+                    dependency=(*xy,float(point[2]))
+                    bands=dependencies.get(dependency)
                     if bands is None:
-                        bands=dependencies[xy]=self.column_blockers(xy)
+                        bands=dependencies[dependency]=self.column_blockers(dependency)
                     z0,z1=sorted((sensor[2]+first*dz,sensor[2]+last*dz))
                     if any(lo<=z1 and hi>=z0 for lo,hi in bands):
                         valid[at]=False
@@ -319,6 +319,15 @@ class ObservationModel:
             self.task['side_keys'].clear()
         self.task.setdefault('view_yaws',[]).append(float(yaw))
         self.task.update(serial=self.map.integrated_serial,point=tuple(point),yaw=float(yaw),armed=True)
+        index=self.map.frontier_index;s=self.map.settings
+        evidence=self.map.surface_observation
+        for key in self.task['keys']:
+            boundary=index.nodes.get(key)
+            if boundary is None or self.map.ground_pending(key[1:3],key[0]):
+                continue
+            target=(s.origin_x+key[1]*s.resolution,s.origin_y+key[2]*s.resolution,boundary.height)
+            sources=[(x,y,sid) for x,y,_,sid in boundary.sources]
+            evidence.expect(target,sources=sources,slices=[key[0]],kind='frontier')
         if self.task.get('floor_attempt') is not None:
             self._capture_floor_view(point,yaw)
         return True
@@ -360,16 +369,21 @@ class ObservationModel:
         task=self.task
         if not task or not task['armed']:return dict(ready=False,reason='not_armed',gain=0,fresh=False)
         s=self.map.settings;gain=0;fresh=False
+        evidence=self.map.surface_observation
         for key,height in zip(task['keys'],task['heights']):
             x,y=key[1:3]
-            col=self.map.columns.get((x,y))
-            if col and any(frontier_return(r.orientation) and abs(r.height-height)<=s.surface_noise_tolerance+1e-7 for r in col.values()):gain+=1
+            target=(*self.map.position((0,x,y)),height)
+            check=evidence.query(target,kind='frontier',layer=key[0])
+            if check['ready']:gain+=1
+            if evidence.has_frontier_ground((x,y),height,task['serial'],layer=key[0]):fresh=True
+            if self.map.ground_pending((x,y),key[0]):
+                continue
+            if check['state']=='refuted' and evidence.refuted((x,y),height,after=task['serial'],include_step=False):
+                fresh=True
             # Frame must actually have integrated measured points near the
             # intended frontier at the right height, after alignment finished.
             for dx,dy in ((0,0),(1,0),(-1,0),(0,1),(0,-1)):
-                observed=self.map.columns.get((x+dx,y+dy))
-                if observed and any(r.last_seen>task['serial'] and abs(r.height-height)<=s.surface_noise_tolerance+1e-7
-                                    for r in observed.values()):fresh=True
+                if self.map.surface_observation.matching((x+dx,y+dy),height,task['serial'],kind='frontier'):fresh=True
         self._record_floor_view()
         return dict(ready=bool(gain and fresh),reason='observed' if gain and fresh else 'waiting_local_observations',gain=gain,fresh=fresh)
 

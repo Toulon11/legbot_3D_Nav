@@ -4,6 +4,7 @@
 #include "legbot_exploration/pct_backend.hpp"
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <set>
 #include <string>
@@ -14,7 +15,7 @@ namespace legbot_exploration {
 struct PlanningSnapshot;
 
 struct PctRecoveryConstraints {
-  std::optional<XY> floor;
+  std::optional<XY> height_band;
   std::optional<double> ascent;
   std::vector<Point> contacts;
   std::function<bool(const Point &)> permits_goal;
@@ -27,6 +28,7 @@ struct PctRecoveryAction {
   Point position;
   Point gap{};
   double yaw=0.;
+  bool targeted=false;
 };
 
 std::optional<double> verified_short_recovery_stop(
@@ -47,12 +49,14 @@ class PctBlockerRecovery {
       const PlanningSnapshot &snapshot, std::uint64_t version, const Point &attitude,
       const std::vector<PctUnknownBlocker> &blockers, const PctRecoveryConstraints &constraints,
       bool can_move, const std::function<bool(const Point &)> &stance_clear,
-      const std::vector<Point> &review={});
+      const std::vector<Point> &review={},double arrival_tolerance=.15);
   std::optional<PctRecoveryAction> delegate(
       const PlanningSnapshot &snapshot, std::uint64_t version,
       const PctRecoveryConstraints &constraints, const std::vector<Point> &goals,
       double arrival_tolerance);
-  void retry_delegates() { delegated_.clear(); }
+  void retry_delegates() { delegated_.clear(); observer_routes_.clear(); }
+  const std::map<std::string,std::size_t> &rejections() const { return rejections_; }
+  bool pending() const { return pending_; }
   std::optional<double> scan_heading(
       PctBackend &map, std::uint64_t version, const Point &position, const Point &attitude,
       const Point &gap, const std::vector<PctUnknownBlocker> &blockers, double body_height,
@@ -62,6 +66,9 @@ class PctBlockerRecovery {
   std::set<std::array<long, 6>> scans_;
   std::set<std::array<long, 5>> moves_;
   std::vector<Point> delegated_;
+  std::vector<Point> observer_routes_;
+  std::map<std::string,std::size_t> rejections_;
+  bool pending_=false;
 };
 
 }  // namespace legbot_exploration

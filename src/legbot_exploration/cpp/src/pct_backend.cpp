@@ -1,6 +1,7 @@
 #include "legbot_exploration/pct_backend.hpp"
 #include <Python.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <mutex>
@@ -114,12 +115,17 @@ struct PctBackend::Impl {
   }
   PyObject *call(const char *method,std::uint64_t version,const Point &start,
                  const Point *target=nullptr,std::optional<XY> floor=std::nullopt,
-                 std::optional<double> heading=std::nullopt,std::optional<double> platform_reference=std::nullopt) {
+                 std::optional<double> heading=std::nullopt,std::optional<double> platform_reference=std::nullopt,
+                 std::optional<double> budget=std::nullopt) {
     ensure();
     Object buffer(PyMemoryView_FromMemory(reinterpret_cast<char*>(xyz.data()),
         static_cast<Py_ssize_t>(xyz.size()*sizeof(float)),PyBUF_READ));
     if(!buffer.p) throw std::runtime_error(python_error());
-    PyObject *answer=target && floor?PyObject_CallMethod(backend,method,"OK(ddd)(ddd)(dd)",
+    Object floor_arg(budget && floor?Py_BuildValue("(dd)",(*floor)[0],(*floor)[1]):Py_NewRef(Py_None));
+    PyObject *answer=target && budget?PyObject_CallMethod(backend,method,"OK(ddd)(ddd)Od",
+        buffer.p,static_cast<unsigned long long>(version),start[0],start[1],start[2],
+        (*target)[0],(*target)[1],(*target)[2],floor_arg.p,*budget):
+        target && floor?PyObject_CallMethod(backend,method,"OK(ddd)(ddd)(dd)",
         buffer.p,static_cast<unsigned long long>(version),start[0],start[1],start[2],
         (*target)[0],(*target)[1],(*target)[2],(*floor)[0],(*floor)[1]):
         target && heading?PyObject_CallMethod(backend,method,"OK(ddd)(ddd)d",
@@ -181,10 +187,10 @@ bool PctBackend::refresh(std::uint64_t version) {
   }catch(const std::exception &e){impl_->error=e.what();return false;}
 }
 PctResult PctBackend::plan(std::uint64_t version,const Point &start,const Point &target,bool explicit_surface,
-    std::optional<XY> floor,bool collect_blockers,bool stair_segment) {
-  return plan_with_method(stair_segment?"plan_stair_surface":
+    std::optional<XY> floor,bool collect_blockers,bool stair_segment,std::optional<double> budget) {
+  return plan_with_method(budget?"plan_review_surface":stair_segment?"plan_stair_surface":
       explicit_surface?(collect_blockers?"plan_surface_with_blockers":"plan_surface"):"plan",
-      version,start,target,floor);
+      version,start,target,floor,budget);
 }
 PctResult PctBackend::plan_shift(std::uint64_t version,const Point &start,const Point &target) {
   return plan_with_method("plan_shift",version,start,target);
@@ -195,7 +201,7 @@ PctResult PctBackend::plan_stair_reverse(std::uint64_t version,const Point &star
 std::vector<PctObservationPose> PctBackend::observation_poses(std::uint64_t version,const Point &base,
     const Point &attitude,const std::vector<Point> &targets,std::optional<bool> include_moves,
     std::optional<double> ascent,std::optional<XY> floor,std::optional<Point> stance,
-    double tolerance,int minimum_gain) {
+    double tolerance,int minimum_gain,bool current_observation) {
   Gil gil;
   try {
     impl_->ensure();
@@ -212,9 +218,10 @@ std::vector<PctObservationPose> PctBackend::observation_poses(std::uint64_t vers
     Object method(PyObject_GetAttrString(impl_->backend,"observation_poses"));
     Object args(Py_BuildValue("((ddd)(ddd)O)",base[0],base[1],base[2],
         attitude[0],attitude[1],attitude[2],points.p));
-    Object kwargs(Py_BuildValue("{s:K,s:O,s:O,s:O,s:O,s:d,s:i}","version",static_cast<unsigned long long>(version),
+    Object kwargs(Py_BuildValue("{s:K,s:O,s:O,s:O,s:O,s:d,s:i,s:s}","version",static_cast<unsigned long long>(version),
         "motions",include_moves?(*include_moves?Py_True:Py_False):Py_None,"ascent",direction.p,"floor",band.p,
-        "stances",stances.p,"tolerance",tolerance,"minimum_gain",minimum_gain));
+        "stances",stances.p,"tolerance",tolerance,"minimum_gain",minimum_gain,
+        "purpose",current_observation?"current_observation":"arrival"));
     Object answer(method.p && args.p && kwargs.p?PyObject_Call(method.p,args.p,kwargs.p):nullptr);
     if(!answer.p)throw std::runtime_error(python_error());
     auto *values=PyDict_GetItemString(answer.p,"poses");
@@ -236,11 +243,11 @@ std::vector<PctObservationPose> PctBackend::observation_poses(std::uint64_t vers
   } catch(const std::exception &e){PyErr_Clear();impl_->error=e.what();return {};}
 }
 PctResult PctBackend::plan_with_method(const char *method,std::uint64_t version,const Point &start,
-    const Point &target,std::optional<XY> floor) {
+    const Point &target,std::optional<XY> floor,std::optional<double> budget) {
   PctResult out;
   Gil gil;
   try {
-    Object answer(impl_->call(method,version,start,&target,floor));
+    Object answer(impl_->call(method,version,start,&target,floor,std::nullopt,std::nullopt,budget));
     if(!PyTuple_Check(answer.p) || PyTuple_Size(answer.p)!=3) throw std::runtime_error("invalid PCT result");
     const char *reason=PyUnicode_AsUTF8(PyTuple_GetItem(answer.p,0));
     if(!reason) throw std::runtime_error(python_error());
@@ -295,7 +302,7 @@ PctFrontiers PctBackend::frontiers(std::uint64_t version,const Point &base,doubl
     std::optional<Point> window,double query_budget,std::optional<Point> continuation,
     std::optional<XY> floor,bool geometry_only,std::optional<XY> platform_floor,
     std::optional<FloorViewLimits> floor_selection,
-    std::optional<double> stair_heading) {
+    std::optional<double> stair_heading,bool seek_ascent) {
   PctFrontiers out;
   Gil gil;
   try {
@@ -309,10 +316,14 @@ PctFrontiers PctBackend::frontiers(std::uint64_t version,const Point &base,doubl
         floor_selection->first_budget,floor_selection->review_budget,floor_selection->review_slice,
         floor_selection->max_attempts,floor_selection->max_step,floor_selection->min_rise):Py_NewRef(Py_None));
     Object heading(stair_heading?PyFloat_FromDouble(*stair_heading):Py_NewRef(Py_None));
-    Object answer(PyObject_CallMethod(impl_->backend,"frontiers","OK(ddd)dOdOOOOOO",buffer.p,
+    Object review(floor_selection && floor_selection->review_remaining?
+        PyFloat_FromDouble(*floor_selection->review_remaining):Py_NewRef(Py_None));
+    Object answer(PyObject_CallMethod(impl_->backend,"frontiers","OK(ddd)dOdOOOOOOOO",buffer.p,
         static_cast<unsigned long long>(version),base[0],base[1],base[2],minimum_distance,
-        bounds.p,query_budget,forward.p,floor_scope.p,geometry_only?Py_True:Py_False,platform.p,selection.p,heading.p));
+        bounds.p,query_budget,forward.p,floor_scope.p,geometry_only?Py_True:Py_False,platform.p,selection.p,heading.p,
+        seek_ascent?Py_True:Py_False,review.p));
     if(!answer.p) throw std::runtime_error(python_error());
+    const auto conversion_started=std::chrono::steady_clock::now();
     const auto field=[](PyObject *dict,const char *key)->PyObject* {
       auto *value=PyDict_Check(dict)?PyDict_GetItemString(dict,key):nullptr;
       if(!value) throw std::runtime_error("invalid PCT frontier field");
@@ -358,10 +369,14 @@ PctFrontiers PctBackend::frontiers(std::uint64_t version,const Point &base,doubl
     if(auto *v=PyDict_GetItemString(answer.p,"deferred_floor_frontier_cells"))out.deferred_floor_frontier_cells=PyLong_AsSize_t(v);
     if(auto *v=PyDict_GetItemString(answer.p,"disconnected_floor_frontier_cells"))out.disconnected_floor_frontier_cells=PyLong_AsSize_t(v);
     if(auto *v=PyDict_GetItemString(answer.p,"pending_review_clusters"))out.pending_review_clusters=PyLong_AsSize_t(v);
+    if(auto *v=PyDict_GetItemString(answer.p,"deferred_review_clusters"))out.deferred_review_clusters=PyLong_AsSize_t(v);
+    if(auto *v=PyDict_GetItemString(answer.p,"missing_connection_clusters"))out.missing_connection_clusters=PyLong_AsSize_t(v);
     if(auto *v=PyDict_GetItemString(answer.p,"reviewing"))out.reviewing=PyObject_IsTrue(v);
     if(auto *v=PyDict_GetItemString(answer.p,"fast_floor"))out.fast_floor=PyObject_IsTrue(v);
     if(auto *v=PyDict_GetItemString(answer.p,"fast_skipped_clusters"))out.fast_skipped_clusters=PyLong_AsSize_t(v);
     if(auto *v=PyDict_GetItemString(answer.p,"fast_skipped_cells"))out.fast_skipped_cells=PyLong_AsSize_t(v);
+    if(auto *v=PyDict_GetItemString(answer.p,"small_skipped_clusters"))out.small_skipped_clusters=PyLong_AsSize_t(v);
+    if(auto *v=PyDict_GetItemString(answer.p,"small_skipped_cells"))out.small_skipped_cells=PyLong_AsSize_t(v);
     for(auto entry:{std::make_pair("no_view_clusters",&out.no_view_clusters),
                     std::make_pair("timed_out_clusters",&out.observer_timeout_clusters)}) {
       auto *rows=PyDict_GetItemString(answer.p,entry.first);
@@ -410,6 +425,7 @@ PctFrontiers PctBackend::frontiers(std::uint64_t version,const Point &base,doubl
       c.gain=PyFloat_AsDouble(field(item,"gain"));
       if(auto *v=PyDict_GetItemString(item,"observer_ms"))c.observer_ms=PyFloat_AsDouble(v);
       if(auto *v=PyDict_GetItemString(item,"attempt"))c.attempt=PyLong_AsLong(v);
+      if(auto *v=PyDict_GetItemString(item,"direction_limited"))c.direction_limited=PyObject_IsTrue(v);
       if(auto *v=PyDict_GetItemString(item,"floor_failure"))c.floor_failure=PyUnicode_AsUTF8(v);
       if(auto *v=PyDict_GetItemString(item,"first_rejected"))c.first_rejected=point(v);
       c.unknown_blockers=read_unknown_blockers(item,version);
@@ -441,6 +457,8 @@ PctFrontiers PctBackend::frontiers(std::uint64_t version,const Point &base,doubl
       if(!encoded.p) throw std::runtime_error(python_error());
       out.metadata=PyUnicode_AsUTF8(encoded.p);
     }
+    out.observer_phase_ms["frontier_result_conversion_ms"]=
+        std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-conversion_started).count();
     out.valid=true;impl_->error.clear();
   } catch(const std::exception &e) {
     PyErr_Clear();impl_->error=e.what();out.error=e.what();out.clusters.clear();
@@ -531,6 +549,7 @@ PctObservation PctBackend::observation_task(std::uint64_t version,const std::str
     }
     out.unknown_blockers=read_unknown_blockers(answer.p,version);
     if(auto *v=PyDict_GetItemString(answer.p,"floor_attempt");v && PyUnicode_Check(v))out.floor_attempt=PyUnicode_AsUTF8(v);
+    if(auto *v=PyDict_GetItemString(answer.p,"resolved_frontier_cells"))out.resolved_frontier_cells=PyLong_AsSize_t(v);
     if(auto *v=PyDict_GetItemString(answer.p,"reason"))out.reason=PyUnicode_AsUTF8(v);
     if(PyErr_Occurred())throw std::runtime_error(python_error());
     Object json(PyImport_ImportModule("json"));Object encoded(PyObject_CallMethod(json.p,"dumps","O",answer.p));
@@ -572,10 +591,12 @@ std::vector<Point> PctBackend::read_points(const char *method,std::uint64_t vers
 }
 PctPointCheck PctBackend::point_check(std::uint64_t version,const Point &point,bool platform,
                                     std::optional<XY> departure_floor,double landing_heading,bool landing_recovery,
-                                    std::optional<XY> floor,bool tread_support,std::optional<double> platform_reference) {
+                                    std::optional<XY> floor,bool tread_support,std::optional<double> platform_reference,
+                                    bool descending_landing) {
   PctPointCheck out;Gil gil;
   try {
-    const auto method=departure_floor?(landing_recovery?"landing_recovery_check":"landing_check"):
+    const auto method=departure_floor?(descending_landing?"descending_landing_check":
+        landing_recovery?"landing_recovery_check":"landing_check"):
         platform?"platform_check":tread_support?"tread_support_check":"point_check";
     Object answer(impl_->call(method,version,point,nullptr,departure_floor?departure_floor:floor,
                               departure_floor?std::optional<double>(landing_heading):std::nullopt,

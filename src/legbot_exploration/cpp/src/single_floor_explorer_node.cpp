@@ -147,6 +147,9 @@ le::ExplorationSettings declare_exploration_settings(
   for(const double budget:{options.pct_floor_view_limits_.first_budget,options.pct_floor_view_limits_.review_budget,
                            options.pct_floor_view_limits_.review_slice})
     if(!std::isfinite(budget) || budget<=0.)throw std::invalid_argument("invalid PCT floor viewpoint budget");
+  options.pct_floor_review_wait_budget_=node.declare_parameter<double>("pct_floor_review_wait_budget_seconds",0.);
+  if(!std::isfinite(options.pct_floor_review_wait_budget_) || options.pct_floor_review_wait_budget_<0.)
+    throw std::invalid_argument("invalid PCT floor review wait budget");
   if(!std::isfinite(options.observation_wait_) || !std::isfinite(options.observation_flat_wait_) ||
      options.observation_flat_wait_<=0. || options.observation_timeout_<=options.observation_flat_wait_ ||
      !std::isfinite(options.observation_timeout_) ||

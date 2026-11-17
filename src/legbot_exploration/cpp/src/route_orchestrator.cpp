@@ -135,8 +135,14 @@ std::vector<PlannerResult> plan_map_candidates(
           pct.goal_safe=false;
           pct.unknown_blockers=arrival.unknown_blockers;
         } else {
+          std::optional<double> budget;
+          if(goal.pct_planning_deadline) {
+            const auto now=std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            budget=std::max(0.,*goal.pct_planning_deadline-now);
+          }
           pct=shared.pct->plan(version,snapshot.base,target,explicit_surface,goal.pct_floor,
-                               goal.collect_unknown_blockers || goal.mode==ExplorationMode::cross_layer,goal.stair_segment);
+                               goal.collect_unknown_blockers || goal.mode==ExplorationMode::cross_layer,
+                               goal.stair_segment,budget);
           if(explicit_surface) {
             std::string arrival_metadata="\"arrival_area\":"+arrival.metadata;
             if(pct.reason=="ok" && !pct.points.empty()) {

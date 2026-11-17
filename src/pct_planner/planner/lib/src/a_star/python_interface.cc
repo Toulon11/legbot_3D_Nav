@@ -20,6 +20,7 @@ PYBIND11_MODULE(a_star, m) {
            py::arg("h_type") = HeuristicType::kDiagonal)
       .def("init", &Astar::Init)
       .def("init_accessor", &Astar::InitAccessor)
+      .def("init_surface_accessor", &Astar::InitSurfaceAccessor)
       .def("get_search_node_count", &Astar::GetSearchNodeCount)
       .def("set_time_limit", &Astar::SetTimeLimit)
       .def("timed_out", &Astar::TimedOut)

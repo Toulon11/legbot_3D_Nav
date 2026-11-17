@@ -59,11 +59,19 @@ void ExplorationController::on_scan_reference(const scan_planner::msg::Bspline &
 }
 
 void ExplorationController::on_forwarded_request(const scan_planner::msg::GoalRequest &request) {
-  if (active_ && request.goal_id == active_->goal_id &&
-      request.attempt_id == active_->attempt_id && request.waypoint_index == active_->stage_index) {
-    active_->identified_request = true;
-    on_goal(request.target);
-  }
+  if (!active_ || active_->turn || active_->reverse ||
+      request.goal_id != active_->goal_id || request.attempt_id != active_->attempt_id ||
+      request.waypoint_index != active_->stage_index || request.target.header.frame_id != options_.frame_id_)
+    return;
+  const auto &point=request.target.pose.position;
+  const auto stamp=stamp_ns(request.target.header.stamp);
+  if (stamp <= 0 || !(xy_distance({point.x,point.y},active_->xy)<.05) ||
+      (active_->identified_request && active_->stamp && *active_->stamp!=stamp))
+    return;
+  // A forwarded stage has a complete identity. The coordinator's /clock
+  // callback can lag ours, so its stamp need not order after input_stamp.
+  active_->identified_request = true;
+  bind_scan_goal(stamp);
 }
 
 void ExplorationController::on_raw_occupancy(const sensor_msgs::msg::PointCloud2 &msg) {
@@ -90,7 +98,7 @@ void ExplorationController::tick_observation() {
   const double current=wall_now();
   if(!observation_task_)return;
   const auto &task=*observation_task_;
-  const bool bounded_scan=task.floor_stair_probe;
+  const bool bounded_scan=task.floor_stair_probe || task.mandatory_stair_scan;
   const bool frame_gated=task.stair_segment_scan || task.targeted_blocker_scan || bounded_scan;
   if(task.directional() && !frame_gated)return;
   if(!task.waiting_since || (bounded_scan && current-task.waiting_since>=options_.observation_wait_) ||
@@ -104,7 +112,8 @@ void ExplorationController::report(const std::string &state, const std::string &
   // Only unfinished selection is resumed quickly. Executing, observing and
   // unavailable-data states keep their existing event/normal-timer handling.
   const bool resume=options_.floor_exploration_ && (state=="pct_local_search_pending" || state=="pct_floor_frontier_settled" ||
-      state=="pct_floor_local_empty" ||
+      state=="pct_floor_local_empty" || state=="pct_floor_complete" || state=="pct_floor_handoff_with_deferred_frontiers" ||
+      (state=="pct_local_stair_probe_waiting" && detail=="stair_index_pending") ||
       (state=="cross_layer_waiting_for_forward_route" && policy_.pct_frontiers_.query_pending));
   if(resume)selection_resume_at_=wall_now()+options_.pct_query_resume_delay_;
   else selection_resume_at_.reset();
@@ -168,6 +177,7 @@ void ExplorationController::report(const std::string &state, const std::string &
          <<",\"platform_height\":"<<(policy_.cross_task_.platform_height()?std::to_string(*policy_.cross_task_.platform_height()):"null")
          <<",\"reason\":"<<json_string(policy_.cross_task_.reason())
          <<",\"filtered_observers\":"<<policy_.cross_filtered_observers_<<'}';
+  if(options_.frontier_source_=="pct")stream<<",\"height_review\":"<<height_review_status_;
   if(options_.floor_exploration_ && options_.frontier_source_=="pct") {
     stream<<",\"pct_floor\":{\"number\":"<<policy_.floor_number_
           <<",\"height\":"<<(policy_.floor_height_?std::to_string(*policy_.floor_height_):"null")
@@ -179,6 +189,8 @@ void ExplorationController::report(const std::string &state, const std::string &
           <<",\"local_stair_probe_active\":"<<(policy_.local_stair_probe_active_?"true":"false")
           <<",\"contacting_feet\":"<<contacting_feet_
           <<",\"foot_sample\":"<<json_string(foot_sample_state_)
+          <<",\"support_stable\":"<<(foot_support_stable_?"true":"false")
+          <<",\"foot_height_span\":"<<foot_height_span_
           <<",\"confirmation_reason\":"<<json_string(policy_.floor_confirmation_reason_)
           <<",\"stable_foot_height\":"<<(stable_foot_height_?std::to_string(*stable_foot_height_):"null")
           <<",\"stair_tracks\":"<<policy_.pct_frontiers_.stair_flights
@@ -257,10 +269,19 @@ void ExplorationController::report(const std::string &state, const std::string &
            << ",\"pct_scoped_frontier_cells\":" << policy_.pct_frontiers_.scoped_frontier_cells
            << ",\"pct_disconnected_floor_frontier_cells\":" << policy_.pct_frontiers_.disconnected_floor_frontier_cells
            << ",\"pct_pending_review_clusters\":" << policy_.pct_frontiers_.pending_review_clusters
+           << ",\"pct_deferred_review_clusters\":" << policy_.pct_frontiers_.deferred_review_clusters
+           << ",\"pct_missing_connection_clusters\":" << policy_.pct_frontiers_.missing_connection_clusters
+           << ",\"pct_floor_known_barriers\":" << policy_.floor_known_barriers_
+           << ",\"pct_floor_review_wait_ms\":" << 1000.*(policy_.floor_review_elapsed_+
+                (policy_.floor_review_started_?wall_now()-*policy_.floor_review_started_:0.))
+           << ",\"pct_floor_review_resolved_cells\":" << policy_.floor_review_resolved_
            << ",\"pct_reviewing\":" << (policy_.pct_frontiers_.reviewing?"true":"false")
            << ",\"pct_fast_floor\":" << (policy_.pct_frontiers_.fast_floor?"true":"false")
            << ",\"pct_fast_skipped_clusters\":" << policy_.pct_frontiers_.fast_skipped_clusters
            << ",\"pct_fast_skipped_cells\":" << policy_.pct_frontiers_.fast_skipped_cells
+           << ",\"pct_failed_small_clusters\":" << policy_.pct_frontiers_.small_skipped_clusters
+           << ",\"pct_failed_small_cells\":" << policy_.pct_frontiers_.small_skipped_cells
+           << ",\"pct_floor_longest_selection_wait_ms\":" << policy_.floor_longest_selection_wait_ms_
            << ",\"pct_deferred_floor_frontier_cells\":" << policy_.pct_frontiers_.deferred_floor_frontier_cells
            << ",\"pct_local_window\":{\"horizontal_half_width\":" << cfg_.local_search_radius
            << ",\"height_above\":" << options_.pct_local_above_ << ",\"height_below\":" << options_.pct_local_below_
@@ -329,6 +350,9 @@ void ExplorationController::sample_support_height(const nav_msgs::msg::Odometry 
   }
   foot_sample_wall_=current;
   stable_foot_height_.reset();
+  foot_support_stable_=false;
+  contacting_foot_mask_=0;
+  foot_height_span_=0.;
   contacting_feet_=0;
   std::array<double,4> heights{};
   const auto reject=[this](const char *why) {
@@ -356,20 +380,29 @@ void ExplorationController::sample_support_height(const nav_msgs::msg::Odometry 
       if(!std::all_of(contact.begin(),contact.end(),[](double value){return std::isfinite(value);}))
         return reject("foot_tf_invalid");
       foot_contact_points_[f]=contact;
+      contacting_foot_mask_|=1u<<f;
       heights[contacting_feet_++]=contact[2];
     } catch(const tf2::TransformException &) {return reject("foot_tf_unavailable");}
   }
   if(contacting_feet_<3) return reject("insufficient_contact");
   std::sort(heights.begin(),heights.begin()+contacting_feet_);
-  if(heights[contacting_feet_-1]-heights[0]>.04) return reject("feet_on_different_levels");
+  foot_height_span_=heights[contacting_feet_-1]-heights[0];
+  const double step_limit=std::min(.16,shared_layer_?shared_layer_->max_step_height:.16);
+  if(foot_height_span_>step_limit+1e-7)return reject("foot_support_exceeds_step_limit");
+  const bool same_surface=foot_height_span_<=.04;
   const double median=(heights[contacting_feet_/2]+heights[(contacting_feet_-1)/2])*.5;
   const double yaw=*base_yaw_;
-  if(!foot_stable_since_ || std::abs(median-foot_reference_height_)>.02 ||
+  bool contacts_changed=contacting_foot_mask_!=foot_reference_mask_;
+  for(std::size_t f=0;f<foot_frames_.size();++f)
+    if((contacting_foot_mask_&(1u<<f)) &&
+       std::abs(foot_contact_points_[f][2]-foot_reference_contacts_[f][2])>.02)contacts_changed=true;
+  if(!foot_stable_since_ || contacts_changed ||
      std::abs(std::remainder(yaw-foot_reference_yaw_,2*M_PI))>.12 ||
      std::hypot((*base_)[0]-foot_reference_xy_[0],(*base_)[1]-foot_reference_xy_[1])>.035) {
     foot_stable_since_=current;
     four_feet_stable_since_.reset();
-    foot_reference_height_=median;
+    foot_reference_mask_=contacting_foot_mask_;
+    foot_reference_contacts_=foot_contact_points_;
     foot_reference_xy_={(*base_)[0],(*base_)[1]};
     foot_reference_yaw_=yaw;
     foot_height_samples_.clear();
@@ -382,8 +415,10 @@ void ExplorationController::sample_support_height(const nav_msgs::msg::Odometry 
   if(current-*foot_stable_since_>=.40 && foot_height_samples_.size()>=3) {
     auto samples=foot_height_samples_;
     std::sort(samples.begin(),samples.end());
-    foot_sample_state_="stable";
-    stable_foot_height_=(samples[samples.size()/2]+samples[(samples.size()-1)/2])*.5;
+    foot_support_stable_=true;
+    foot_sample_state_=same_surface?"stable":"stable_multilevel";
+    // A stable stance can span two treads; its average is not a ground surface.
+    if(same_surface)stable_foot_height_=(samples[samples.size()/2]+samples[(samples.size()-1)/2])*.5;
   }
 }
 
@@ -624,19 +659,10 @@ void ExplorationController::on_goal(const geometry_msgs::msg::PoseStamped &msg) 
   }
   // 只有表达式为真，才执行下面缩进或花括号内的代码。
   if (xy_distance(xy, active_->xy) < 0.05) {
-    // 与当前活动目标几乎相同，只更新时间戳（保证是最新的 Goal）
-    if (stamp_ns(msg.header.stamp) < active_->input_stamp) return; // 老旧消息直接忽略
-    active_->stamp = stamp_ns(msg.header.stamp);
-    path_processor_.bind_scan_goal(*active_->stamp);
-    if (pending_scan_failure_ && pending_scan_failure_->first == *active_->stamp) {
-      const auto pending = *pending_scan_failure_;
-      pending_scan_failure_.reset();
-      handle_scan_failure(pending.first, pending.second);
-      return;
-    }
-    if(pending_scan_ack_ && stamp_ns(pending_scan_ack_->header.stamp)==*active_->stamp) {
-      const auto pending=*pending_scan_ack_;pending_scan_ack_.reset();on_ack(pending);
-    }
+    // The legacy PoseStamped path has no stage identity.
+    const auto stamp=stamp_ns(msg.header.stamp);
+    if (active_->identified_request || stamp < active_->input_stamp) return;
+    bind_scan_goal(stamp);
   } else {
     // 完全不同的目标：先清除当前目标并暂停
     // 清空临时状态，准备下一轮处理。
@@ -649,23 +675,38 @@ void ExplorationController::on_goal(const geometry_msgs::msg::PoseStamped &msg) 
   }
 }
 
-void ExplorationController::on_ack(const geometry_msgs::msg::PoseStamped &msg) {
-  // 尚无对应数据或目标时，进入此分支。
-  if (!active_ || active_->turn || active_->reverse) return;
-  if(!active_->stamp) {
-    if(msg.header.frame_id==options_.frame_id_ && stamp_ns(msg.header.stamp)>=active_->input_stamp)
-      pending_scan_ack_=msg;
+void ExplorationController::bind_scan_goal(std::int64_t stamp) {
+  active_->stamp = stamp;
+  path_processor_.bind_scan_goal(stamp);
+  if (pending_scan_failure_ && pending_scan_failure_->first == stamp) {
+    const auto pending = *pending_scan_failure_;
+    pending_scan_failure_.reset();
+    handle_scan_failure(pending.first, pending.second);
     return;
   }
-  if(stamp_ns(msg.header.stamp) != *active_->stamp) return;
-  // 只有表达式为真，才执行下面缩进或花括号内的代码。
-  if (msg.header.frame_id != options_.frame_id_) return;
-  // 根据当前目标是否存在或是否完成来决定下一步。
-  const auto command=base_?path_processor_.dispatch(*active_->stamp,*base_):std::nullopt;
-  const double arrival_limit=command && command->xy_tolerance?*command->xy_tolerance:options_.goal_reach_xy_;
-  if (xy_distance({msg.pose.position.x, msg.pose.position.y}, active_->xy) > arrival_limit+1e-6) return;
-  if(!std::isfinite(msg.pose.position.x)||!std::isfinite(msg.pose.position.y)||!std::isfinite(msg.pose.position.z))return;
-  active_->stop_position=Point{msg.pose.position.x,msg.pose.position.y,msg.pose.position.z};
+  if (pending_scan_ack_ && stamp_ns(pending_scan_ack_->header.stamp) == stamp) {
+    const auto pending = *pending_scan_ack_;
+    pending_scan_ack_.reset();
+    on_ack(pending);
+  }
+}
+
+void ExplorationController::on_ack(const geometry_msgs::msg::PoseStamped &msg) {
+  if (!active_ || active_->turn || active_->reverse || msg.header.frame_id != options_.frame_id_) return;
+  const auto stamp = stamp_ns(msg.header.stamp);
+  if (stamp <= 0) return;
+  const auto &point = msg.pose.position;
+  if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) return;
+  const auto command = base_ ? path_processor_.dispatch(stamp,*base_) : std::nullopt;
+  const double arrival_limit = command && command->xy_tolerance ? *command->xy_tolerance : options_.goal_reach_xy_;
+  if (xy_distance({point.x,point.y},active_->xy)>arrival_limit+1e-6) return;
+  if(!active_->stamp) {
+    // Delivery can race the forwarded request. Bind only by its exact stamp.
+    pending_scan_ack_=msg;
+    return;
+  }
+  if (stamp != *active_->stamp) return;
+  active_->stop_position=Point{point.x,point.y,point.z};
   active_->ack = true;
   // A matching identified request plus the executor's stamped zero/arrival
   // receipt is authoritative. A depth-one Bool can coalesce false->true
@@ -890,6 +931,20 @@ void ExplorationController::handle_scan_failure(std::int64_t stamp, const std::s
   const XY failed_target = route_selection_target_.value_or(active_->xy);
   const auto failed_pct=selected_pct_;
   const auto failed_observation=selected_pct_observation_;
+  if(selected_local_stair_probe_ && reason=="execution_stop_timeout" && !turning && !recovering &&
+     base_ && base_yaw_ && wall_now()-base_wall_<=options_.odom_timeout_ &&
+     wall_now()-yaw_wall_<=options_.odom_timeout_ && layer_map_fresh()) {
+    LayerMapReadPhase lock(*shared_layer_);
+    const auto checked=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
+        "recover_stair_stop",0,*base_,*base_yaw_);
+    RCLCPP_INFO(logger_,"Stair stop timeout actual-stance check: %s",checked.metadata.c_str());
+    if(checked.ready) {
+      active_.reset();
+      reset_planned_route();
+      report("stair_stop_safe_replan","execution_stop_timeout");
+      return;
+    }
+  }
   bool floor_attempt_settled=false;
   if(selected_local_stair_probe_ && failed_pct && !failed_pct->observations.empty()) {
     auto point=failed_pct->observations.front();
@@ -951,8 +1006,7 @@ void ExplorationController::on_scan_failure(const std_msgs::msg::String &msg) {
         return (ch >= 'a' && ch <= 'z') || ch == '_';
       })) return;
   if (!active_->stamp) {
-    if (stamp >= active_->input_stamp)
-      pending_scan_failure_ = std::make_pair(stamp, reason);
+    pending_scan_failure_ = std::make_pair(stamp, reason);
     return;
   }
   handle_scan_failure(stamp, reason);
@@ -994,7 +1048,8 @@ void ExplorationController::on_recovery_action_result(const std_msgs::msg::Strin
     reset_planned_route();
     observation_task_->turning=false;
     if(base_ && base_yaw_)arm_observation_view();
-    report("observation_waiting_for_local_frames");return;
+    if(observation_task_->waiting_since>0)report("observation_waiting_for_local_frames");
+    return;
   }
   active_.reset();
   reset_planned_route();
@@ -1003,12 +1058,35 @@ void ExplorationController::on_recovery_action_result(const std_msgs::msg::Strin
 Point ExplorationController::cross_ground_pose() const {
   auto point=*base_;
   point[2]-=options_.layer_body_height_;
+  const bool feet_current=stable_foot_height_ && wall_now()-foot_sample_wall_<=.25;
+  if(feet_current)point[2]=*stable_foot_height_;
+  if(shared_layer_ && shared_layer_->pct && layer_map_fresh()) {
+    LayerMapReadPhase lock(*shared_layer_);
+    auto support_pose=*base_;
+    support_pose[2]=point[2]+options_.layer_body_height_;
+    const auto support=shared_layer_->pct->point_check(shared_layer_->current_version.load(),support_pose,
+        false,std::nullopt,0.,false,feet_current?std::optional<XY>{{point[2],.04}}:std::nullopt,true);
+    if(support.ready && support.ground_z)point[2]=*support.ground_z;
+  }
   return point;
 }
 
 bool ExplorationController::stable_four_foot_support(double current) const {
-  return stable_foot_height_ && four_feet_stable_since_ && current-foot_sample_wall_<=.25 &&
+  return foot_support_stable_ && four_feet_stable_since_ && current-foot_sample_wall_<=.25 &&
       foot_sample_wall_-*four_feet_stable_since_>=.40;
+}
+
+double ExplorationController::refresh_stair_heading(double fallback) {
+  if(!base_ || !shared_layer_ || !shared_layer_->pct || !layer_map_fresh())return fallback;
+  LayerMapReadPhase lock(*shared_layer_);
+  const auto view=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
+      "stair_heading",0,*base_,fallback);
+  if(!view.ready)return fallback;
+  if(std::abs(std::remainder(view.yaw-fallback,2*M_PI))>.10)
+    RCLCPP_INFO(logger_,"Measured stair heading refreshed: %.3f -> %.3f rad",fallback,view.yaw);
+  if(policy_.cross_task_.engaged() || policy_.cross_task_.deferred())
+    policy_.cross_task_.set_ascent_yaw(view.yaw);
+  return view.yaw;
 }
 
 void ExplorationController::finish_active_goal() {
@@ -1147,6 +1225,11 @@ void ExplorationController::publish_pct_frontiers() {
 }
 
 void ExplorationController::start_stair_segment_scan(double heading,bool mandatory) {
+  heading=refresh_stair_heading(heading);
+  // When no measured direction is available, scan from the current stance
+  // instead of demanding a large turn to an old approach bearing.
+  if(base_yaw_ && std::abs(std::remainder(heading-*base_yaw_,2*M_PI))>.71)
+    heading=*base_yaw_;
   auto region=cross_ground_pose();
   region[0]+=.5*std::cos(heading);
   region[1]+=.5*std::sin(heading);
@@ -1176,14 +1259,20 @@ void ExplorationController::start_floor_stair_scan(double heading,double current
 
 void ExplorationController::arm_observation_view() {
   auto &task=*observation_task_;
+  // The first and last headings only align the body. Arm evidence at the sides.
+  if(task.mandatory_stair_scan && (task.next==1 || task.next==task.headings.size()))return;
   LayerMapReadPhase lock(*shared_layer_);
   const auto version=shared_layer_->current_version.load();
-  const bool stair_view=task.stair_segment_scan;
+  const bool stair_view=task.stair_segment_scan || task.mandatory_stair_scan;
+  if(task.mandatory_stair_scan && !task.stair_segment_scan)
+    shared_layer_->pct->observation_task(version,"arm",task.frontier.id,*base_,*base_yaw_);
   shared_layer_->pct->observation_task(version,
       task.targeted_blocker_scan?"arm_blocker_review":
       task.floor_stair_probe?"arm_floor_stair_probe":stair_view?"arm_stair_view":"arm",
-      task.frontier.id,*base_,stair_view?task.center:*base_yaw_);
+      task.frontier.id,*base_,stair_view?task.center:*base_yaw_,
+      task.mandatory_stair_scan?task.headings[task.next-1]-task.center:0.);
   task.waiting_since=wall_now();
+  task.stair_view_last_frame=task.waiting_since;
 }
 
 void ExplorationController::end_observation(bool success,const std::string &reason,bool floor_attempt_settled) {
@@ -1191,7 +1280,6 @@ void ExplorationController::end_observation(bool success,const std::string &reas
   const auto frontier=observation_task_->frontier;
   RCLCPP_INFO(logger_,"Observation task %s: %s",success?"completed":"unresolved",reason.c_str());
   const bool support_scan=observation_task_->support_scan;
-  const bool segment_scan=observation_task_->stair_segment_scan;
   if(observation_task_->targeted_blocker_scan && shared_layer_ && shared_layer_->pct && base_) {
     LayerMapReadPhase lock(*shared_layer_);
     observation_metadata_=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
@@ -1213,6 +1301,8 @@ void ExplorationController::end_observation(bool success,const std::string &reas
     LayerMapReadPhase lock(*shared_layer_);
     const auto result=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),"finish",
         frontier.id,*base_,*base_yaw_,observation_task_->coverage);
+    if(observation_task_->floor_attempt==2 && !platform_frontier && !policy_.floor_complete_)
+      policy_.floor_review_resolved_+=result.resolved_frontier_cells;
     settlement=result.metadata;
     if(observation_task_->floor_attempt && result.floor_attempt=="inconclusive")
       policy_.pct_floor_wait_for_frame_after_=shared_layer_->last_integration_wall_seconds.load();
@@ -1231,6 +1321,8 @@ void ExplorationController::end_observation(bool success,const std::string &reas
        <<",\"cluster_id\":"<<frontier.id<<",\"evidence\":"<<observation_metadata_
        <<",\"duration_s\":"<<wall_now()-observation_task_->began
        <<",\"views_completed\":"<<observation_task_->views_completed;
+  if(observation_task_->mandatory_stair_scan)
+    event<<",\"stair_views_with_returns\":"<<observation_task_->stair_views_with_returns;
   if(observation_task_->floor_attempt)event<<",\"floor_frontier_attempt\":"<<observation_task_->floor_attempt;
   event<<",\"selection_map_version\":"<<frontier.revision
        <<",\"observation_map_version\":"<<shared_layer_->current_version.load();
@@ -1265,7 +1357,9 @@ void ExplorationController::end_observation(bool success,const std::string &reas
     const auto checked=shared_layer_->pct->arrival_area(shared_layer_->current_version.load(),
         next_pose,options_.observation_goal_xy_tolerance_,policy_.cross_task_.ascent_yaw());
     if(!checked.ready) {
-      begin_blocker_recovery(frontier,checked.unknown_blockers,true);
+      begin_blocker_recovery(frontier,checked.unknown_blockers,true,0,"pct_stair_frontier",
+                             std::nullopt,std::nullopt,true);
+      report("cross_layer_waiting_for_forward_route","continuation_requires_observation");
       return;
     }
     path_processor_=std::move(*continuation);
@@ -1277,10 +1371,8 @@ void ExplorationController::end_observation(bool success,const std::string &reas
     selected_floor_attempt_=continuation_attempt;
     route_selection_target_=XY{frontier.frontier[0],frontier.frontier[1]};
   }
-  if(segment_scan && !success && policy_.cross_task_.engaged() && !recovery_.blocker_recovery_) {
-    recover_blocked_ascent();
-    return;
-  }
+  // Cross-layer selection checks the current footprint and platform before
+  // choosing a route or recovery after a failed segment scan.
   report(success?"observation_completed":"observation_unresolved",reason);
 }
 
@@ -1375,16 +1467,22 @@ bool ExplorationController::handle_observation(double current) {
   if(task.waiting_since>0) {
     const double dwell=task.directional()?options_.observation_wait_:options_.observation_flat_wait_;
     if(task.mandatory_stair_scan) {
-      if(current-task.waiting_since<dwell ||
-         shared_layer_->last_integration_wall_seconds.load()<=task.waiting_since) {
+      bool observed=false;
+      const double frame=shared_layer_->last_integration_wall_seconds.load();
+      if(frame>task.stair_view_last_frame) {
+        task.stair_view_last_frame=frame;
+        LayerMapReadPhase lock(*shared_layer_);
+        const auto progress=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
+            "stair_view_progress",0,*base_);
+        observed=progress.ready;
+        observation_metadata_=progress.metadata;
+      }
+      if(!observed && current-task.waiting_since<options_.observation_wait_) {
         report("observation_waiting_for_local_frames");return true;
       }
+      if(observed)++task.stair_views_with_returns;
       task.waiting_since=0.;
       ++task.views_completed;
-      if(task.next>=task.headings.size()) {
-        end_observation(true,task.support_scan?"stair_segment_scan_observed":"sweep_executed");
-        return true;
-      }
     } else {
       if(task.floor_stair_probe) {
         const bool frame=shared_layer_->last_integration_wall_seconds.load()>task.waiting_since;
@@ -1453,6 +1551,9 @@ bool ExplorationController::handle_observation(double current) {
        options_.observation_full_sweep_ && task.next==task.headings.size()) {
       ++task.next;task.coverage=M_PI;
       if(!dispatch_observation_turn(2*M_PI))end_observation(false,"full_sweep_space_rejected");
+    } else if(task.mandatory_stair_scan && task.stair_segment_scan) {
+      end_observation(true,task.stair_views_with_returns?"stair_segment_scan_observed":
+          "stair_segment_sweep_no_related_returns");
     } else end_observation(true,task.support_scan?
         (task.cross_layer?"stair_support_sweep_executed":"blocker_sweep_executed"):"sweep_executed");
     return true;
@@ -1462,7 +1563,7 @@ bool ExplorationController::handle_observation(double current) {
   const double offset=std::abs(std::remainder(heading-task.center,2*M_PI));
   if(std::abs(angle)<=.06) {
     arm_observation_view();
-    report("observation_waiting_for_local_frames");
+    if(task.waiting_since>0)report("observation_waiting_for_local_frames");
   } else if(!dispatch_observation_turn(angle)) {
     const bool primary_done=!task.directional() && task.views_completed>0;
     end_observation(primary_done,primary_done?"side_turn_space_rejected":"turn_space_rejected");

@@ -5,6 +5,7 @@ cells stay in the owner; no dense map or second planning snapshot is created.
 The owner updates this index before releasing its map commit lock.
 """
 from dataclasses import dataclass, field
+from collections import Counter, deque, defaultdict
 import math
 import time
 from statistics import median
@@ -14,10 +15,14 @@ import numpy as np
 SLICE_ID_STRIDE = 1 << 24
 
 DIRECTIONS = tuple((x,y) for x in (-1,0,1) for y in (-1,0,1) if x or y)
+NEIGHBORHOOD = ((0, 0),) + DIRECTIONS
 EMPTY_WORK = dict(checked_columns=0,changed_frontier_layers=0,topology_changed_layers=0,
                   boundary_input_columns=0,relabelled_tiles=0,reclustered_layers=0,
                   component_fragments_visited=0,updated_clusters=0,observer_invalidated=0,
-                  summaries_ms=0.,membership_ms=0.,clusters_ms=0.,update_ms=0.)
+                  summaries_ms=0.,membership_ms=0.,clusters_ms=0.,update_ms=0.,
+                  affected_clusters=0,component_nodes_visited=0,cluster_rebuilds=0,
+                  local_connectivity_checks=0,local_connectivity_preserved=0,
+                  physical_columns_checked=0,physical_clusters_updated=0,physical_tasks_ms=0.)
 
 
 def frontier_return(orientation):
@@ -30,6 +35,7 @@ class Boundary:
     height: float
     # Keep cut-specific support references; source_states reads current costs.
     sources: tuple
+    layer: int | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +47,10 @@ class FloorAttempt:
     fast: bool = False
     failures: int = 0
     max_attempts: int = 2
+    bounded_review: bool = False
+    failed_small: bool = False
+    tested_poses: frozenset = frozenset()
+    resume_poses: tuple = ()
 
     @property
     def review(self):
@@ -53,10 +63,17 @@ class FloorViewSearch:
     scope: tuple
     members: dict
     elapsed: float = 0.
+    last_slice: int = 0
     rejected: set = field(default_factory=set)
     first_rejected: tuple | None = None
     blockers: list = field(default_factory=list)
     route_timeout: bool = False
+    direction_center: tuple | None = None
+    direction_poses: tuple | None = None
+    direction_results: dict = field(default_factory=dict)
+    tested_poses: set = field(default_factory=set)
+    resume_poses: tuple = ()
+    pose_limit: int | None = None
 
 
 class FrontierCluster(dict):
@@ -102,26 +119,32 @@ class SliceFrontiers:
         if xy in cache:return cache[xy]
         m=self.map;s=m.settings;potential=[];safe=[];observed=set();barriers=set()
         k=self.layer
+        if m.ground_pending(xy,k):
+            result=([],(),(),())
+            cache[xy]=result
+            return result
         row=m.cell((k,*xy)) if k in m.column_layers.get(xy,()) else None
         if row is not None and np.isfinite(row['G']):
             h=float(row['G'])
             barriers.add(h)
             if np.isfinite(row['C']):barriers.add(float(row['C']))
-            if not row['solid'] and (not np.isfinite(row['C']) or row['C']-h>=s.minimum_clearance):
+            if (not row['solid'] and m.surface_observation.is_ground_source(xy,int(row['g_surface_id'])) and
+                    (not np.isfinite(row['C']) or row['C']-h>=s.minimum_clearance)):
                 cost=m.planning_cost((k,*xy))
-                potential.append((k,h,int(row['g_surface_id']),float(cost)))
-                if 0<=cost<=20:safe.append(potential[-1])
+                source=(k,h,int(row['g_surface_id']),float(cost))
+                if 0<=cost<=20:safe.append(source)
+                potential.append(source)
         # Keep physical surfaces even when no fixed cut selects them as G.
         # They can seed a view task, but never acquire an invented safe cost.
         # Measured hits provide independent occlusion/body evidence.
         column=m.columns.get(xy)
         if column:
-            records=list(column.values())
+            records=list(m.surface_observation.observed(xy))
             barriers.update(r.height for r in records)
             observed.update((r.height,r.orientation) for r in records)
             for at,r in enumerate(records):
                 if r.orientation!=1:continue
-                cut=math.ceil((r.height-s.origin_z)/s.slice_dh-1e-7)
+                cut=m.surface_observation.first_ground_slice(r.height)
                 if k!=cut or (at+1<len(records) and records[at+1].height-r.height<s.minimum_clearance):
                     continue
                 if not any(other['g_surface_id']==r.id for _,other in m.layers_at(*xy)):
@@ -132,6 +155,7 @@ class SliceFrontiers:
 
     def _boundaries(self, xy, cache):
         s=self.map.settings
+        evidence=self.map.surface_observation
         sources={}
         for dx,dy in DIRECTIONS:
             nx,ny=xy[0]+dx,xy[1]+dy
@@ -159,52 +183,21 @@ class SliceFrontiers:
                 distances=[abs(h-height) for height in heights]
                 closest=min(distances)
                 matches=[at for at,d in enumerate(distances) if d<=closest+1e-7]
-                # One measured sheet cannot resolve two different tasks.
-                # Equidistant, ambiguous evidence resolves neither of them.
+                # Exact matching assigns a return to its unique closest group.
                 if closest<=s.surface_noise_tolerance+1e-7 and len(matches)==1:
                     resolved.add(matches[0])
             for at,group in enumerate(groups):
                 height=heights[at]
-                if at in resolved:continue
-                if any(height+s.step_max<h<=height+s.minimum_clearance for h in barriers):continue
-                if self._observed_step_edge(xy,height,cache):continue
+                refs=tuple((x,y,sid) for x,y,_,sid,_ in group)
+                if at in resolved or any(height+s.step_max<h<=height+s.minimum_clearance for h in barriers):
+                    continue
+                if evidence.frontier_settled(xy,height,refs,layer=k):
+                    continue
                 # Stable source identity permits several heights in one cut/XY.
                 # IDs are column-local, so include the source XY in the key.
                 anchor=min((e[0],e[1],e[3]) for e in group)
-                result[(k,*xy,anchor)]=Boundary(height,tuple(sorted(entry[:4] for entry in group)))
+                result[(k,*xy,anchor)]=Boundary(height,tuple(sorted(entry[:4] for entry in group)),k)
         return result
-
-    def _observed_step_edge(self, xy, expected, cache):
-        """Recognize a fully measured two-tread boundary, without inventing G.
-
-        A neighbour's tread must not extend forever into the other, observed
-        tread. Require a complete 3x3 patch partitioned into two height bands
-        by a straight edge. Holes, overlapping sheets and undersides retain
-        their independent unknown-height tasks.
-        """
-        s=self.map.settings
-        measured=[h for h,o in self._summary(xy,cache)[1] if frontier_return(o)]
-        if not measured:return False
-        # The other tread can be C on this cut. Edge classification uses real
-        # returns, independently of whether this cut currently selects it as G.
-        actual=min(measured,key=lambda h:abs(h-expected))
-        delta=abs(expected-actual)
-        tolerance=s.surface_noise_tolerance+1e-7
-        if not tolerance<delta<=s.step_max+1e-7:return False
-        labels={}
-        for dx,dy in ((0,0),)+DIRECTIONS:
-            hits=self._summary((xy[0]+dx,xy[1]+dy),cache)[1]
-            # A measured underside is evidence of a separate sheet, including
-            # a thin floor whose lower/upper sides are within step ability.
-            if any(o==-1 and min(actual,expected)-tolerance<=h<=max(actual,expected)+tolerance
-                   for h,o in hits):return False
-            own=any(frontier_return(o) and abs(h-actual)<=tolerance for h,o in hits)
-            other=any(frontier_return(o) and abs(h-expected)<=tolerance for h,o in hits)
-            if own==other:return False
-            labels[dx,dy]=int(other)
-        if labels[0,0] or not 3<=sum(labels.values())<=6:return False
-        return any(all(label==int(dx*nx+dy*ny>0) for (dx,dy),label in labels.items())
-                   for nx,ny in DIRECTIONS)
 
     def source_states(self, key):
         """Read current costs from retained cut references, not stale copies."""
@@ -256,7 +249,7 @@ class SliceFrontiers:
         for key in members:self.membership[key]=cid
         self.changed_clusters.add(cid)
 
-    def update(self, changed_columns, boundary_kernel=None):
+    def update(self, changed_columns, boundary_kernel=None, force_columns=()):
         self.changed_clusters=set()
         self.stale_observers=set()
         if not changed_columns:
@@ -265,9 +258,9 @@ class SliceFrontiers:
         began=time.monotonic()
         self.revision=self._catalog().revision+1
         cache={};observer_changes=set();observer_heights=set()
-        boundary_dirty=set()
+        boundary_dirty=set(force_columns)
         # Raw hits and soft costs do not necessarily alter a boundary. Compare
-        # only the committed fields read by _boundaries before expanding 3x3.
+        # only the fields read by boundary checks before expanding the 3x3.
         for xy in changed_columns:
             potential,observed,safe,barriers=self._summary(xy,cache)
             previous_safe=self.safe_signatures.get(xy,())
@@ -280,13 +273,14 @@ class SliceFrontiers:
                 observer_heights.update((*xy,entry[0]) for entry in previous_safety^current_safety)
             if safe:self.safe_signatures[xy]=safe
             else:self.safe_signatures.pop(xy,None)
-            signature=(tuple(entry[:3] for entry in potential),observed,barriers)
-            previous_input=self.frontier_inputs.get(xy,((),(),()))
+            signature=(tuple(entry[:3] for entry in potential),observed,barriers,
+                       self.map.surface_observation.boundary_signature(xy))
+            previous_input=self.frontier_inputs.get(xy,((),(),(),()))
             self.known_count+=len(potential)-len(previous_input[0])
             self.safe_count+=len(safe)-len(previous_safe)
             if previous_input!=signature:
                 boundary_dirty.add(xy)
-                if signature!=((),(),()):self.frontier_inputs[xy]=signature
+                if any(signature):self.frontier_inputs[xy]=signature
                 else:self.frontier_inputs.pop(xy,None)
         summaries_done=time.monotonic()
         columns=set(boundary_dirty)
@@ -310,14 +304,17 @@ class SliceFrontiers:
             if potential or observed or barriers:
                 summaries[xy]=([(height,sid) for _,height,sid,_ in potential],observed,barriers)
         settings=self.map.settings
+        evidence=self.map.surface_observation
         found=kernel(columns,summaries,settings.surface_noise_tolerance,
                      settings.step_max,settings.minimum_clearance)
         replacements={xy:{} for xy in columns}
         for xy,groups in found.items():
             for height,sources in groups:
-                if self._observed_step_edge(xy,height,cache):continue
+                refs=tuple((x,y,sid) for x,y,_,sid in sources)
+                if evidence.frontier_settled(xy,height,refs,layer=self.layer):
+                    continue
                 anchor=min((x,y,sid) for x,y,_,sid in sources)
-                replacements[xy][(self.layer,*xy,anchor)]=Boundary(height,tuple(sources))
+                replacements[xy][(self.layer,*xy,anchor)]=Boundary(height,tuple(sources),self.layer)
         return replacements
 
     def _replace_boundaries(self, replacements):
@@ -353,7 +350,7 @@ class SliceFrontiers:
                   (set(self.neighbours(key)) if key in self.nodes else None)}
         self.components.replace(removed,added)
         membership_ms=1000*(time.monotonic()-began)
-        work=self.components.update(topology)
+        work=self.components.update(topology,old_edges)
         # Heights can change without altering any edge. Refresh metadata only;
         # no component traversal or observer search is needed in that case.
         metadata_clusters=old_clusters|{self.membership[k] for k in geometry if k in self.membership}
@@ -417,7 +414,13 @@ class FrontierIndex:
         self.completion_revision=0
         self.floor_failures={}
         self.floor_blacklist={}
+        self.floor_review_timeouts={}
+        self.floor_failed_small={}
+        self.floor_known_barriers={}
         self.floor_disconnected={}
+        self.floor_retry_tiles=defaultdict(set)
+        self.floor_retry_dependencies={}
+        self.floor_reopened=0
 
     def reset_geometry(self):
         # Completed views and failure history are keyed by physical evidence.
@@ -432,11 +435,13 @@ class FrontierIndex:
         self.floor_query_members={}
         self.floor_query=None
         self.floor_pending=None
-        self.floor_view_search=None
+        self.floor_view_searches={}
+        self.floor_view_slice=0
         self.query_scope=None
         self.query_visited={}
-        self._physical_task_cache=None
-        self._merged_tasks={}
+        self._physical_task_cache=({}, {}, {}, {})
+        self._physical_column_edges={}
+        self._physical_contacts={}
         self.known_count=self.safe_count=0
         self.revision=getattr(self,'revision',0)
         self.last_work=dict(EMPTY_WORK)
@@ -480,8 +485,10 @@ class FrontierIndex:
         observer_changes=set()
         observer_heights=set()
         self.revision+=1
-        cluster_changed=False
+        changed_clusters=set()
+        changed_columns=set()
         for index,(changed,surfaces,heights) in results:
+            changed_columns.update(key[1:3] for key in changed)
             for key in changed:
                 xy=key[1:3]
                 if key in index.nodes:
@@ -500,20 +507,22 @@ class FrontierIndex:
                 if cluster:
                     self.clusters[cid]=cluster
                     for key in cluster['members']:
+                        if self.membership.get(key)!=cid:
+                            changed_columns.add(key[1:3])
                         self.membership[key]=cid
-            cluster_changed |= bool(index.changed_clusters)
+            changed_clusters.update(index.changed_clusters)
             observer_changes.update(surfaces)
             observer_heights.update(heights)
             for key,value in index.last_work.items():
                 self.last_work[key]+=value
             for observer in index.stale_observers:
                 self.observer_cache.drop(observer)
-        if cluster_changed:
-            self._physical_task_cache=None
-            self.observer_cache.prune()
+        if changed_clusters or changed_columns:
+            self._update_physical_tasks(changed_clusters,changed_columns)
         s=self.map.settings
         self._forget_completed(observer_heights,s.robot_radius+s.safety_margin+s.resolution)
         self.observer_cache.invalidate_surfaces(observer_changes)
+        self._reopen_floor_failures(observer_changes)
         self.known_count=sum(index.known_count for index in self.slices.values())
         self.safe_count=sum(index.safe_count for index in self.slices.values())
         self.last_work['observer_invalidated']=self.observer_cache.invalidated-invalidated
@@ -532,6 +541,66 @@ class FrontierIndex:
         for bx in range(lo[0]//b,hi[0]//b+1):
             for by in range(lo[1]//b,hi[1]//b+1):points.update(self.completed_tiles.get((bx,by),()))
         return sorted(points)
+
+    def _watch_floor_failure(self, floor, key):
+        xy=key[1:3]
+        token=(xy,floor,self.nodes[key])
+        if token in self.floor_retry_dependencies:return
+        s=self.map.settings
+        radius=self.radius+max(s.robot_radius+s.safety_margin,s.ground_lidar_min_range)+.15
+        half=math.ceil(radius/s.resolution)
+        x,y=xy;b=s.block_size
+        tiles={(bx,by) for bx in range((x-half)//b,(x+half)//b+1)
+               for by in range((y-half)//b,(y+half)//b+1)}
+        self.floor_retry_dependencies[token]=tiles
+        for tile in tiles:self.floor_retry_tiles[tile].add(token)
+
+    def _reopen_floor_failures(self, changes):
+        s=self.map.settings;b=s.block_size
+        touched=defaultdict(list)
+        for layer,x,y,height in changes:
+            row=self.map.cell((layer,x,y))
+            if row is not None and not row['unknown'] and self.map.planning_cost((layer,x,y))<=20:
+                for token in self.floor_retry_tiles.get((x//b,y//b),()):
+                    touched[token].append((x,y,height))
+        radius=self.radius+max(s.robot_radius+s.safety_margin,s.ground_lidar_min_range)+.15
+        resumed=set()
+        for token,points in touched.items():
+            xy,floor,boundary=token
+            if not any(math.hypot(x-xy[0],y-xy[1])*s.resolution<=radius and
+                       abs(height-boundary.height)<=s.step_max+1e-7 for x,y,height in points):
+                continue
+            for table in (self.floor_failures,self.floor_blacklist,self.floor_review_timeouts,self.floor_failed_small):
+                records=table.get(xy)
+                if records is None:continue
+                matches=[record for record in records if self._same_boundary(boundary,record[1])]
+                for record in matches:
+                    if isinstance(records,dict):del records[record]
+                    else:records.discard(record)
+                if not records:table.pop(xy,None)
+            for key in self.by_column.get(xy,()):
+                if self._same_boundary(self.nodes[key],boundary):
+                    resumed.add(self.task_id(key))
+            for tile in self.floor_retry_dependencies.pop(token):
+                self.floor_retry_tiles[tile].discard(token)
+                if not self.floor_retry_tiles[tile]:del self.floor_retry_tiles[tile]
+        for cid in resumed:
+            self.clear_floor_view_search(cid)
+            self.query_visited.pop(cid,None)
+        self.floor_reopened+=len(resumed)
+        self.last_work['reopened_floor_clusters']=len(resumed)
+
+    def floor_work_available(self, floor):
+        for cluster in self.physical_tasks()[0].values():
+            for key in cluster['members']:
+                node=self.nodes[key]
+                if (abs(node.height-floor[0])<=floor[1] and
+                        any(abs(source[2]-floor[0])<=floor[1] for source in node.sources) and
+                        not self._disconnected_on_floor(floor,key) and
+                        not self._floor_records(self.floor_blacklist,floor,key) and
+                        self._failure_count(floor,key)==0):
+                    return True
+        return False
 
     def _forget_completed(self, columns, radius):
         if not self.completed_points:return
@@ -562,9 +631,11 @@ class FrontierIndex:
 
     def _observers(self, members, base=None, minimum_distance=0., completed=(), component=None,
                    window=None, deadline=None, continuation=None, floor=None, minimum_gain=1, physical=None,
-                   connectivity=None, admission=None, rejected=(), ascent_limits=None):
+                   connectivity=None, admission=None, rejected=(), ascent_limits=None,
+                   direction_search=None, direction_deadline=None):
         return self.observer_cache.select(members,base,minimum_distance,completed,component,window,deadline,
-                                          continuation,floor,minimum_gain,physical,connectivity,admission,rejected,ascent_limits)
+                                          continuation,floor,minimum_gain,physical,connectivity,admission,
+                                          rejected,ascent_limits,direction_search,direction_deadline)
 
     def complete(self, cid, revision, point):
         point=tuple(map(float,point))
@@ -581,17 +652,25 @@ class FrontierIndex:
             cid=cluster['id']
         local=self.floor_query_members.get(cid)
         if not local or cluster is None or self.floor_query is None:return None
-        floor,belongs,fast,failures,max_attempts=self.floor_query
+        floor,belongs,fast,failures,max_attempts,bounded_review=self.floor_query
         members={key:self.nodes[key] for key in cluster['members'] if belongs(key) and
                  not self._disconnected_on_floor(floor,key) and
                  not self._floor_records(self.floor_blacklist,floor,key) and
                  self._failure_count(floor,key)==failures}
-        return FloorAttempt(cid,floor,members,local,fast,failures,max_attempts)
+        small_limit=self.map.settings.floor_failed_small_cluster_max_cells
+        small=bounded_review and failures>0 and small_limit and self._small_floor_members(
+            cluster['members'],belongs,small_limit)
+        search=self.floor_view_searches.get(cid) if bounded_review else None
+        tested=frozenset(search.tested_poses|search.rejected) if search is not None else frozenset()
+        resume=tuple(p for p in (search.direction_poses or ()) if p not in tested) if search is not None else ()
+        return FloorAttempt(cid,floor,members,local,fast,failures,max_attempts,bounded_review,bool(small),tested,resume)
 
-    def reject_floor_view(self, cid, pose, timed_out, blockers):
-        search=self.floor_view_search
-        if search is None or search.cluster!=cid:return False
+    def reject_floor_view(self, cid, pose, timed_out, blockers, elapsed=0.):
+        search=self.floor_view_searches.get(cid)
+        if search is None:return False
         pose=tuple(pose)
+        if pose not in search.rejected:
+            search.elapsed+=max(0.,elapsed)
         search.rejected.add(pose)
         if search.first_rejected is None:search.first_rejected=pose
         search.route_timeout|=timed_out
@@ -599,8 +678,7 @@ class FrontierIndex:
         return True
 
     def clear_floor_view_search(self, cid):
-        if self.floor_view_search is not None and self.floor_view_search.cluster==cid:
-            self.floor_view_search=None
+        self.floor_view_searches.pop(cid,None)
 
     def _same_boundary(self, first, second):
         a={source[:2]:source[3] for source in first.sources}
@@ -617,6 +695,8 @@ class FrontierIndex:
                 if self._same_boundary(node,identity[1])]
 
     def _disconnected_on_floor(self, floor, key):
+        if any(record[0]==floor for record in self._floor_records(self.floor_known_barriers,floor,key)):
+            return True
         height=self.nodes[key].height
         tolerance=self.map.settings.surface_noise_tolerance+1e-7
         return any(band==floor and abs(height-z)<=tolerance
@@ -662,6 +742,13 @@ class FrontierIndex:
         # can change while the robot is travelling to the observation.
         remaining=self.remaining_floor_members(attempt.members)
         if not remaining:return 'progress' if sufficient_progress else 'cluster_changed'
+        if count_failure and failure_reason!='floor_known_barrier':
+            for key in remaining:self._watch_floor_failure(attempt.floor,key)
+        if attempt.bounded_review and attempt.review and failure_reason in (
+                'floor_observer_timeout','floor_route_timeout','floor_missing_connection'):
+            for key in remaining:
+                self.floor_review_timeouts.setdefault(key[1:3],set()).add((attempt.floor,self.nodes[key]))
+            return 'review_timed_out'
         if attempt.review:
             for key in remaining:
                 xy=key[1:3]
@@ -671,12 +758,19 @@ class FrontierIndex:
                 if not records:self.floor_failures.pop(xy,None)
         if sufficient_progress:return 'progress'
         failures=attempt.failures+1
-        exhausted=failures>=attempt.max_attempts
+        exhausted=failures>=attempt.max_attempts or failure_reason=='floor_known_barrier'
         for key in remaining:
             xy=key[1:3]
             record=(attempt.floor,self.nodes[key])
-            if exhausted:self.floor_blacklist.setdefault(xy,set()).add(record)
-            else:self.floor_failures.setdefault(xy,{})[record]=(failures,completed_view)
+            if failure_reason=='floor_known_barrier':
+                self.floor_known_barriers.setdefault(xy,set()).add(record)
+                continue
+            if exhausted:
+                self.floor_blacklist.setdefault(xy,set()).add(record)
+                if attempt.failed_small:self.floor_failed_small.setdefault(xy,set()).add(record)
+            else:
+                self.floor_failures.setdefault(xy,{})[record]=(failures,completed_view,failure_reason,
+                                                              attempt.tested_poses,attempt.resume_poses)
         if not exhausted:
             return 'first_no_progress' if failures==1 else 'deferred'
         if failure_reason=='floor_disconnected':
@@ -698,6 +792,17 @@ class FrontierIndex:
         return [((s.origin_x+x*s.resolution,s.origin_y+y*s.resolution,self.nodes[rep].height),aliases)
                 for (x,y),column in groups.items() for rep,aliases in column]
 
+    def _small_floor_members(self, members, belongs, limit):
+        """Classify the complete floor cluster, stopping once it is large enough."""
+        floor_members, columns = set(), set()
+        for key in members:
+            if belongs(key):
+                floor_members.add(key)
+                columns.add(key[1:3])
+                if len(columns)>limit:
+                    return set()
+        return floor_members if len(self.physical_targets(floor_members))<=limit else set()
+
     def floor_observation_counts(self, covered):
         # One XY can have duplicate cuts and independent physical surfaces.
         columns={}
@@ -711,63 +816,104 @@ class FrontierIndex:
             else:
                 groups.append(dict(height=boundary.height,boundaries=[boundary],matches=set(matches)))
         resolved=0
-        for groups in columns.values():
+        evidence=self.map.surface_observation
+        for xy,groups in columns.items():
             # A real return can resolve only one physical task in this column.
             candidates=sorted((abs(height-g['height']),i,sid) for i,g in enumerate(groups)
+                              if all(not self.map.ground_pending(xy,b.layer) for b in g['boundaries'])
                               for sid,height in g['matches'])
-            matched_groups=set();matched_surfaces=set()
+            resolved_groups={i for i,g in enumerate(groups) if any(
+                evidence.frontier_settled(xy,b.height,[(x,y,sid) for x,y,_,sid in b.sources],layer=b.layer)
+                for b in g['boundaries'])}
+            matched_surfaces=set()
             for _,i,sid in candidates:
-                if i not in matched_groups and sid not in matched_surfaces:
-                    matched_groups.add(i);matched_surfaces.add(sid)
-            resolved+=len(matched_groups)
+                if i not in resolved_groups and sid not in matched_surfaces:
+                    resolved_groups.add(i);matched_surfaces.add(sid)
+            resolved+=len(resolved_groups)
         return sum(map(len,columns.values())),resolved
 
     def physical_tasks(self):
-        """Coalesce tasks for selection while keeping their original cut members."""
-        if self._physical_task_cache is not None:
-            return self._physical_task_cache
-        parent={cid:cid for cid in self.clusters}
-
-        def root(cid):
-            while parent[cid]!=cid:
-                parent[cid]=parent[parent[cid]]
-                cid=parent[cid]
-            return cid
-
-        for keys in self.by_column.values():
-            if len(keys)<2:
-                continue
-            for _,aliases in self.physical_targets(keys):
-                representative=root(self.membership[aliases[0]])
-                for key in aliases[1:]:
-                    other=root(self.membership[key])
-                    first,last=sorted((representative,other))
-                    parent[last]=first
-                    representative=first
-        grouped={}
-        for cid in sorted(parent):
-            grouped.setdefault(root(cid),[]).append(cid)
-
-        tasks={}
-        merged={}
-        tiles={}
-        for cid,aliases in grouped.items():
-            if len(aliases)==1:
-                task=self.clusters[cid]
-            else:
-                signature=tuple((a,self.clusters[a]['revision']) for a in aliases)
-                task=self._merged_tasks.get(signature)
-                if task is None:
-                    members=set().union(*(self.clusters[a]['members'] for a in aliases))
-                    task=FrontierCluster(self, **self.describe_task(cid,members))
-                merged[signature]=task
-            tasks[cid]=task
-            for tile in task['tiles']:
-                tiles.setdefault(tile,set()).add(cid)
-        owners={alias:cid for cid,aliases in grouped.items() for alias in aliases}
-        self._merged_tasks=merged
-        self._physical_task_cache=(tasks, tiles, owners, grouped)
+        """Committed task/spatial indexes; queries never rebuild their contents."""
         return self._physical_task_cache
+
+    def _update_physical_tasks(self, changed_clusters, columns):
+        began=time.monotonic()
+        tasks,spatial,owners,aliases=self._physical_task_cache
+        columns=set(columns)
+        touched=set(changed_clusters)
+        for xy in columns:
+            for first,last in self._physical_column_edges.get(xy,()):
+                touched.update((first,last))
+            touched.update(self.membership[key] for key in self.by_column.get(xy,()))
+
+        for xy in columns:
+            previous=self._physical_column_edges.pop(xy,set())
+            current=set()
+            for _,members in self.physical_targets(self.by_column.get(xy,())):
+                ids=sorted({self.membership[key] for key in members})
+                current.update((ids[0],other) for other in ids[1:])
+            for first,last in previous-current:
+                for source,target in ((first,last),(last,first)):
+                    neighbours=self._physical_contacts[source]
+                    neighbours[target]-=1
+                    if not neighbours[target]:
+                        del neighbours[target]
+                    if not neighbours:
+                        del self._physical_contacts[source]
+            for first,last in current-previous:
+                self._physical_contacts.setdefault(first,Counter())[last]+=1
+                self._physical_contacts.setdefault(last,Counter())[first]+=1
+            if current:
+                self._physical_column_edges[xy]=current
+
+        # Include whole old tasks when a changed column joins or separates
+        # their aliases. Everything else retains its cached task and views.
+        affected=set(touched)
+        pending=deque(touched)
+        visited_tasks=set()
+        while pending:
+            cid=pending.popleft()
+            neighbours=set(self._physical_contacts.get(cid,()))
+            task_id=owners.get(cid)
+            if task_id is not None and task_id not in visited_tasks:
+                visited_tasks.add(task_id)
+                neighbours.update(aliases[task_id])
+            new=neighbours-affected
+            affected.update(new)
+            pending.extend(new)
+        for task_id in visited_tasks:
+            task=tasks.pop(task_id)
+            for tile in task['tiles']:
+                spatial[tile].remove(task_id)
+                if not spatial[tile]:
+                    del spatial[tile]
+            for cid in aliases.pop(task_id):
+                del owners[cid]
+
+        remaining={cid for cid in affected if cid in self.clusters}
+        while remaining:
+            first=min(remaining)
+            remaining.remove(first)
+            group={first}
+            pending=deque([first])
+            while pending:
+                for other in self._physical_contacts.get(pending.popleft(),{}).keys() & remaining:
+                    remaining.remove(other)
+                    group.add(other)
+                    pending.append(other)
+            if len(group)==1:
+                task=self.clusters[first]
+            else:
+                members=set().union(*(self.clusters[cid]['members'] for cid in group))
+                task=FrontierCluster(self,**self.describe_task(first,members))
+            tasks[first]=task
+            aliases[first]=group
+            owners.update((cid,first) for cid in group)
+            for tile in task['tiles']:
+                spatial.setdefault(tile,set()).add(first)
+        self.last_work['physical_columns_checked']=len(columns)
+        self.last_work['physical_clusters_updated']=len(affected)
+        self.last_work['physical_tasks_ms']=1000*(time.monotonic()-began)
 
     def _cluster_fragments(self, cid):
         owner=self.components.by_namespace[cid % SLICE_ID_STRIDE]
@@ -785,12 +931,19 @@ class FrontierIndex:
 
     def query(self, base=None, minimum_distance=0., window_size=None, query_budget=0., continuation=None,
               floor=None, stairs=(), evaluate_observers=True, fast=False, prune_disconnected=False,
-              floor_selection=None, attempt_scope=None, max_attempts=2, ascent_limits=None):
+              floor_selection=None, attempt_scope=None, max_attempts=2, ascent_limits=None,
+              ordinary_floor=True, review_remaining=None):
         began=time.monotonic()
         s=self.map.settings
         output=[]
-        managed_cross=attempt_scope is not None and continuation is not None
+        managed_cross=attempt_scope is not None
+        seek_ascent=managed_cross and continuation is None
         bounded_floor=evaluate_observers and (managed_cross or (floor is not None and continuation is None))
+        ordinary_floor=ordinary_floor and bounded_floor and not managed_cross
+        review_enabled=not ordinary_floor or s.floor_global_review_enabled
+        small_limit=s.floor_failed_small_cluster_max_cells if ordinary_floor else 0
+        bounded_review=ordinary_floor and review_enabled and review_remaining is not None
+        connectivity_deadline=began+.08
         task_scope=attempt_scope if managed_cross else floor
         floor_selection=floor_selection if bounded_floor else None
         prune_disconnected=prune_disconnected and bounded_floor and not managed_cross and base is not None
@@ -819,7 +972,12 @@ class FrontierIndex:
         queues=[[] for _ in range(max_attempts)]
         deferred_clusters=set()
         deferred_members=set()
+        small_clusters=0
+        small_members=set()
         disconnected_members=set()
+        review_deferred=set()
+        missing_connection=set()
+        connection_reviews=set()
         def on_floor(z):
             return abs(z-floor[0]) <= floor[1]
 
@@ -837,7 +995,7 @@ class FrontierIndex:
 
             def belongs(key):
                 node=self.nodes[key]
-                if not any(on_floor(src[2]) for src in node.sources):
+                if not on_floor(node.height) or not any(on_floor(src[2]) for src in node.sources):
                     return False
                 x,y=key[1:3]
                 for flight in indices.get((x,y),()):
@@ -849,7 +1007,17 @@ class FrontierIndex:
                         return False
                 return True
             floor_members=belongs
-        if managed_cross:
+        if seek_ascent:
+            max_step,min_rise=ascent_limits
+
+            def ascending_member(key):
+                node=self.nodes[key]
+                low,high=base[2]+min_rise,base[2]+max_step+1e-7
+                return (low-s.surface_noise_tolerance<=node.height<=high and
+                        any(low<=source[2]<=high for source in node.sources))
+
+            floor_members=ascending_member
+        elif managed_cross:
             level_filter=floor_members
             yaw,min_height,slack=continuation
             direction=(math.cos(yaw),math.sin(yaw))
@@ -898,13 +1066,54 @@ class FrontierIndex:
                     deferred_members.update(blocked)
                     deferred_clusters.add(cid)
                     members=members-blocked
+                    if bounded_review:
+                        failed_small={key for key in blocked if self._floor_records(self.floor_failed_small,task_scope,key)}
+                        if failed_small:
+                            small_clusters+=1
+                            small_members.update(failed_small)
+                            deferred_members.difference_update(failed_small)
                 tasks={}
                 for key in members:
                     failures=self._failure_count(task_scope,key)
-                    if failures<max_attempts:tasks.setdefault(failures,set()).add(key)
+                    if failures<max_attempts:
+                        tasks.setdefault(failures,set()).add(key)
+                failed_members={key for failures,keys in tasks.items() if failures for key in keys}
+                if failed_members:
+                    if bounded_review:
+                        timed_out={key for key in failed_members if
+                                   self._floor_records(self.floor_review_timeouts,task_scope,key)}
+                        needs_connection=any(self.floor_failures[key[1:3]][record][2]=='floor_missing_connection'
+                                             for key in failed_members
+                                             for record in self._floor_records(self.floor_failures,task_scope,key))
+                        if needs_connection:connection_reviews.add(cid)
+                        waiting=needs_connection and (component is None or time.monotonic()>=connectivity_deadline or
+                                 self.observer_cache.disconnected(failed_members,connectivity,component,floor))
+                        if waiting:
+                            missing_connection.add(cid)
+                        if timed_out or (review_remaining<=0. and not waiting):
+                            review_deferred.add(cid)
+                        if waiting:
+                            timed_out=failed_members
+                        if timed_out or review_remaining<=0.:
+                            deferred_members.update(timed_out if review_remaining>0. else failed_members)
+                            for count in tasks:
+                                if count:
+                                    tasks[count]-=timed_out
+                            if review_remaining<=0.:
+                                tasks={0:tasks[0]} if 0 in tasks else {}
+                    small=not bounded_review and small_limit and self._small_floor_members(cluster['members'],floor_members,small_limit)
+                    if small:
+                        small_clusters+=1
+                        small_members.update(failed_members)
+                    elif not review_enabled:
+                        deferred_members.update(failed_members)
+                        deferred_clusters.add(cid)
+                    if small or not review_enabled:
+                        tasks={0:tasks[0]} if 0 in tasks else {}
             else:
                 tasks={0:members}
             for failures,task in tasks.items():
+                if not task:continue
                 physical=self.physical_targets(task)
                 if base is None:
                     rank=0.
@@ -914,7 +1123,7 @@ class FrontierIndex:
                     if bounded_floor and not managed_cross:
                         from .pct_frontier_observers import observation_effort
                         rank=observation_effort(float(np.linalg.norm(xyz[:,:2]-base[:2],axis=1).min()),len(xyz))
-                priority=0
+                priority=int(failures>0 and cid in connection_reviews)
                 if managed_cross:
                     if floor is None:
                         priority=int(not any(self.nodes[k].height-base[2]>=min_rise for k in task))
@@ -927,9 +1136,11 @@ class FrontierIndex:
         failures=next((i for i in range(allowed_rounds) if queues[i]),0)
         prepared=queues[failures]
         reviewing=failures>0
+        directional=ordinary_floor and floor_selection is not None and (
+            bounded_review if reviewing else s.floor_four_direction_search)
         entries={}
-        # Keep at most one unfinished flat observer batch across ticks. Match
-        # its physical members even if the incremental component was rekeyed.
+        # Match suspended searches to current physical members, including
+        # components rekeyed by incremental map updates.
         resume=None
         resumed_ms=0.
         resumed_slices=0
@@ -940,13 +1151,25 @@ class FrontierIndex:
                 resume=next((cid for _,cid,members in prepared if remaining & members),None)
             self.floor_pending=None
         search_scope=(task_scope,window_size is None,failures, floor is not None)
+        rotate_local=floor_selection is not None and window is not None and not managed_cross and not reviewing
         if floor_selection is not None:
-            search=self.floor_view_search
-            if search is not None and search.scope==search_scope:
+            active_searches={}
+            for search in sorted(self.floor_view_searches.values(),key=lambda s:-s.elapsed):
+                if search.scope!=search_scope:continue
                 remaining=self.remaining_floor_members(search.members)
-                resume=next((cid for _,cid,members in prepared if remaining & members),None)
-            if resume is None:self.floor_view_search=None
-        self.floor_query=(task_scope,floor_members,fast,failures,max_attempts) if bounded_floor else None
+                if not remaining:continue
+                overlap,cid=max(((len(remaining & members),cid) for _,cid,members in prepared),default=(0,None))
+                if overlap and cid not in active_searches:
+                    search.cluster=cid
+                    active_searches[cid]=search
+            self.floor_view_searches=active_searches
+            route_retries=[cid for cid,search in active_searches.items()
+                           if search.direction_center is not None and search.rejected]
+            if route_retries:
+                resume=max(route_retries,key=lambda cid:active_searches[cid].last_slice)
+            elif not rotate_local and active_searches:
+                resume=max(active_searches,key=lambda cid:active_searches[cid].last_slice)
+        self.floor_query=(task_scope,floor_members,fast,failures,max_attempts,bounded_review) if bounded_floor else None
         self.floor_query_members={cid:members for _,cid,members in prepared} if bounded_floor else {}
         scoped_cells=0
         for _,cid,members in prepared:
@@ -969,25 +1192,37 @@ class FrontierIndex:
             output[-1]['observers_complete']=False
             entries[cid]=output[-1]
         scope=(None if base is None else tuple(np.rint(np.asarray(base)/self.map.settings.resolution).astype(int)),
-               None if window_size is None else tuple(window_size),minimum_distance,continuation,floor,reviewing,fast)
+               None if window_size is None else tuple(window_size),minimum_distance,continuation,task_scope,reviewing,fast)
         if evaluate_observers and (self.query_scope!=scope or not query_budget):
             self.query_visited.clear();self.query_scope=scope
         slice_budget=floor_selection[-1] if floor_selection is not None and reviewing else query_budget
+        if bounded_review and reviewing:
+            slice_budget=min(.20,slice_budget) if slice_budget else .20
         preparation_ms=1000*(time.monotonic()-began)
         deadline=(time.monotonic() if bounded_floor else began)+slice_budget if slice_budget else None
+        if bounded_review and reviewing:
+            deadline=min(deadline if deadline is not None else math.inf,began+review_remaining)
         no_view_clusters=[]
         timed_out_clusters=[]
         skipped=set()
         checked=0;geometry_ms=visibility_ms=0.;phase_ms={}
         ordered=sorted(prepared,key=lambda row:(row[1]!=resume,row[0],row[1]))
+        if rotate_local:
+            def last_slice(row):
+                search=self.floor_view_searches.get(row[1])
+                return search.last_slice if search is not None else 0
+
+            ordered[:4]=sorted(ordered[:4],key=lambda row:(row[1]!=resume,last_slice(row)))
         for _,cid,members in (ordered if evaluate_observers else ()):
             revision=clusters[cid]['revision']
             prior=self.query_visited.get(cid)
             if not bounded_floor and query_budget and prior is not None and prior[:2]==(revision,members):
                 continue
             self.query_visited.pop(cid,None)
-            if deadline is not None and checked and (checked>=4 or time.monotonic()>=deadline):break
+            if deadline is not None and (checked or (bounded_review and reviewing)) and (
+                    checked>=4 or time.monotonic()>=deadline):break
             cluster=clusters[cid]
+            observer_started=time.monotonic() if directional else None
             if prune_disconnected and component is not None:
                 start_geometry=time.monotonic()
                 disconnected=self.observer_cache.disconnected
@@ -1002,7 +1237,14 @@ class FrontierIndex:
                            self._failure_count(task_scope,key)==failures}
                     proven=whole==members or disconnected(whole,connectivity,component,floor)
                     if proven:
-                        entries[cid].update(floor_failure='floor_disconnected',
+                        reason='floor_disconnected'
+                        if bounded_review and time.monotonic()<connectivity_deadline:
+                            reason='floor_known_barrier' if connectivity.known_barrier(
+                                self.map.indices(base),self.observer_cache.station_cells(whole,floor),
+                                min(time.monotonic()+.04,connectivity_deadline)) else 'floor_missing_connection'
+                        elif bounded_review:
+                            reason='floor_missing_connection'
+                        entries[cid].update(floor_failure=reason,
                             observers_evaluated=True,observers_complete=True)
                         no_view_clusters.append(cid)
                     elif window is not None:
@@ -1022,7 +1264,7 @@ class FrontierIndex:
             retry=self.retry_completion(cid,task_scope,members) if reviewing else None
             # A failed view search has no coverage record, but its old stand
             # position can still be avoided when choosing the review pose.
-            if retry is not None and len(retry)==3 and retry not in completed:
+            if retry is not None and len(retry)==3 and retry not in completed and not (bounded_review and reviewing):
                 completed.append(retry)
             observer_args=(members,base,minimum_distance,completed,component,window,deadline)
             observer_options={}
@@ -1032,17 +1274,32 @@ class FrontierIndex:
             observer_options['physical']=physical_entries[cid,failures]
             if prune_disconnected:observer_options['connectivity']=connectivity
             if fast:observer_options['minimum_gain']=min(s.fast_min_visible_cells,entries[cid]['cells'])
-            observer_started=time.monotonic()
+            if observer_started is None:
+                observer_started=time.monotonic()
             if floor_selection is not None:
-                if cid!=resume or self.floor_view_search is None:
-                    self.floor_view_search=FloorViewSearch(cid,search_scope,{})
-                search=self.floor_view_search
+                search=self.floor_view_searches.get(cid)
+                if search is None:
+                    search=self.floor_view_searches[cid]=FloorViewSearch(cid,search_scope,{})
                 search.cluster=cid
                 search.members={key:self.nodes[key] for key in members}
+                self.floor_view_slice+=1
+                search.last_slice=self.floor_view_slice
                 admission,arrival_geometry,tolerance,first_budget,review_budget,_=floor_selection
                 total_budget=review_budget if reviewing else first_budget
+                if directional:
+                    total_budget=min(1.,review_budget) if reviewing else s.floor_direction_search_timeout
+                    if search.direction_center is None:
+                        search.direction_center=tuple(cluster['frontier'][:2])
+                        if reviewing:
+                            records=[self.floor_failures[key[1:3]][record] for key in members
+                                     for record in self._floor_records(self.floor_failures,task_scope,key)]
+                            search.rejected.update(p for record in records for p in record[3])
+                            search.resume_poses=tuple(dict.fromkeys(p for record in records for p in record[4]))
+                            search.pose_limit=2
                 remaining=max(0.,total_budget-search.elapsed)
                 limit=observer_started+remaining
+                if directional:
+                    observer_options.update(direction_search=search,direction_deadline=limit)
                 if deadline is not None:limit=min(deadline,limit)
                 observer_args=observer_args[:6]+(limit,)
                 observer_options.update(admission=(admission,arrival_geometry,tolerance,remaining>0.),
@@ -1050,7 +1307,7 @@ class FrontierIndex:
             observations=self._observers(*observer_args,**observer_options)
             # Prefer a new view. Allow one more look if the first failed
             # sweep's visit mask removes the last available option.
-            if not observations and not self.observer_cache.pending and retry in completed:
+            if not observations and not self.observer_cache.pending and retry in completed and not (bounded_review and reviewing):
                 retry_args=observer_args[:3]+([p for p in completed if p!=retry],)+observer_args[4:]
                 observations=self._observers(*retry_args,**observer_options)
             checked+=1
@@ -1064,6 +1321,8 @@ class FrontierIndex:
             gain=max((v['gain'] for v in views),default=0)*self.map.settings.resolution
             entries[cid].update(observations=observations,gain=gain,observers_evaluated=True,
                                 observers_complete=complete,observation_yaws=[v['yaw'] for v in views])
+            if directional:
+                entries[cid]['direction_limited']=True
             if bounded_floor:
                 elapsed_ms=1000*(time.monotonic()-observer_started)+(resumed_ms if cid==resume else 0.)
                 if floor_selection is not None:
@@ -1071,7 +1330,10 @@ class FrontierIndex:
                     entries[cid]['observer_ms']=1000*search.elapsed
                     search.blockers=self.map.merge_unknown_blockers(
                         search.blockers+self.observer_cache.unknown_blockers,base)
-                    if observations or (not complete and search.elapsed<total_budget):
+                    if observations:
+                        break
+                    if not complete and search.elapsed<total_budget:
+                        if rotate_local:continue
                         break
                     entries[cid]['floor_failure']=(
                         'floor_route_timeout' if search.route_timeout else
@@ -1080,7 +1342,7 @@ class FrontierIndex:
                     entries[cid]['unknown_blockers']=search.blockers
                     if search.first_rejected is not None:
                         entries[cid]['first_rejected']=list(search.first_rejected)
-                    self.clear_floor_view_search(cid)
+                    if not bounded_review or reviewing:self.clear_floor_view_search(cid)
                     self.observer_cache.discard_search(members)
                     no_view_clusters.append(cid)
                     if search.blockers:break
@@ -1101,11 +1363,12 @@ class FrontierIndex:
                 self.query_visited[cid]=(revision,members,not observations)
         if bounded_floor:
             pending=(self.floor_pending is not None or
-                     (floor_selection is not None and self.floor_view_search is not None) or checked<len(prepared))
+                     (floor_selection is not None and bool(self.floor_view_searches)) or checked<len(prepared))
         else:
             pending=bool(evaluate_observers and query_budget and any(
                 self.query_visited.get(cid,(None,None))[:2]!=(clusters[cid]['revision'],members)
                 for _,cid,members in prepared))
+        small_count=len(self.physical_targets(small_members))
         deferred_count=len(self.physical_targets(deferred_members))
         disconnected_count=len(self.physical_targets(disconnected_members))
         output=[row for row in output if row['id'] not in skipped]
@@ -1114,11 +1377,13 @@ class FrontierIndex:
             scope='local' if window is not None else 'global',
             window=list(map(float,window_size)) if window is not None else [],
             window_center=list(map(float,base)) if window is not None else [],
-            deferred_floor_frontier_cells=deferred_count+disconnected_count,
+            deferred_floor_frontier_cells=deferred_count+disconnected_count+small_count,
             disconnected_floor_frontier_cells=disconnected_count,
+            small_skipped_clusters=small_clusters,small_skipped_cells=small_count,
             fast_floor=fast,fast_skipped_clusters=len(deferred_clusters) if fast else 0,
             fast_skipped_cells=deferred_count if fast else 0,
             pending_review_clusters=len(reviews),reviewing=reviewing,no_view_clusters=no_view_clusters,
+            deferred_review_clusters=len(review_deferred),missing_connection_clusters=len(missing_connection),
             timed_out_clusters=timed_out_clusters,scoped_frontier_cells=scoped_cells,
             query_pending=pending,query_checked_clusters=checked,observer_prepare_ms=preparation_ms,
             observer_geometry_ms=geometry_ms,observer_visibility_ms=visibility_ms,

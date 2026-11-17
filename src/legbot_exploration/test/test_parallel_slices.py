@@ -98,6 +98,24 @@ class ParallelSliceTest(unittest.TestCase):
                       selected_surfaces(previous,k)!=selected_surfaces(current,k)}
             self.assertTrue(expected<=selected,(expected-selected,previous,current))
 
+    def test_changed_intervals_include_support_hidden_below_an_underside(self):
+        from legbot_exploration.map_evidence import SurfaceColumn,SurfaceRecord
+        rng=np.random.default_rng(36);layers=tuple(range(-5,35))
+        for _ in range(100):
+            previous=tuple(sorted((round(float(z),3),i+1,True,int(rng.choice((-1,0,1))))
+                                  for i,z in enumerate(rng.uniform(-.3,3.,14))))
+            current=list(previous)
+            del current[int(rng.integers(len(current)))]
+            current.append((round(float(rng.uniform(-.3,3.)),3),100,True,1))
+            current=tuple(sorted(current))
+            selected=set(changed_slice_indices(previous,current,layers,layers,0.,.1))
+            def value(records,k):
+                surfaces=[SurfaceRecord(i,h,1,h,h,mature_at=1,orientation=o) for h,i,_,o in records]
+                g,c=SurfaceColumn().at(k*.1,(tuple(r.height for r in surfaces),surfaces))
+                return tuple(None if r is None else r.id for r in (g,c))
+            expected={k for k in layers if value(previous,k)!=value(current,k)}
+            self.assertTrue(expected<=selected,(expected-selected,previous,current))
+
     def test_new_neighbor_cuts_and_maturity_keep_full_recompute_geometry(self):
         settings=MapSettings(block_size=8,slice_dh=.1,maturity_min_points=3)
         reference=FixedLayerMap(settings,update_workers=1,native_updates=False)

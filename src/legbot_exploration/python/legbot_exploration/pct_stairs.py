@@ -1,6 +1,7 @@
 """Recognize ascending runs of real treads from the committed PCT surfaces."""
-from collections import deque
+from collections import defaultdict, deque, OrderedDict
 from dataclasses import dataclass
+from itertools import islice
 import math
 import time
 
@@ -71,10 +72,19 @@ class StairFlight:
     direction: tuple
     treads: tuple
     half_width: int
+    usable_count: int | None = None
 
     @property
     def confirmed(self):
-        return len(self.treads) >= 3
+        return len(self.usable_treads) >= 2
+
+    @property
+    def usable_treads(self):
+        return self.treads if self.usable_count is None else self.treads[:self.usable_count]
+
+    @property
+    def pending_treads(self):
+        return () if self.usable_count is None else self.treads[self.usable_count:]
 
     def owns_boundary(self, x, y, sources, on_floor):
         """Only hand off the unknown boundary directly ahead of the entrance."""
@@ -109,6 +119,131 @@ class StairFlight:
                 return True
         return False
 
+class StairCandidateCache:
+    """Incremental geometric candidates, exact column dependencies and pending admission."""
+    def __init__(self, settings):
+        self.settings=settings
+        self.floor=None
+        self.tiles={}
+        self.owners=defaultdict(set)
+        self.dependents=defaultdict(set)
+        self.pending=OrderedDict()
+        self.qualified={}
+        self.groups={}
+        self.group_bins=defaultdict(set)
+        self.membership={}
+        self.dirty_groups=OrderedDict()
+        self.candidates={}
+        self.confirmed={}
+        self.changes=OrderedDict()
+        self.next_group=0
+
+    def set_floor(self, floor):
+        if self.floor!=floor:
+            self.__init__(self.settings)
+            self.floor=floor
+
+    def _bin(self, flight):
+        size=max(1,math.ceil(1./self.settings.resolution))
+        x,y,_=flight.treads[0]
+        return x//size,y//size
+
+    def _same_entrance(self, first, second):
+        a,b=first.treads[0],second.treads[0]
+        dx,dy=first.direction;ux,uy=second.direction
+        return (math.dist(a[:2],b[:2])*self.settings.resolution<=1. and
+                abs(a[2]-b[2])<=self.settings.surface_noise_tolerance and
+                (dx*ux+dy*uy)/math.hypot(dx,dy)/math.hypot(ux,uy)>=.70)
+
+    def _queue(self, flight):
+        old=self.qualified.pop(flight,None)
+        self.pending.setdefault(flight,None)
+        group=self.membership[flight]
+        if old is not None:self.dirty_groups.setdefault(group,None)
+        if old is not None and self.candidates.get(group)==old:
+            self.candidates.pop(group,None)
+            self.confirmed.pop(group,None)
+            self.changes[group]=None
+
+    def invalidate(self, columns):
+        affected=set()
+        for xy in columns:affected.update(self.dependents.get(tuple(xy),()))
+        for flight in affected:self._queue(flight)
+
+    def replace(self, owner, flights):
+        current=set(flights)
+        previous=self.tiles.get(owner,set())
+        for flight in previous-current:
+            self.owners[flight].discard(owner)
+            if self.owners[flight]:continue
+            del self.owners[flight]
+            group=self.membership.pop(flight)
+            self.groups[group][1].discard(flight)
+            self.pending.pop(flight,None)
+            self.qualified.pop(flight,None)
+            for x,y,_ in (flight.entry,*flight.treads):
+                self.dependents[x,y].discard(flight)
+                if not self.dependents[x,y]:del self.dependents[x,y]
+            self.candidates.pop(group,None)
+            self.confirmed.pop(group,None)
+            self.changes[group]=None
+            self.dirty_groups.setdefault(group,None)
+        for flight in current-previous:
+            self.owners[flight].add(owner)
+            if flight in self.membership:continue
+            bx,by=self._bin(flight)
+            group=next((gid for dx in (-1,0,1) for dy in (-1,0,1)
+                        for gid in self.group_bins.get((bx+dx,by+dy),())
+                        if self._same_entrance(flight,self.groups[gid][0])),None)
+            if group is None:
+                self.next_group+=1;group=self.next_group
+                self.groups[group]=(flight,set())
+                self.group_bins[bx,by].add(group)
+            self.groups[group][1].add(flight)
+            self.membership[flight]=group
+            for x,y,_ in (flight.entry,*flight.treads):self.dependents[x,y].add(flight)
+            self._queue(flight)
+        if current:self.tiles[owner]=current
+        else:self.tiles.pop(owner,None)
+
+    def process(self, qualify, ground, deadline, publish):
+        checked=published=0
+        def priority(flight):
+            x,y,_=flight.entry
+            return math.hypot(x*self.settings.resolution+self.settings.origin_x-ground[0],
+                              y*self.settings.resolution+self.settings.origin_y-ground[1])
+
+        while (self.pending or self.dirty_groups) and time.monotonic()+1e-9<deadline:
+            if self.dirty_groups:
+                group,_=self.dirty_groups.popitem(last=False)
+                anchor,members=self.groups[group]
+                best=max((self.qualified[f] for f in members if f in self.qualified),
+                         key=lambda f:(len(f.usable_treads),len(f.treads),-priority(f)),default=None)
+                if best is None:
+                    self.candidates.pop(group,None);self.confirmed.pop(group,None)
+                else:
+                    self.candidates[group]=best
+                    if best.confirmed:self.confirmed[group]=best
+                    else:self.confirmed.pop(group,None)
+                publish(group,best)
+                self.changes.pop(group,None)
+                published+=1
+                if not members:
+                    self.group_bins[self._bin(anchor)].discard(group)
+                    del self.groups[group]
+                continue
+            flight=min(islice(self.pending,64),key=priority)
+            del self.pending[flight]
+            result=qualify(flight,self.floor)
+            checked+=1
+            if result is not None:self.qualified[flight]=result
+            self.dirty_groups.setdefault(self.membership[flight],None)
+        return checked,published
+
+    def needs_work(self):
+        return bool(self.pending or self.dirty_groups)
+
+
 class StairIndex:
     """Cache entrance candidates by tile and invalidate the columns each search read."""
     def __init__(self, include_unclassified=False):
@@ -121,23 +256,49 @@ class StairIndex:
         self.readers = {}
         self.dirty = set()
         self._unseeded = deque()
+        self._unseeded_tiles=deque()
+        self.column_tiles=defaultdict(set)
         self.revision = 0
+        self._building={}
+        self._building_reads=set()
+        self._building_dependencies={}
+        self._building_users=defaultdict(set)
+        self._building_tile=None
+        self._published_seeds={}
 
     @property
     def pending(self):
-        return bool(self._unseeded or self.dirty)
+        return bool(self._unseeded or self._unseeded_tiles or self.dirty)
+
+    def cached_flights(self):
+        return list(dict.fromkeys(f for flights in self.flights.values() for f in flights))
 
     def update(self, mapping, columns):
+        s=mapping.settings
+        for x,y in columns:self.column_tiles[x//s.block_size,y//s.block_size].add((x,y))
         if self.floor is None:
             return
         floor = self.floor[0]
-        s = mapping.settings
         _, max_rise = tread_rise_bounds(s)
         for xy in columns:
-            heights = tuple(r.height for r in mapping.columns.get(xy, {}).values()
-                            if r.orientation == 1 or (self.include_unclassified and r.orientation == 0))
+            heights = {h for _,h,_ in mapping.support_samples(*xy)}
+            if self.include_unclassified:
+                # Keep pending geometric hints alongside the traversable index.
+                # This lets verified tread runs win before inspecting raw lips.
+                heights.update(r.height for r in mapping.columns.get(xy, {}).values()
+                               if r.orientation in (0,1))
+            heights=tuple(sorted(heights))
             if self.surfaces.get(xy, ()) == heights:
                 continue
+            affected=set(self._building_users.get(xy,()))
+            if (xy[0]//s.block_size,xy[1]//s.block_size)==self._building_tile:
+                affected.update((xy,direction) for direction in DIRECTIONS)
+            for key in affected:
+                self._building.pop(key,None)
+                for dependency in self._building_dependencies.pop(key,()):
+                    self._building_users[dependency].discard(key)
+                    if not self._building_users[dependency]:
+                        del self._building_users[dependency]
             if heights:
                 self.surfaces[xy] = heights
             else:
@@ -152,7 +313,7 @@ class StairIndex:
                 del self.seeds[tile][xy]
                 self.dirty.add(tile)
 
-    def query(self, mapping, floor, tolerance, deadline=None, tile_limit=None, focus=None):
+    def advance(self, mapping, floor, tolerance, deadline=None, tile_limit=None, focus=None):
         def tile_order(tile):
             if focus is None:
                 return tile
@@ -163,60 +324,91 @@ class StairIndex:
             return math.hypot(dx,dy)+size*behind,tile
 
         if self.floor != (floor, tolerance):
+            column_tiles=self.column_tiles
             self.__init__(self.include_unclassified)
+            self.column_tiles=column_tiles
             self.floor = floor, tolerance
-            if deadline is None:
-                self.update(mapping, mapping.columns)
-            else:
-                if focus is None:
-                    self._unseeded=deque(mapping.columns)
-                else:
-                    size=mapping.settings.block_size
-                    tiles={}
-                    for x,y in mapping.columns:
-                        tiles.setdefault((x//size,y//size),[]).append((x,y))
-                    self._unseeded=deque(xy for tile in sorted(tiles,key=tile_order) for xy in tiles[tile])
-        while self._unseeded:
-            self.update(mapping,[self._unseeded.popleft() for _ in range(min(1024,len(self._unseeded)))])
+            if not column_tiles:
+                # A standalone diagnostic index may be created after fusion.
+                self.update(mapping,mapping.columns)
+            self._unseeded_tiles=deque(sorted(column_tiles,key=tile_order))
+        candidates=mapping.stair_candidates
+        candidates.set_floor((floor,tolerance))
+        while self._unseeded or self._unseeded_tiles:
+            if not self._unseeded:
+                self._unseeded.extend(self.column_tiles[self._unseeded_tiles.popleft()])
+            self.update(mapping,[self._unseeded.popleft() for _ in range(min(64,len(self._unseeded)))])
             if deadline is not None and time.monotonic()>=deadline:
                 break
         processed = 0
-        for tile in sorted(self.dirty,key=tile_order):
+        ordered=sorted(self.dirty,key=tile_order)
+        if self._building_tile in self.dirty:
+            ordered.remove(self._building_tile);ordered.insert(0,self._building_tile)
+        for tile in ordered:
             if ((tile_limit is not None and processed >= tile_limit) or
                 (deadline is not None and time.monotonic() >= deadline)):
                 break
-            self.dirty.remove(tile)
-            processed += 1
-            for xy in self.reads.pop(tile, ()):
-                self.readers[xy].remove(tile)
-                if not self.readers[xy]:
-                    del self.readers[xy]
+            if self._building_tile!=tile:
+                self._building_tile=tile
+                self._building={}
+                self._building_reads=set()
+                self._building_dependencies={}
+                self._building_users=defaultdict(set)
             seeds = self.seeds.get(tile)
             if not seeds:
                 self.seeds.pop(tile, None)
                 self.flights.pop(tile, None)
-                continue
-            reads = set()
+            old_seeds=self._published_seeds.setdefault(tile,set())
+            for xy in old_seeds-set(seeds or ()):
+                for direction in DIRECTIONS:
+                    candidates.replace((self.include_unclassified,tile,xy,direction),())
+                old_seeds.remove(xy)
+            reads = self._building_reads
+            key_reads=set()
 
             def heights(x, y):
                 xy = x, y
                 reads.add(xy)
+                key_reads.add(xy)
                 return self.surfaces.get(xy, ())
 
-            self.flights[tile] = _find_stairs(mapping.settings, floor, tolerance, seeds, heights)
+            for xy,levels in (seeds or {}).items():
+                for direction in DIRECTIONS:
+                    key=xy,direction
+                    if key in self._building:continue
+                    if deadline is not None and time.monotonic()>=deadline:return
+                    key_reads=set()
+                    self._building[key]=_find_stairs(mapping.settings,floor,tolerance,{xy:levels},heights,
+                                                    directions=(direction,))
+                    self._building_dependencies[key]=key_reads
+                    for dependency in key_reads:self._building_users[dependency].add(key)
+                    candidates.replace((self.include_unclassified,tile,xy,direction),self._building[key])
+                    old_seeds.add(xy)
+            for xy in self.reads.pop(tile, ()):
+                self.readers[xy].discard(tile)
+                if not self.readers[xy]:del self.readers[xy]
+            self.flights[tile]=[flight for batch in self._building.values() for flight in batch]
             self.reads[tile] = reads
             for xy in reads:
                 self.readers.setdefault(xy, set()).add(tile)
-        if processed:
+            self.dirty.remove(tile)
+            self._building_tile=None
+            self._building={};self._building_reads=set()
+            self._building_dependencies={}
+            self._building_users=defaultdict(set)
+            processed+=1
             self.revision += 1
-        return list(dict.fromkeys(f for flights in self.flights.values() for f in flights))
+
+    def query(self, mapping, floor, tolerance, deadline=None, tile_limit=None, focus=None):
+        self.advance(mapping,floor,tolerance,deadline,tile_limit,focus)
+        return self.cached_flights()
 
 
 def find_stairs(mapping, floor, floor_tolerance):
     return StairIndex().query(mapping, floor, floor_tolerance)
 
 
-def _find_stairs(s, floor, floor_tolerance, first_treads, heights):
+def _find_stairs(s, floor, floor_tolerance, first_treads, heights, directions=DIRECTIONS):
     tread_tolerance = min(.035, s.surface_noise_tolerance)
     _, max_rise = tread_rise_bounds(s)
     first_rise = s.surface_noise_tolerance-1e-7
@@ -228,7 +420,7 @@ def _find_stairs(s, floor, floor_tolerance, first_treads, heights):
 
     flights = []
     platforms = {}
-    for dx, dy in DIRECTIONS:
+    for dx, dy in directions:
         pitch = s.resolution*math.hypot(dx, dy)
         # Gaps are allowed only for recognizing geometry. The planner still
         # requires supported motion and never uses these gaps as free space.

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -31,6 +32,7 @@ class Node {
   double height = 0.0;
   double ele = 0;
   double cost = 0.0;
+  std::int64_t surface_id = -1;  // Legacy map entries have no surface metadata.
   int layer = 0;
   Eigen::Vector3i idx = Eigen::Vector3i(0, 0, 0);  // layer, row, col
   Node* parent = nullptr;
@@ -70,6 +72,9 @@ class Astar {
   using CellReader = std::function<std::array<double, 3>(int, int, int)>;
   void InitAccessor(double cost_threshold, int num_layers, int rows, int columns,
                     double resolution, double step_cost_weight, CellReader reader);
+  using SurfaceCellReader = std::function<std::tuple<double, double, double, std::int64_t>(int, int, int)>;
+  void InitSurfaceAccessor(double cost_threshold, int num_layers, int rows, int columns,
+                           double resolution, double step_cost_weight, SurfaceCellReader reader);
   std::size_t GetSearchNodeCount() const { return sparse_nodes_.size(); }
   void SetTimeLimit(double seconds);
   bool TimedOut() const { return timed_out_; }
@@ -100,6 +105,7 @@ class Astar {
   int DecideLayer(const Node* cur_node) const;
 
   std::int64_t GetHash(const Eigen::Vector3i& idx) const;
+  std::int64_t VisitKey(const Node* node) const;
   Node* NodeAt(int layer, int row, int column) const;
 
   std::vector<Eigen::Vector3i> GetNeighbors(Node* node) const;
@@ -132,7 +138,7 @@ class Astar {
   int xy_size_ = 0;
   double resolution_ = 0;
   MultiLayerGridMap grid_map_;
-  CellReader reader_;
+  SurfaceCellReader reader_;
   mutable std::unordered_map<std::int64_t, std::unique_ptr<Node>> sparse_nodes_;
   double cost_threshold_ = 35;
   double step_cost_weight_ = 1.0;

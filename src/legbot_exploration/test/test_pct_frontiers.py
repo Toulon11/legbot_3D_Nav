@@ -66,7 +66,8 @@ class PctFrontierTest(unittest.TestCase):
 
     def test_cache_is_sparse_and_follows_geometry_revision(self):
         a=OnlinePct.__new__(OnlinePct);a.version=1;a.geometry_revision=1;a.metadata={}
-        a.map=SimpleNamespace(settings=SimpleNamespace(step_max=.16,minimum_clearance=.5),dirty=set())
+        a.map=SimpleNamespace(settings=SimpleNamespace(step_max=.16,minimum_clearance=.5),
+                              dirty=set(),evidence_dirty=set())
         a.cfg=SimpleNamespace(trav=SimpleNamespace(step_max=.16,interval_min=.5))
         a.planner=fixture()
         first=a.frontiers(b'',1)

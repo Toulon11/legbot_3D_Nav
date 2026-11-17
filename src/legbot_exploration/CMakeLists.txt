@@ -88,7 +88,8 @@ if(BUILD_TESTING)
   target_include_directories(test_planning_pipeline PRIVATE cpp/include)
   target_compile_features(test_planning_pipeline PRIVATE cxx_std_17)
   target_compile_options(test_planning_pipeline PRIVATE -UNDEBUG)
-  add_test(NAME exploration_planning_pipeline COMMAND test_planning_pipeline)
+  add_test(NAME exploration_planning_pipeline COMMAND test_planning_pipeline
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../install/pct_planner/share/pct_planner)
   add_executable(test_pct_embedding test/test_pct_embedding.cpp)
   target_link_libraries(test_pct_embedding exploration_pct_backend)
   target_compile_options(test_pct_embedding PRIVATE -UNDEBUG)
@@ -99,6 +100,10 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_fixed_layer_map.py)
   add_test(NAME exploration_pct_adapter COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_online_pct.py)
+  add_test(NAME exploration_surface_observation COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_surface_observation.py)
+  set_tests_properties(exploration_surface_observation PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:$ENV{PYTHONPATH}")
   add_test(NAME exploration_pct_native_accessor COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_native_accessor.py)
   add_test(NAME exploration_pct_controller COMMAND ${Python3_EXECUTABLE}
@@ -113,6 +118,14 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --recovery)
   add_test(NAME exploration_pct_recovery_occupied COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --recovery-occupied)
+  add_test(NAME exploration_pct_startup_low_body COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --startup-low-body)
+  set_tests_properties(exploration_pct_startup_low_body PROPERTIES TIMEOUT 55 RUN_SERIAL TRUE
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}/../../.pct_runtime:$ENV{PYTHONPATH};AMENT_PREFIX_PATH=${CMAKE_CURRENT_SOURCE_DIR}/../../install/pct_planner:$ENV{AMENT_PREFIX_PATH}")
+  add_test(NAME exploration_pct_multilevel_support COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --multilevel-support)
+  set_tests_properties(exploration_pct_multilevel_support PROPERTIES TIMEOUT 40 RUN_SERIAL TRUE
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}/../../.pct_runtime:$ENV{PYTHONPATH};AMENT_PREFIX_PATH=${CMAKE_CURRENT_SOURCE_DIR}/../../install/pct_planner:$ENV{AMENT_PREFIX_PATH}")
   set_tests_properties(exploration_pct_recovery_occupied PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 45 RUN_SERIAL TRUE)
   add_test(NAME exploration_pct_local_global COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --local-global)
@@ -136,6 +149,12 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --stair-priority)
   add_test(NAME exploration_pct_local_stair_probe COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --local-stair-probe)
+  add_test(NAME exploration_pct_floor_ascent_handoff COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --floor-ascent-handoff)
+  add_test(NAME exploration_pct_floor_descent_arrival COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --floor-descent-arrival)
+  set_tests_properties(exploration_pct_floor_ascent_handoff exploration_pct_floor_descent_arrival PROPERTIES TIMEOUT 55 RUN_SERIAL TRUE
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}/../../.pct_runtime:$ENV{PYTHONPATH};AMENT_PREFIX_PATH=${CMAKE_CURRENT_SOURCE_DIR}/../../install/pct_planner:$ENV{AMENT_PREFIX_PATH}")
   add_test(NAME exploration_pct_stair_reverse COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --stair-reverse)
   add_test(NAME exploration_pct_stair_reverse_partial COMMAND ${Python3_EXECUTABLE}
@@ -154,6 +173,12 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --floor-blacklist)
   add_test(NAME exploration_pct_floor_no_observation COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --floor-no-observation)
+  add_test(NAME exploration_pct_ordinary_floor_trial COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --ordinary-floor-trial)
+  add_test(NAME exploration_pct_bounded_floor_review COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --bounded-floor-review)
+  set_tests_properties(exploration_pct_bounded_floor_review PROPERTIES TIMEOUT 45 RUN_SERIAL TRUE
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}/../../.pct_runtime:$ENV{PYTHONPATH};AMENT_PREFIX_PATH=${CMAKE_CURRENT_SOURCE_DIR}/../../install/pct_planner:$ENV{AMENT_PREFIX_PATH}")
   add_test(NAME exploration_pct_floor_disconnected COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_controller_ros.py $<TARGET_FILE:combined_exploration_cpp> --floor-disconnected)
   add_test(NAME exploration_pct_floor_blind_observers COMMAND ${Python3_EXECUTABLE}
@@ -180,6 +205,10 @@ if(BUILD_TESTING)
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:$ENV{PYTHONPATH}")
   add_test(NAME exploration_pct_frontier_index COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_pct_frontier_index.py)
+  add_test(NAME exploration_frontier_component_updates COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_frontier_component_updates.py)
+  set_tests_properties(exploration_frontier_component_updates PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:$ENV{PYTHONPATH}")
   add_test(NAME exploration_parallel_slices COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_parallel_slices.py)
   set_tests_properties(exploration_parallel_slices PROPERTIES
@@ -203,7 +232,7 @@ if(BUILD_TESTING)
   set_tests_properties(exploration_pct_adapter exploration_fixed_layer_map exploration_pct_native_accessor PROPERTIES
     ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}/../../.pct_runtime:$ENV{PYTHONPATH}")
   set_property(TEST exploration_pct_adapter exploration_fixed_layer_map exploration_pct_native_accessor
-    exploration_pct_frontiers exploration_pct_observation exploration_pct_frontier_index
+    exploration_pct_frontiers exploration_pct_observation exploration_pct_frontier_index exploration_frontier_component_updates
     exploration_pct_local_window exploration_pct_connectivity exploration_pct_gpu_equivalence exploration_parallel_slices
     APPEND PROPERTY ENVIRONMENT_MODIFICATION
     "PYTHONPATH=path_list_prepend:${CMAKE_CURRENT_SOURCE_DIR}/../pct_planner/planner/scripts")

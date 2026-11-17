@@ -6,6 +6,7 @@ import time
 import weakref
 import numpy as np
 from lib import a_star
+from .map_evidence import same_ground_surface
 
 
 class BlockPlanner:
@@ -14,15 +15,16 @@ class BlockPlanner:
         self.wrapper_type = wrapper_type
         self.cfg = SimpleNamespace(planner=SimpleNamespace(route_simplify_epsilon=.08))
         self.planner = a_star.Astar()
-        if not hasattr(self.planner, 'set_time_limit'):
-            raise RuntimeError('PCT accessor extension missing; rebuild pct_planner')
+        if not hasattr(self.planner, 'init_surface_accessor'):
+            raise RuntimeError('PCT surface accessor extension missing; rebuild pct_planner')
         self.search_nodes = 0
         self.search_diagnostics = {}
         self._failures=OrderedDict()
         self._read_blocks=set()
         # A pybind std::function must not own a bound method that owns this
         # same native planner, which would form an uncollectable cycle.
-        self._reader = lambda layer, row, col, floor=None, ref=weakref.ref(self): ref()._read(layer, row, col, floor)
+        self._reader = lambda layer, row, col, floor=None, ref=weakref.ref(self): (
+            ref()._read(layer,row,col,floor))
 
     def _read(self, layer, row, column, floor=None):
         m = self.map
@@ -32,19 +34,26 @@ class BlockPlanner:
         cell = m.cell(key)
         if (cell is None or not np.isfinite(cell['G']) or
                 (floor is not None and abs(cell['G']-floor[0])>floor[1]+1e-7)):
-            return (1e6, -100., 0.)
+            return (1e6, -100., 0., 0)
         cost = m.planning_cost(key)
+        ground, surface_id = float(cell['G']), int(cell['g_surface_id'])
         gateway = 0.
-        if not cell['solid'] and not cell['unknown'] and cell['inflated_terrain_cost'] >= 0:
+        if cost > 8 and not cell['solid'] and not cell['unknown'] and cell['inflated_terrain_cost'] >= 0:
             for sign in (-1, 1):
                 other_key = (key[0]+sign, key[1], key[2])
+                self._read_blocks.add((other_key[0],key[1]//b,key[2]//b))
                 other = m.cell(other_key)
                 if other is None or other['solid'] or other['unknown'] or not np.isfinite(other['G']):
                     continue
+                other_ground = float(other['G'])
+                if not same_ground_surface(surface_id, ground, int(other['g_surface_id']), other_ground):
+                    continue
+                if floor is not None and abs(other_ground-floor[0])>floor[1]+1e-7:
+                    continue
                 other_cost=m.planning_cost(other_key)
-                if abs(other['G']-cell['G']) < .1 and other_cost <= 20 and cost-other_cost > 8:
+                if other_cost <= 20 and cost-other_cost > 8:
                     gateway = 2.*sign
-        return (float(cost), float(cell['G']), gateway)
+        return (float(cost), ground, gateway, surface_id)
 
     def _unknown_blockers(self, blocked, goal_height):
         m = self.map
@@ -53,13 +62,13 @@ class BlockPlanner:
             height = min(parent_height+m.settings.step_max,
                          max(parent_height-m.settings.step_max, goal_height))
             if cell is None or cell['unknown'] or not np.isfinite(cell['G']) or cell['solid']:
-                yield from m.unknown_blockers(k, [(x, y)], height)
+                yield from m.unknown_blockers(k,[(x,y)],height)
             elif cell['unknown_hard'] or cell['solid_hard']:
-                unknown, solid, _ = m.footprint_conflicts(m.position((k, x, y)), k, separate=True)
-                yield from m.unknown_blockers(k, unknown | solid, height)
+                unknown,solid,_=m.footprint_conflicts(m.position((k,x,y)),k,separate=True)
+                yield from m.unknown_blockers(k,unknown | solid,height)
 
     def plan(self, start, target, optimize=False, *, start_check=None, goal_check=None, floor=None,
-             collect_blockers=False, dense=False):
+             collect_blockers=False, dense=False, deadline=None):
         if optimize:
             raise ValueError('online PCT uses native A* and RDP; GPMP is disabled')
         m = self.map
@@ -101,7 +110,8 @@ class BlockPlanner:
                 return None
             del self._failures[cache_key]
         budget=m.settings.planning_budget_seconds
-        deadline=time.monotonic()+budget
+        limit=time.monotonic()+budget
+        deadline=limit if deadline is None else min(deadline,limit)
         self._read_blocks.clear()
         # Try the lowest-cost admitted surfaces first, preferring their common
         # upper cuts. Each native search still sees every cut.
@@ -126,8 +136,8 @@ class BlockPlanner:
             if remaining <= 0:
                 self.search_diagnostics['timed_out']=True
                 return None
-            self.planner.init_accessor(20., m.last_layer-m.first_layer+1, int(shape[0]), int(shape[1]),
-                                       m.settings.resolution, 1., reader)
+            self.planner.init_surface_accessor(20., m.last_layer-m.first_layer+1,
+                int(shape[0]), int(shape[1]), m.settings.resolution, 1., reader)
             remaining=deadline-time.monotonic()
             if remaining <= 0:
                 self.search_diagnostics['timed_out']=True
@@ -164,7 +174,7 @@ class BlockPlanner:
                 side = np.array([-heading[1], heading[0]])
                 radius = m.settings.robot_radius+m.settings.safety_margin
                 self.search_diagnostics['unknown_blockers'] = m.merge_unknown_blockers(
-                    (p for p in self._unknown_blockers(blockers, target[2])
+                    (p for p in self._unknown_blockers(blockers,target[2])
                      if abs(side@(np.asarray(p[:2])-start[:2])) <= radius+m.settings.resolution), start)
             self._failures[cache_key]=({key:versions.get(key,0) for key in self._read_blocks},
                                        self.search_diagnostics.get('unknown_blockers', []),m.revision)

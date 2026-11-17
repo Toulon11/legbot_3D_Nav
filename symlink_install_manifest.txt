@@ -22,7 +22,9 @@
 /home/likai/legbot_3D_Nav/install/legbot_exploration/lib/python3.12/site-packages/legbot_exploration/pct_observation.py
 /home/likai/legbot_3D_Nav/install/legbot_exploration/lib/python3.12/site-packages/legbot_exploration/pct_observation_poses.py
 /home/likai/legbot_3D_Nav/install/legbot_exploration/lib/python3.12/site-packages/legbot_exploration/pct_stairs.py
+/home/likai/legbot_3D_Nav/install/legbot_exploration/lib/python3.12/site-packages/legbot_exploration/surface_observation.py
 /home/likai/legbot_3D_Nav/install/legbot_exploration/lib/python3.12/site-packages/legbot_exploration/surface_orientation.py
+/home/likai/legbot_3D_Nav/install/legbot_exploration/lib/python3.12/site-packages/legbot_exploration/surface_relations.py
 /home/likai/legbot_3D_Nav/install/legbot_exploration/lib/python3.12/site-packages/legbot_exploration/tomographic_slice.py
 /home/likai/legbot_3D_Nav/install/legbot_exploration/lib/python3.12/site-packages/legbot_exploration/truth_coverage.py
 /home/likai/legbot_3D_Nav/install/legbot_exploration/lib/legbot_exploration/verify_flat_coverage.py

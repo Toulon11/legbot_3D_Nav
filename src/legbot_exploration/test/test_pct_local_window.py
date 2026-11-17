@@ -91,7 +91,9 @@ class LocalWindowTest(unittest.TestCase):
                 for surface in column.values():surface.orientation=-1
                 m.dirty.add(xy)
         m.build()
-        self.assertFalse(any(f.confirmed for f in m.stair_index.query(m,0.,.08)))
+        remaining=m.stair_index.query(m,0.,.08)
+        self.assertTrue(any(f.confirmed for f in remaining))
+        self.assertTrue(all(len(f.treads)<=2 and all(z<.3 for _,_,z in f.treads) for f in remaining))
 
     def test_two_failed_views_remove_whole_floor_cluster_outside_local_window(self):
         hole={(x,0) for x in range(10)}

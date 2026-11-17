@@ -17,6 +17,7 @@ struct FloorViewLimits {
   double xy_tolerance, first_budget, review_budget, review_slice;
   int max_attempts=2;
   double max_step=0., min_rise=0.;
+  std::optional<double> review_remaining;
 };
 struct PctInspection {
   // Wire payloads only, generated from the current locked PCT map.
@@ -32,6 +33,7 @@ struct PctFrontier {
   double gain=0.0,observer_ms=0.0;
   std::size_t cells=0;
   int attempt=0;
+  bool direction_limited=false;
   std::vector<Point> observations, display;
   std::vector<double> observation_yaws;
   std::string floor_failure;
@@ -52,9 +54,11 @@ struct PctFrontiers {
   std::size_t deferred_floor_frontier_cells=0;
   std::size_t disconnected_floor_frontier_cells=0;
   std::size_t pending_review_clusters=0;
+  std::size_t deferred_review_clusters=0,missing_connection_clusters=0;
   bool reviewing=false;
   bool fast_floor=false;
   std::size_t fast_skipped_clusters=0,fast_skipped_cells=0;
+  std::size_t small_skipped_clusters=0,small_skipped_cells=0;
   std::size_t stair_flights=0;
   std::size_t stair_step_unsafe=0;
   bool stair_platform_visible=false;
@@ -87,6 +91,7 @@ struct PctObservation {
   std::optional<double> side_yaw;
   std::optional<Point> region;
   std::size_t gain=0;
+  std::size_t resolved_frontier_cells=0;
   std::string reason, floor_attempt, metadata="{}";
   std::vector<PctUnknownBlocker> unknown_blockers;
 };
@@ -120,22 +125,25 @@ class PctBackend {
                         double min_gain,std::size_t max_candidates,std::size_t max_nodes);
   PctResult plan(std::uint64_t version, const Point &start, const Point &target,
       bool explicit_surface=false, std::optional<XY> floor=std::nullopt,
-      bool collect_blockers=false,bool stair_segment=false);
+      bool collect_blockers=false,bool stair_segment=false,std::optional<double> budget=std::nullopt);
   PctResult plan_shift(std::uint64_t version,const Point &start,const Point &target);
   PctResult plan_stair_reverse(std::uint64_t version,const Point &start,const Point &target);
   // Body XYZ and roll/pitch/yaw in; surface XYZ targets in. A fixed stance
   // and zero minimum gain admit navigation only, never bypass arrival safety.
+  // current_observation admits only the actual stationary stance with positive
+  // visible gain; its body support remains mandatory, its outer disc may be unknown.
   std::vector<PctObservationPose> observation_poses(std::uint64_t version,const Point &base,
       const Point &attitude,const std::vector<Point> &targets,std::optional<bool> include_moves=std::nullopt,
       std::optional<double> ascent=std::nullopt,std::optional<XY> floor=std::nullopt,
-      std::optional<Point> stance=std::nullopt,double tolerance=.15,int minimum_gain=1);
+      std::optional<Point> stance=std::nullopt,double tolerance=.15,int minimum_gain=1,
+      bool current_observation=false);
   PctFrontiers frontiers(std::uint64_t version,const Point &base=Point{},double minimum_distance=0.0,
                         std::optional<Point> window=std::nullopt,double query_budget=0.,
                         std::optional<Point> continuation=std::nullopt,
                         std::optional<XY> floor=std::nullopt,bool geometry_only=false,
                         std::optional<XY> platform_floor=std::nullopt,
                         std::optional<FloorViewLimits> floor_selection=std::nullopt,
-                        std::optional<double> stair_heading=std::nullopt);
+                        std::optional<double> stair_heading=std::nullopt,bool seek_ascent=false);
   PctStairProbe floor_stair_probe(std::uint64_t version,const Point &base,const XY &floor,double yaw,
                                 bool depart,bool review,double tolerance);
   bool complete_observation(std::uint64_t version,const PctFrontier &frontier,const Point &point);
@@ -144,7 +152,8 @@ class PctBackend {
   PctPointCheck point_check(std::uint64_t version, const Point &point,bool platform=false,
                             std::optional<XY> departure_floor=std::nullopt,double landing_heading=0.,
                             bool landing_recovery=false,std::optional<XY> floor=std::nullopt,
-                            bool tread_support=false,std::optional<double> platform_reference=std::nullopt);
+                            bool tread_support=false,std::optional<double> platform_reference=std::nullopt,
+                            bool descending_landing=false);
   PctObservation observation_task(std::uint64_t version,const std::string &operation,
       std::uint64_t cluster,const Point &point,double yaw=0.,double half_angle=0.,
       const std::vector<PctUnknownBlocker> *blockers=nullptr);
@@ -157,7 +166,8 @@ class PctBackend {
   const std::string &map_metadata() const;
  private:
   PctResult plan_with_method(const char *method,std::uint64_t version,const Point &start,
-                             const Point &target,std::optional<XY> floor=std::nullopt);
+                             const Point &target,std::optional<XY> floor=std::nullopt,
+                             std::optional<double> budget=std::nullopt);
   std::vector<Point> read_points(const char *method,std::uint64_t version,const Point &base,
       std::optional<double> heading=std::nullopt);
   struct Impl;

@@ -9,6 +9,7 @@
     auxiliary_sensor_odom_topic: /ground_lidar/odometry_lidar
     pct_maturity_min_points: 3         # Same frame or accumulated frames.
     pct_surface_noise_tolerance: 0.05  # Same-column matching and near-ground noise band, in metres.
+    pct_new_height_threshold: 0.10     # New measured support height triggers one local evidence review.
     # Temporary normals of real frame points; no inferred/fitted ground is added.
     pct_surface_normal_radius: 0.25
     pct_surface_normal_min_points: 6
@@ -19,6 +20,10 @@
     pct_floor_min_resolved_frontier_cells: 5 # Also require 10% of covered cells; capped by actual view coverage.
     pct_fast_exploration: true              # Prioritize useful ordinary floor observations and allow partial coverage.
     pct_fast_min_visible_cells: 3           # Minimum number visible from the candidate pose and yaw.
+    pct_floor_failed_small_cluster_max_cells: 2 # Track small tasks removed after an unsuccessful review.
+    pct_floor_global_review_enabled: true
+    pct_floor_four_direction_search: true  # One observation stance per quadrant on the first ordinary attempt.
+    pct_floor_direction_search_timeout_seconds: 1.5 # Cumulative observation search work per ordinary cluster.
     pct_landing_support_radius: 0.60   # Support radius used to rank interior staging poses, in metres.
     pct_landing_min_area: 1.50         # Connected measured platform area in square metres.
     pct_landing_min_width: 0.80        # Continuous level width across the ascent, in metres.

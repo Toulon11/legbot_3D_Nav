@@ -78,6 +78,7 @@ class OnlineLayerMapNode : public rclcpp::Node {
     integer("slice_update_workers","pct_slice_update_workers",0);
     integer("maturity_min_points","pct_maturity_min_points",3);
     shared_->surface_noise_tolerance=number("surface_noise_tolerance","pct_surface_noise_tolerance",.05);
+    number("new_height_threshold","pct_new_height_threshold",.10);
     number("surface_normal_radius","pct_surface_normal_radius",.25);
     integer("surface_normal_min_points","pct_surface_normal_min_points",6);
     number("surface_normal_vertical","pct_surface_normal_vertical",.5);
@@ -87,6 +88,12 @@ class OnlineLayerMapNode : public rclcpp::Node {
     integer("floor_min_resolved_frontier_cells","pct_floor_min_resolved_frontier_cells",5);
     settings<<",\"fast_exploration\":"<<(declare_parameter<bool>("pct_fast_exploration",false)?"true":"false");
     integer("fast_min_visible_cells","pct_fast_min_visible_cells",3);
+    integer("floor_failed_small_cluster_max_cells","pct_floor_failed_small_cluster_max_cells",0);
+    settings<<",\"floor_global_review_enabled\":"
+        <<(declare_parameter<bool>("pct_floor_global_review_enabled",true)?"true":"false");
+    settings<<",\"floor_four_direction_search\":"
+        <<(declare_parameter<bool>("pct_floor_four_direction_search",false)?"true":"false");
+    number("floor_direction_search_timeout","pct_floor_direction_search_timeout_seconds",1.5);
     number("landing_support_radius","pct_landing_support_radius",.60);
     number("landing_min_area","pct_landing_min_area",1.50);
     number("landing_min_width","pct_landing_min_width",.80);

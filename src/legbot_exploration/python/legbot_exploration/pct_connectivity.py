@@ -76,25 +76,15 @@ class ConnectivityIndex:
         dirty=set()
         for tile in candidates:
             mask=np.zeros((b,b),bool)
-            traversable={}
             for k in range(m.first_layer,m.last_layer+1):
                 block=m.blocks.get((k,*tile))
                 if block is None:continue
                 known=np.isfinite(block['G'])&~block['solid']&~block['unknown']
                 safe=known&~block['hard']&(block['inflated_terrain_cost']>=0)&(block['inflated_terrain_cost']<=20)
-                if self.floor is None:
-                    mask|=safe
-                    continue
-                within=abs(block['G']-self.floor[0])<=self.floor[1]+1e-7
-                mask|=safe&within
-                traversable[k]=(block['G'], safe, known&within&(block['inflated_terrain_cost']>=0))
-            # The native accessor can admit a costly gateway using an
-            # equivalent safe cut even if that cut lies outside the floor band.
-            for k,(ground,_,gateway_source) in traversable.items():
-                for adjacent in (k-1,k+1):
-                    if adjacent in traversable:
-                        other,safe,_=traversable[adjacent]
-                        mask|=gateway_source&safe&(abs(other-ground)<.1)
+                if self.floor is not None:
+                    safe &= abs(block['G']-self.floor[0])<=self.floor[1]+1e-7
+                # A gateway's safe alias shares its XY and passes the same floor filter.
+                mask |= safe
             old=self.tiles.get(tile)
             if old is not None and np.array_equal(old!=0,mask):continue
             if old is None and not mask.any():continue
@@ -120,3 +110,31 @@ class ConnectivityIndex:
         if dirty:self.revision+=1;self.components.clear();self.masks.clear()
         self.last_work=dict(checked_tiles=len(candidates),relabelled_tiles=len(dirty),revision=self.revision,
                             update_ms=1000*(time.monotonic()-began))
+
+    def known_barrier(self, start, targets, deadline):
+        """Prove a separation only if a bounded search is sealed by measured obstacles."""
+        if not targets:
+            return False
+        m=self.map
+        points=np.asarray([tuple(start),*targets])
+        lower=points.min(axis=0)-3
+        shape=points.max(axis=0)+4-lower
+        if int(np.prod(shape))>4096:
+            return False
+        # Missing, stale and inconclusive cells are open in this diagnostic.
+        open_cells=np.ones(tuple(shape),dtype=bool)
+        for x,y in np.ndindex(*shape):
+            if time.monotonic()>=deadline:
+                return False
+            xy=(int(lower[0]+x),int(lower[1]+y))
+            if self.node(xy) is None and m.surface_relations.measured_floor_barrier(xy,self.floor[0],0):
+                open_cells[x,y]=False
+        at=tuple(np.asarray(start)-lower)
+        ends=[tuple(np.asarray(xy)-lower) for xy in targets]
+        open_cells[at]=True
+        for end in ends:open_cells[end]=True
+        labels,_=label(open_cells,structure=np.ones((3,3),bool))
+        outside=set(np.r_[labels[0,:],labels[-1,:],labels[:,0],labels[:,-1]])-{0}
+        root=labels[at]
+        return all(labels[end]!=root and (root not in outside or labels[end] not in outside)
+                   for end in ends)

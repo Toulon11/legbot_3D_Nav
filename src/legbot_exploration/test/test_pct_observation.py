@@ -1,5 +1,6 @@
 """Views must fit the physical sensor; arrival/version changes cannot complete them."""
 import unittest
+from unittest.mock import patch
 import numpy as np
 from legbot_exploration.fixed_layer_map import FixedLayerMap,MapSettings
 from legbot_exploration.pct_observation import ObservationModel, ray_columns
@@ -83,10 +84,14 @@ class ObservationTests(unittest.TestCase):
     def test_mature_underside_is_not_tread_observation_gain(self):
         m=self.mapping();v=m.frontier_index.observation_model
         v.task=dict(keys=[(1,15,0,(-1,0,1))],heights=[.14],serial=m.integrated_serial,armed=True)
-        m.integrate(np.array([[1.5,0.,0.]]*3));m.build()
+        with patch('legbot_exploration.surface_orientation.classify',return_value=np.full(3,-1)):
+            m.integrate([[1.5,0.,0.]]*3,sensor_origin=(0.,0.,.5))
+        m.build()
         result=v.progress()
         self.assertEqual(result['gain'],0)
         self.assertFalse(result['fresh'])
+        m.integrate([[1.5,0.,0.]]);m.build()
+        self.assertTrue(v.progress()['ready'])
 
     def test_points_above_and_below_do_not_imply_a_fresh_middle_observation(self):
         m=self.mapping();v=m.frontier_index.observation_model

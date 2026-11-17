@@ -40,7 +40,9 @@ def main():
     cross_test='--cross-layer' in sys.argv
     floor_deferred_test='--floor-deferred' in sys.argv
     floor_blacklist_test='--floor-blacklist' in sys.argv
-    floor_no_observation_test='--floor-no-observation' in sys.argv
+    ordinary_floor_trial='--ordinary-floor-trial' in sys.argv
+    bounded_review_test='--bounded-floor-review' in sys.argv
+    floor_no_observation_test='--floor-no-observation' in sys.argv or ordinary_floor_trial or bounded_review_test
     floor_disconnected_test='--floor-disconnected' in sys.argv
     floor_blind_test='--floor-blind-observers' in sys.argv
     flat_gap_test='--flat-gap-scan' in sys.argv
@@ -50,16 +52,20 @@ def main():
     stair_scout_test='--stair-frontier-scout' in sys.argv
     stair_priority_test='--stair-priority' in sys.argv
     local_stair_probe_test='--local-stair-probe' in sys.argv
+    floor_ascent_handoff_test='--floor-ascent-handoff' in sys.argv
+    floor_descent_arrival_test='--floor-descent-arrival' in sys.argv
+    startup_low_body_test='--startup-low-body' in sys.argv
+    multilevel_support_test='--multilevel-support' in sys.argv
     stair_gap_test='--stair-gap-scan' in sys.argv
     platform_shift_test='--landing-shift' in sys.argv
     short_floor_test='--short-floor' in sys.argv or platform_shift_test
     floor_skip_test=('--floor-skip' in sys.argv or stair_reverse_test or stair_scout_test or
-                     stair_priority_test or stair_gap_test or short_floor_test)
+                     stair_priority_test or stair_gap_test or short_floor_test or floor_ascent_handoff_test)
     floor_exploration_test='--floor-exploration' in sys.argv
     fast_floor_test='--fast-floor' in sys.argv
     fast_floor_observation_test='--fast-floor-observation' in sys.argv
-    floor_test=(floor_exploration_test or floor_deferred_test or floor_blacklist_test or
-                floor_unavailable_test or floor_skip_test or fast_floor_test or fast_floor_observation_test or flat_gap_test or local_stair_probe_test)
+    floor_test=(floor_exploration_test or floor_descent_arrival_test or floor_deferred_test or floor_blacklist_test or
+                floor_unavailable_test or floor_skip_test or fast_floor_test or fast_floor_observation_test or flat_gap_test or local_stair_probe_test or startup_low_body_test or multilevel_support_test)
     observation_test='--observation' in sys.argv
     command=[sys.argv[1],'--exploration-mode=combined','--ros-args']
     for name in ('exploration.yaml','multi_layer_map.yaml'):
@@ -70,7 +76,7 @@ def main():
                  'use_sim_time:=false','robot_reference_height:=0.38','publish_period:=0.3',
                  'legbot_explorer:frontier_source:=pct','legbot_explorer:planner_mode:=layer',
                  'legbot_explorer:pct_floor_exploration:='+('true' if floor_test else 'false'),
-                 'legbot_explorer:observation_only:='+('true' if completion_test else 'false'),
+                 'legbot_explorer:observation_only:='+('true' if completion_test or floor_descent_arrival_test else 'false'),
                  'legbot_explorer:no_frontier_hold:=0.2','legbot_explorer:max_voxels:=1',
                  'legbot_explorer:require_planner_occupancy:=true'):
         command+=['-p',item]
@@ -83,7 +89,7 @@ def main():
     if pending_test:
         command+=['-p','online_layer_map:pct_planning_budget_seconds:=0.000000001']
     if cross_test:
-        command+=['-p','online_layer_map:pct_surface_noise_tolerance:=0.105',
+        command+=['-p','online_layer_map:pct_surface_noise_tolerance:=0.05',
                   '-p','online_layer_map:pct_maturity_min_points:=1',
                   '-p','legbot_explorer:local_search_radius:=3.0',
                   '-p','legbot_explorer:observation_frame_wait:=0.3',
@@ -93,6 +99,14 @@ def main():
                   '-p','legbot_explorer:observation_frame_wait:=0.2',
                   '-p','online_layer_map:pct_fast_exploration:='+
                   str(fast_floor_test or fast_floor_observation_test).lower()]
+    if ordinary_floor_trial:
+        command+=['-p','online_layer_map:pct_floor_global_review_enabled:=false']
+    elif not bounded_review_test and (floor_deferred_test or floor_blacklist_test or floor_unavailable_test or
+                                      flat_gap_test or fast_floor_test or fast_floor_observation_test):
+        command+=['-p','online_layer_map:pct_floor_global_review_enabled:=true',
+                  '-p','online_layer_map:pct_floor_four_direction_search:=false',
+                  '-p','online_layer_map:pct_floor_failed_small_cluster_max_cells:=0',
+                  '-p','legbot_explorer:pct_floor_review_wait_budget_seconds:=0.0']
     if stair_reverse_test:
         # This recovery fixture deliberately uses one-metre-deep treads.
         # Keep them below its platform threshold so recovery is exercised
@@ -185,6 +199,14 @@ def main():
             if local_stair_probe_test:
                 points=([(i*.1,j*.1,0.) for i in range(-18,12) for j in range(-14,15)]+
                         [(i*.1,j*.1,.13) for i in range(12,18) for j in range(-9,10)])*3
+            if floor_ascent_handoff_test:
+                points=([(i*.1,j*.1,0.) for i in range(-18,10) for j in range(-14,15)]+
+                        [(i*.1,j*.1,.13) for i in range(10,34) for j in range(-12,13)])*3
+            if startup_low_body_test:
+                # Real ground is observed outside the laser's near blind area.
+                # The footprint stays unknown even after four feet settle.
+                points=[(i*.1,j*.1,0.) for i in range(-35,36) for j in range(-25,26)
+                        if math.hypot(i*.1,j*.1)>=.8]*3
             if stair_priority_test:
                 points=[(i*.05,j*.05,0.) for i in range(-60,0) for j in range(-62,63)]
                 points.extend((i*.05,j*.05,z) for start,end,lo,hi,z in
@@ -250,7 +272,11 @@ def main():
         next_cloud=0.
         loaded_feet=2
         split_support=False
+        split_height=.14
+        base_speed=0.
         if floor_test:base_position[:]=[0.,0.,.38]
+        if floor_descent_arrival_test:base_position[:]=[0.,0.,1.86]
+        if startup_low_body_test:base_position[:]=[0.,0.,.084]
         if stair_priority_test:base_position[:]=[-1.6,0.,.38]
         if cross_test:base_position[:]=[-.4,0.,.38]
         def spin_until(condition,timeout=15):
@@ -268,6 +294,7 @@ def main():
                     stamp=node.get_clock().now().to_msg()
                     a=Odometry();a.header=Header(stamp=stamp,frame_id='map')
                     a.pose.pose.position.x=base_position[0];a.pose.pose.position.y=base_position[1];a.pose.pose.position.z=base_position[2];a.pose.pose.orientation.w=__import__("math").cos(base_yaw/2);a.pose.pose.orientation.z=__import__("math").sin(base_yaw/2)
+                    a.twist.twist.linear.x=base_speed
                     b=Odometry();b.header=a.header;b.pose.pose.position.x=base_position[0];b.pose.pose.position.y=base_position[1];b.pose.pose.position.z=base_position[2]+.39
                     b.pose.pose.orientation.w=1.
                     if floor_test:
@@ -278,7 +305,9 @@ def main():
                         transforms=[]
                         for name in feet:
                             foot=TransformStamped(header=Header(stamp=stamp,frame_id='base'),child_frame_id=name)
-                            foot.transform.translation.z=-.22 if split_support and name.startswith('R') else -.36
+                            foot.transform.translation.z=-.36+(split_height if split_support and name.startswith('R') else 0.)
+                            if startup_low_body_test:
+                                foot.transform.translation.z=.02-base_position[2]
                             foot.transform.rotation.w=1.
                             transforms.append(foot)
                         foot_tf.publish(TFMessage(transforms=transforms))
@@ -299,12 +328,107 @@ def main():
                     return
             raise AssertionError('timeout; last states='+str(states[-2:]))
         try:
+            if floor_descent_arrival_test:
+                loaded_feet=4
+                spin_until(lambda:states and states[-1]['pct_floor']['number']==1,15)
+                assert abs(states[-1]['pct_floor']['height']-1.5)<.04,states[-1]
+                base_position[2]=.86
+                until=time.monotonic()+1.
+                spin_until(lambda:time.monotonic()>=until,3)
+                assert states[-1]['pct_floor']['number']==1,states[-1]
+                base_position[2]=.36
+                spin_until(lambda:states[-1]['pct_floor']['number']==2,15)
+                arrived=states[-1]
+                assert abs(arrived['pct_floor']['height'])<.04,arrived
+                floors=arrived['height_review']['frontier_floors']
+                assert len(floors)==2 and floors[0]['observation_start_frame'] is not None,floors
+                assert floors[1]['observation_start_frame'] is None,floors
+                assert any(s['state']=='cross_layer_completed' for s in states),states[-1]
+                print('PASS verified descending platform initializes the unvisited floor')
+                return 0
+            if startup_low_body_test:
+                spin_until(lambda:any(s['state']=='pct_blocker_recovery_waiting' and
+                    s.get('detail')=='no_other_safe_delegate_goal' for s in states),20)
+                assert not requests,'untrusted support must not authorize a destination'
+                geometry=states[-1]['pct_map']['geometry_version']
+                loaded_feet=4
+                spin_until(lambda:bool(requests),15)
+                request=requests[0]
+                p=request.target.pose.position
+                assert abs(p.z-.38)<.02,(p.x,p.y,p.z)
+                assert math.hypot(p.x,p.y)>.8,'unknown footprint was fabricated as safe'
+                assert states[-1]['pct_map']['geometry_version']==geometry,states[-1]
+                forward(request.target)
+                base_position[:]=[p.x,p.y,p.z]
+                until=time.monotonic()+.4
+                spin_until(lambda:time.monotonic()>=until,2)
+                ack.publish(request.target)
+                spin_until(lambda:any(s.get('pct_floor',{}).get('number')==1 for s in states),12)
+                assert abs(states[-1]['pct_floor']['height'])<.02,states[-1]
+                print('PASS crouched startup wakes recovery on stable support without filling the blind footprint')
+                return 0
             if floor_test:
                 spin_until(lambda:any(s['state']=='pct_waiting_for_floor_height' and
                     s.get('pct_floor',{}).get('contacting_feet')==2 for s in states),20)
                 assert not requests
                 loaded_feet=4
                 spin_until(lambda:any(s.get('pct_floor',{}).get('number')==1 for s in states),10)
+                if multilevel_support_test:
+                    split_support=True
+                    split_height=.16
+                    spin_until(lambda:bool(states) and
+                        states[-1].get('pct_floor',{}).get('foot_sample')=='stable_multilevel',8)
+                    support=states[-1]['pct_floor']
+                    assert support['support_stable'] and support['stable_foot_height'] is None,support
+                    assert abs(support['foot_height_span']-.16)<1e-6,support
+                    assert abs(support['height'])<.02,'mixed feet must not synthesize a new floor G'
+                    split_height=.17
+                    spin_until(lambda:states[-1]['pct_floor']['foot_sample']=='foot_support_exceeds_step_limit',8)
+                    assert not states[-1]['pct_floor']['support_stable'],states[-1]
+                    split_height=.14
+                    spin_until(lambda:states[-1]['pct_floor']['foot_sample']=='stable_multilevel',8)
+                    print('PASS 16 cm multilevel support is stable without an averaged ground; 17 cm stays rejected')
+                    return 0
+                if floor_ascent_handoff_test:
+                    for stage in range(12):
+                        spin_until(lambda:len(requests)>stage,12)
+                        request=requests[stage]
+                        p=request.target.pose.position
+                        planned=next(g for g in goals if g['goal_id']==request.goal_id and
+                                     g['attempt_id']==request.attempt_id)
+                        assert planned['selection_policy']=='pct_local_stair_probe',planned
+                        final=request.has_xy_tolerance
+                        if final:
+                            assert p.z>.48 and not any(s['control_mode']=='cross_layer' for s in states)
+                            split_support=True
+                            base_speed=.06
+                        forward(request.target)
+                        stop=copy.deepcopy(request.target)
+                        if final:
+                            stop.pose.position.z-=.06
+                            assert stop.pose.position.z-.38<.08
+                            # Arrive facing away from the old approach bearing.
+                            # The stair scan must use measured treads/current yaw,
+                            # rather than demand a large turn on this split stance.
+                            base_yaw=1.5
+                        base_position[:]=[p.x,p.y,stop.pose.position.z]
+                        until=time.monotonic()+.35
+                        spin_until(lambda:time.monotonic()>=until,2)
+                        ack.publish(stop)
+                        if final:break
+                    else:raise AssertionError('no final tread receipt')
+                    spin_until(lambda:any(s['state']=='pct_floor_ascent_waiting' and
+                                         s.get('detail')=='stable_pose' for s in states),12)
+                    assert not any(s['state'].startswith('pct_blocker_recovery') for s in states),states[-1]
+                    base_speed=0.
+                    spin_until(lambda:any(s.get('detail')=='measured_floor_ascent' and
+                                         s['control_mode']=='cross_layer' for s in states),12)
+                    assert not any(s['state'].startswith('pct_blocker_recovery') for s in states),states[-1]
+                    spin_until(lambda:bool(observed_stair_turns),12)
+                    assert all(abs(angle)<=.71 for _,angle in observed_stair_turns),observed_stair_turns
+                    assert not any(e.get('reason')=='turn_space_rejected' for e in observation_events),observation_events
+                    print('PASS actual tread receipt waits for steady odometry and hands off to cross-layer')
+                    return 0
                 if local_stair_probe_test:
                     spin_until(lambda:bool(requests) and any(
                         s.get('pct_floor',{}).get('pending_stair_candidates',0)>0 for s in states),20)
@@ -419,6 +543,28 @@ def main():
                         return 0
                     spin_until(lambda:any(s['state']=='pct_waiting_for_stairs' for s in states),18)
                     assert not goals and not requests and not plans,goals
+                    if bounded_review_test:
+                        settled=[s for s in states if s['state']=='pct_floor_frontier_settled']
+                        first=[s for s in settled if not s['pct_reviewing']]
+                        second=[s for s in settled if s['pct_reviewing']]
+                        assert first and second and not any(s['pct_failed_small_cells'] for s in first),settled
+                        done=next(s for s in states if s['state']=='pct_floor_handoff_with_deferred_frontiers')
+                        assert done['pct_failed_small_cells']==len(holes),done
+                        assert 0<done['pct_floor_review_wait_ms']<=8000.,done
+                        assert not done['pct_pending_review_clusters'],done
+                        print('PASS small clusters enter bounded review and are retired only after review')
+                        return 0
+                    if ordinary_floor_trial:
+                        settled=[s for s in states if s['state']=='pct_floor_frontier_settled']
+                        assert settled and all(not s['pct_reviewing'] for s in settled),settled
+                        done=next(s for s in states if s['state']=='pct_floor_handoff_with_deferred_frontiers')
+                        assert done['pct_failed_small_cells']==len(holes),done
+                        assert done['pct_failed_small_clusters']==len(holes),done
+                        assert done['pct_deferred_floor_frontier_cells']==len(holes),done
+                        assert not done['pct_pending_review_clusters'],done
+                        assert done['pct_floor_longest_selection_wait_ms']>0,done
+                        print('PASS ordinary floor attempts small clusters once, then hands off without a review')
+                        return 0
                     if floor_disconnected_test:
                         done=next(s for s in states if s['state']=='pct_floor_handoff_with_deferred_frontiers')
                         assert done['pct_disconnected_floor_frontier_cells']==len(holes),done
@@ -486,10 +632,13 @@ def main():
                         view=next(g for g in goals if g['goal_id']==sent.goal_id and
                                   g['attempt_id']==sent.attempt_id)
                         assert view['selection_policy']=='pct_local_stair_probe',goals
-                        # Shared pose search may view the farther entrance
-                        # obliquely; it need not stand directly in front of it.
-                        bearing=math.atan2(2.1-view['observation_y'],.25-view['observation_x'])
-                        assert abs(math.remainder(view['observation_yaw']-bearing,2*math.pi))<.4,goals
+                        def selected_diagnostic():
+                            return next((s['observation_evidence']['diagnostic'] for s in reversed(states)
+                                if s.get('goal_id')==sent.goal_id and
+                                'diagnostic' in s.get('observation_evidence',{})),None)
+                        spin_until(lambda:selected_diagnostic() is not None,3)
+                        flight=selected_diagnostic()
+                        assert len(flight['treads'])==2 and flight['treads'][0][1]>1.5,flight
                         assert abs(view['observation_z']-.38)<.02,goals
                         print('PASS farther two-tread entrance is scouted before a nearby one-tread entrance')
                         return 0
@@ -498,16 +647,21 @@ def main():
                     assert states[-1]['pct_floor']['start_floor_skipped'],states[-1]
                     assert not any(s['state'].startswith('pct_floor_complete') for s in states)
                     if stair_scout_test:
-                        points=points+[(i*.025,j*.025,z)
-                            for lo,hi,z in ((96,119,.10),(120,160,.23))
-                            for i in range(lo,hi+1) for j in range(-40,41)]
+                        points=points+[(i*.025,j*.025,.10)
+                            for i in range(96,120) for j in range(-40,41)]
                         points.extend((i*.1,j*.1,0.) for i in (22,23) for j in range(-10,11))
+                        upper_added=False
                         probe_events=lambda:[e for e in observation_events
                             if e['reason']=='floor_stair_probe_observed']
                         for index in range(16):
                             spin_until(lambda:len(requests)>index or bool(probe_events()),12)
                             if probe_events():break
                             request=requests[index]
+                            if not upper_added and any(g['goal_id']==request.goal_id and
+                                    g['selection_policy']=='pct_local_stair_probe' for g in goals):
+                                points.extend((i*.025,j*.025,.23)
+                                    for i in range(120,161) for j in range(-40,41))
+                                upper_added=True
                             forward(request.target)
                             p=request.target.pose.position
                             assert p.z<=.65,p
@@ -579,6 +733,7 @@ def main():
                         blocked.append(tuple((math.floor((v+.07*d)*10)+.5)/10
                                              for v,d in zip((x,y,z),direction)))
                         split_support=True
+                        split_height=.17
                         until=time.monotonic()+.5
                         spin_until(lambda:time.monotonic()>=until and
                                    states[-1]['cross_layer_task']['rise_m']>.08,5)
@@ -587,7 +742,7 @@ def main():
                         spin_until(lambda:any(s['state']=='cross_layer_reposition_waiting_for_stable_feet'
                                               for s in states),5)
                         assert not shifts
-                        split_support=False
+                        split_height=.14
                         spin_until(lambda:bool(shifts) or states[-1]['state']=='cross_layer_deferred',10)
                         assert shifts, [(plan['reason'],plan['backend'].get('rear_support_check'),
                                          plan['backend'].get('stop_check')) for plan in plans[-4:]]
@@ -714,6 +869,8 @@ def main():
                     elif p.z>upper_stop_z:
                         break
                 assert support_scan
+                assert not any(g['selection_policy']=='pct_stair_frontier' for g in goals), \
+                    'ascent must not sweep unrelated frontier clusters'
                 assert any(s.get('pct_floor',{}).get('phase')=='ascending' for s in states),states[-1]
                 assert any(g['mode']=='cross_layer' and g['observation_z']>.7 for g in goals),goals
                 assert any(s.get('pct_floor',{}).get('saved_stair_entrances') for s in states),states[-1]
@@ -756,6 +913,12 @@ def main():
                 assert abs(upper['pct_floor']['height']-upper_ground)<.01,upper
                 assert upper['pct_floor']['phase']=='exploring' and upper['control_mode']=='flat',upper
                 assert not upper['pct_floor']['start_floor_skipped'],upper
+                floor_evidence=upper['height_review']['frontier_floors']
+                assert len(floor_evidence)==2,floor_evidence
+                assert floor_evidence[0]['observation_start_frame'] is None,floor_evidence
+                assert abs(floor_evidence[1]['height']-upper_ground)<.01,floor_evidence
+                cutoff=floor_evidence[1]['observation_start_frame']
+                assert cutoff is not None and 0<cutoff<upper['height_review']['height_serial'],upper
                 if short_floor_test:
                     assert any(g['selection_policy']=='pct_stair_climb' for g in goals),goals
                     assert upper['pct_floor']['contacting_feet']==3,upper
@@ -765,10 +928,12 @@ def main():
                                (g['selection_policy']=='pct_platform_frontier' and g['mode']=='cross_layer')
                                for g in goals if g['mode']=='cross_layer'),goals
                     segment_scans=[e for e in observation_events if e['reason'] in
-                                   ('stair_segment_scan_observed','stair_segment_scan_stance_unavailable')]
+                                   ('stair_segment_scan_observed','stair_segment_sweep_no_related_returns',
+                                    'stair_segment_scan_stance_unavailable')]
                     assert len(segment_scans)>=2,observation_events
                     assert any(e['success'] for e in segment_scans),segment_scans
-                    assert all(e['views_completed']==4 for e in segment_scans if e['success']),segment_scans
+                    assert all(e['views_completed']==2 and 0<=e['stair_views_with_returns']<=2
+                               for e in segment_scans if e['success']),segment_scans
                     assert any(e['reason']=='stair_support_sweep_executed' and e['success']
                                for e in observation_events),observation_events
                     climbs={g['goal_id'] for g in goals if g['selection_policy'] in ('pct_stair_climb','pct_stair_step')}
@@ -795,9 +960,10 @@ def main():
                     complete.publish(Bool(data=True))
                     handled+=1
                     if request.has_xy_tolerance:break
-                assert base_position[2]>.55,base_position
+                assert base_position[2]>=.38+.10-1e-5,base_position
                 spin_until(lambda:bool(observation_events),16)
-                assert observation_events[-1]['reason']=='sweep_executed',observation_events[-1]
+                scan=observation_events[-1]
+                assert scan['reason']=='stair_segment_scan_observed' and scan['views_completed']==2,scan
                 assert 1<=len(observed_turns)<=4,observed_turns
                 assert all(abs(angle)<=.71 for _,angle in observed_stair_turns),observed_stair_turns
                 spin_until(lambda:len(requests)>handled or
@@ -972,11 +1138,18 @@ def main():
             # Reproduce immediate-arrival ordering: the stamped receipt can
             # beat the forwarded GoalRequest callback, and depth-one Bool
             # may retain only true. Do not require a false arming edge.
-            ack.publish(first);complete.publish(Bool(data=True))
+            # The coordinator can be one /clock tick behind the sender.
+            # Its own stamp is still authoritative for this identified stage.
+            receipt=copy.deepcopy(first)
+            sent_ns=first.header.stamp.sec*1000000000+first.header.stamp.nanosec
+            receipt.header.stamp.sec,receipt.header.stamp.nanosec=divmod(sent_ns-1000000,1000000000)
+            ack.publish(receipt);complete.publish(Bool(data=True))
             until=time.monotonic()+.15;spin_until(lambda:time.monotonic()>=until,2)
             assert len(waypoints)==1,'accepted arrival before binding the identified request'
             handoff_started=time.monotonic()
-            forward(first)
+            confirmed=copy.deepcopy(requests[0])
+            confirmed.target.header.stamp=receipt.header.stamp
+            forwarded.publish(confirmed)
             spin_until(lambda:any(e['status']=='succeeded' for e in executions))
             if first_is_final:
                 spin_until(lambda:any(s.get('observation_task_active') for s in states))
@@ -987,6 +1160,7 @@ def main():
                 assert time.monotonic()-handoff_started<.5,'next waypoint waited for controller tick'
                 assert requests[1].goal_id==requests[0].goal_id and requests[1].waypoint_index==1
             success=next(e for e in executions if e['status']=='succeeded')
+            assert success['scan_goal_stamp']==sent_ns-1000000,success
             assert success['requested_xy_tolerance']==(.15 if first_is_final else None),success
             assert success['goal_distance']<1e-8,success
             second=waypoints[1];forward(second)

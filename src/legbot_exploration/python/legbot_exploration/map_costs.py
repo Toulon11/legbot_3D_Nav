@@ -225,7 +225,7 @@ def update_costs(m, base, changed_g):
         if row is None or not row['measured']:
             continue
         relief_work += 1
-        old_state = (bool(row['solid']), bool(row['unknown']))
+        old_state = (bool(row['solid']), bool(row['unknown']), row['passage_cost']<0)
         passage = -1.
         has_ground = np.isfinite(row['G'])
         if has_ground:
@@ -235,6 +235,8 @@ def update_costs(m, base, changed_g):
                 passage = 50. if clearance < s.minimum_clearance else max(0., 20.*(s.desired_clearance-clearance))
             else:
                 passage = 0.
+            if passage<50 and row['pending_ceiling_z']-row['G']<s.minimum_clearance:
+                passage=-1.
         relief = -1.
         if row['feature_valid']:
             if row['flat']:
@@ -270,7 +272,7 @@ def update_costs(m, base, changed_g):
             terrain_changed.add(key)
         row['solid'] = row['terrain_cost'] >= 50
         row['unknown'] = not has_ground
-        if old_state != (bool(row['solid']), bool(row['unknown'])):
+        if old_state != (bool(row['solid']), bool(row['unknown']), passage<0):
             state_changed.add(key)
     half = s.inflation_kernel_size//2
     weights = [(dx, dy, float(np.clip(1.-(math.hypot(dx, dy)*s.resolution-s.robot_radius)/(s.safety_margin+s.resolution), 0., 1.)))
@@ -301,7 +303,9 @@ def update_costs(m, base, changed_g):
     hard_work = 0
     for block_key, block, mask in target_masks(m, state_changed, disk_half):
         hard_work += int(mask.sum())
-        unknown = ndimage.binary_dilation(gather(m, block_key, disk_half, 'unknown', True), structure=structure)
+        unseen=gather(m,block_key,disk_half,'unknown',True) | (
+            gather(m,block_key,disk_half,'passage_cost',-1.)<0)
+        unknown=ndimage.binary_dilation(unseen,structure=structure)
         solid = ndimage.binary_dilation(gather(m, block_key, disk_half, 'solid', False), structure=structure)
         unknown = unknown[disk_half:disk_half+b, disk_half:disk_half+b]
         solid = solid[disk_half:disk_half+b, disk_half:disk_half+b]

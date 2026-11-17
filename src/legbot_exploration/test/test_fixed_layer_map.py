@@ -21,6 +21,57 @@ def mapping(**settings):
 
 
 class FixedMapTest(unittest.TestCase):
+    def test_entering_lower_new_floor_rechecks_ceiling_without_clearing_ground(self):
+        for native in (False,True):
+            with self.subTest(native=native):
+                m=FixedLayerMap(MapSettings(maturity_min_points=1,robot_radius=0.,safety_margin=0.),
+                                native_updates=native)
+                below,new,upper=.98,1.40,2.10
+                m.integrate(np.vstack((floor_grid(.5,below),floor_grid(.5,upper))))
+                m.integrate([[.2,0.,1.25]])
+                m.build()
+                evidence=m.surface_observation
+                evidence.enter_frontier_floor((0.,0.,upper),.08)
+                evidence.visit_height((0.,0.,upper))
+                m.integrate([[.1,0.,new]])
+                m.build()
+                self.assertTrue(evidence.enter_frontier_floor((.1,0.,new),.08))
+                m.build()
+                old=m.cell((2,0,0))
+                self.assertAlmostEqual(old['G'],below,places=5)
+                self.assertAlmostEqual(old['C'],upper,places=5)
+                self.assertAlmostEqual(old['pending_ceiling_z'],new,places=5)
+                self.assertFalse(old['unknown'] or old['solid'])
+                self.assertTrue(old['unknown_hard'])
+                self.assertEqual(old['passage_cost'],-1.)
+                self.assertEqual(m.planning_cost((2,0,0)),50.)
+                self.assertAlmostEqual(next(m.unknown_blockers(2,[(0,0)],below))[2],new,places=5)
+                self.assertTrue(np.isnan(m.cell((2,1,0))['pending_ceiling_z']))
+                self.assertAlmostEqual(m.cell((5,0,0))['G'],upper,places=5)
+                nearer=m.cell((2,2,0))
+                self.assertAlmostEqual(nearer['C'],1.25,places=5)
+                self.assertTrue(np.isnan(nearer['pending_ceiling_z']))
+
+                # An unrelated higher return cannot confirm the nearer C.
+                m.integrate([[0.,0.,upper]])
+                m.build()
+                self.assertAlmostEqual(m.cell((2,0,0))['pending_ceiling_z'],new,places=5)
+                record=evidence.expect((0.,0.,new),review=True,kind='geometry')
+                rays=[(x,y,below) for x in (-.075,-.025,.025,.075)
+                      for y in (-.075,-.025,.025,.075)]
+                m.integrate(rays,sensor_origin=(0.,0.,1.8))
+                m.build()
+                self.assertEqual(record.state,'refuted')
+                self.assertTrue(np.isnan(m.cell((2,0,0))['pending_ceiling_z']))
+                self.assertAlmostEqual(m.cell((2,0,0))['C'],upper,places=5)
+                m.integrate([[0.,0.,new]])
+                m.build()
+                old=m.cell((2,0,0))
+                self.assertAlmostEqual(old['G'],below,places=5)
+                self.assertAlmostEqual(old['C'],new,places=5)
+                self.assertTrue(np.isnan(old['pending_ceiling_z']))
+                self.assertTrue(old['solid'])
+
     def test_surface_groups_reject_a_chain_beyond_the_full_noise_span(self):
         column=SurfaceColumn()
         for z in (0.,.049,.070):column.add(z,.05,100)
@@ -97,8 +148,8 @@ class FixedMapTest(unittest.TestCase):
         self.assertTrue(m.point_safe_check((0.,0.,.32))['ready'])
         self.assertAlmostEqual(m.cell((2,0,0))['G'],0.,places=5)
         self.assertAlmostEqual(m.cell((2,0,0))['C'],1.20,places=5)
-        self.assertAlmostEqual(m.cell((3,0,0))['G'],1.20,places=5)
-        self.assertTrue(np.isnan(m.cell((3,0,0))['C']))
+        self.assertAlmostEqual(m.cell((3,0,0))['G'],0.,places=5)
+        self.assertAlmostEqual(m.cell((3,0,0))['C'],1.20,places=5)
         # The 3 cm thickness is smaller than the 5 cm noise tolerance.
         m.integrate(plane(1.23),sensor_origin=(0.,0.,1.65))
         m.build()
@@ -107,6 +158,31 @@ class FixedMapTest(unittest.TestCase):
         self.assertAlmostEqual(m.cell((3,0,0))['G'],1.23,places=5)
         self.assertTrue(m.point_safe_check((0.,0.,1.55))['ready'])
         self.assertAlmostEqual(m.cell((2,0,0))['C'],1.20,places=5)
+
+    def test_support_wins_over_a_nearby_historical_underside_without_inventing_ground(self):
+        m=mapping(maturity_min_points=1,robot_radius=0.,safety_margin=0.)
+        def hit(height,orientation):
+            points=floor_grid(.5,height)
+            with patch('legbot_exploration.surface_orientation.classify',
+                       return_value=np.full(len(points),orientation)):
+                m.integrate(points,sensor_origin=(0.,0.,1.5))
+            m.build()
+        hit(1.177,-1)
+        self.assertTrue(m.cell((3,0,0))['unknown'])
+        self.assertFalse(m.point_safe_check((0.,0.,1.497))['ready'])
+        hit(1.174,1)
+        row=m.cell((3,0,0))
+        self.assertAlmostEqual(row['G'],1.174)
+        record=next(r for r in m.columns[(0,0)].values() if r.id==row['g_surface_id'])
+        self.assertEqual(record.orientation,1)
+        self.assertTrue(m.point_safe_check((0.,0.,1.494))['ready'])
+        self.assertTrue(any(r.orientation==-1 for r in m.columns[(0,0)].values()))
+        # A separate low ceiling below this same cut is retained and blocks
+        # support, instead of being skipped along with the invalid G source.
+        hit(1.30,-1)
+        self.assertAlmostEqual(m.cell((3,0,0))['G'],1.174)
+        self.assertAlmostEqual(m.cell((3,0,0))['C'],1.30)
+        self.assertFalse(m.point_safe_check((0.,0.,1.494))['ready'])
 
     def test_near_ground_noise_uses_the_configured_tolerance(self):
         samples=[(0.,0.,.091),(0.,0.,.097),(0.,0.,.099),(0.,0.,.30)]
@@ -153,7 +229,7 @@ class FixedMapTest(unittest.TestCase):
         # A verified underside remains in the geometry even on the same stripe.
         integrate([(.009,0,.34)]*3,[-1]*3)
         row=m.cell((2,0,0))
-        self.assertAlmostEqual(row['G'],.34,places=5)
+        self.assertAlmostEqual(row['G'],.335,places=5)
         self.assertAlmostEqual(m.cell((1,0,0))['C'],.329,places=5)
 
     def test_two_measured_support_heights_keep_clearance_without_neighboring_treads(self):

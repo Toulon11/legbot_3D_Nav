@@ -75,6 +75,7 @@ struct ExplorationSettings {
   double pct_query_budget_=.20;
   double pct_query_resume_delay_=.10;
   FloorViewLimits pct_floor_view_limits_{.15,2.,4.,.40};
+  double pct_floor_review_wait_budget_=0.;
   double recovery_goal_xy_tolerance_=0.15;
 };
 
@@ -164,7 +165,7 @@ class ExplorationController {
   };
   struct ObservationTask {
     PctFrontier frontier;
-    double began=0.,waiting_since=0.,center=0.,coverage=0.;
+    double began=0.,waiting_since=0.,center=0.,coverage=0.,stair_view_last_frame=0.;
     bool initialized=false,turning=false;
     bool cross_layer=false,platform_frontier=false;
     bool support_scan=false;
@@ -177,6 +178,7 @@ class ExplorationController {
     std::optional<Point> planned_pose;
     std::size_t next=0;
     std::size_t views_completed=0;
+    std::size_t stair_views_with_returns=0;
     std::vector<double> headings;
     std::optional<PathProcessor> continuation;
     bool directional() const {return cross_layer || stair_heading.has_value() || targeted_blocker_scan;}
@@ -240,7 +242,8 @@ class ExplorationController {
       const std::vector<PctUnknownBlocker> &blockers,
       bool cross_layer,int floor_attempt=0,const char *policy="pct_frontier",
       std::optional<std::string> start_failure=std::nullopt,
-      std::optional<XY> platform=std::nullopt);
+      std::optional<XY> platform=std::nullopt,bool enqueue=false);
+  bool resume_pending_blocker_recovery();
   void try_pct_landing_shift(double current);
   void finish_blocker_recovery(const char *reason);
   void run_blocker_recovery(double current);
@@ -253,14 +256,15 @@ class ExplorationController {
       std::optional<Point> viewpoint=std::nullopt,
       double planning_ms=0.);
   double cross_layer_minimum_travel() const;
+  const char *floor_stair_motion_wait(double current) const;
   bool try_floor_stair_probe(std::uint64_t version,double current,bool depart=false);
   bool try_stair_route(StairRoute kind,std::optional<XY> platform_floor=std::nullopt,
       PctFrontier *blocked=nullptr);
   bool skipping_start_floor() const;
   void dispatch_floor_stairs(bool can_send,
       const char *waiting_state="pct_waiting_for_stairs");
-  FrontierSelection select_exploration_target(std::optional<XY> platform, bool cross_layer,
-      std::function<bool()> measured_ascent={});
+  enum class FrontierMode { floor, cross_layer, floor_ascent };
+  FrontierSelection select_exploration_target(std::optional<XY> platform, FrontierMode mode);
   void run_pct_cycle(double current);
 
   void report(const std::string &state, const std::string &detail = "");
@@ -275,6 +279,7 @@ class ExplorationController {
   bool integrate_cloud(const sensor_msgs::msg::PointCloud2 &msg);
   void finish_if_complete();
   void publish_execution_result(const ExecutionResult &result);
+  void bind_scan_goal(std::int64_t stamp);
   std::optional<double> nearest_obstacle_distance(
       const XY &point, const std::vector<XY> &obstacles,
       double last_update) const;
@@ -283,6 +288,8 @@ class ExplorationController {
   void handle_scan_failure(std::int64_t stamp, const std::string &reason);
   Point cross_ground_pose() const;
   bool stable_four_foot_support(double current) const;
+  double refresh_stair_heading(double fallback);
+  std::optional<std::uint64_t> blocker_recovery_evidence(const BlockerRecovery &task);
   void finish_active_goal();
   void publish_marker(const std::optional<XY> &goal);
   void publish_pct_frontiers();
@@ -316,9 +323,14 @@ class ExplorationController {
   bool selected_stair_segment_=false;
   std::size_t contacting_feet_=0;
   std::optional<double> stable_foot_height_,foot_stable_since_,four_feet_stable_since_;
+  bool foot_support_stable_=false;
+  unsigned contacting_foot_mask_=0,foot_reference_mask_=0;
+  double foot_height_span_=0.;
+  std::array<Point,4> foot_reference_contacts_{};
   std::deque<double> foot_height_samples_;
-  double foot_sample_wall_=0.,foot_force_wall_=0.,foot_reference_height_=0.,foot_reference_yaw_=0.;
+  double foot_sample_wall_=0.,foot_force_wall_=0.,foot_reference_yaw_=0.;
   bool pct_markers_dirty_=false;
+  std::string height_review_status_="{}";
   std::set<std::pair<std::string,int>> pct_marker_keys_;
   int64_t foot_force_stamp_=0;
   std::string foot_sample_state_="no_contact_data";
@@ -326,7 +338,7 @@ class ExplorationController {
   const std::array<const char *,4> foot_frames_{"FL_foot","FR_foot","RL_foot","RR_foot"};
   std::array<Point,4> foot_contact_points_{};
   std::array<double,4> foot_forces_{};
-  bool pct_round_exhausted_=false;
+  bool pct_round_exhausted_=false, pct_stair_search_pending_=false;
   struct PctObservationProgress {
     std::uint64_t revision=0;
     std::vector<Point> observations;
