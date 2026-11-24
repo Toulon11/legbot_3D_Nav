@@ -9,6 +9,7 @@ rules out a route. Native A* still checks the slices, heights and gateway rules.
 Only touched 32x32 tiles are relabelled. Queries walk the small graph of tile
 components, not the full map, and no geometry snapshot is constructed.
 """
+import math
 import weakref
 import time
 import numpy as np
@@ -66,9 +67,18 @@ class ConnectivityIndex:
         self.masks[(tile,component)]=result
         return result
 
-    def update(self, changed):
-        b=self.map.settings.block_size
-        self.update_tiles({(int(x)//b,int(y)//b) for _,x,y in changed})
+    def update(self, changed, *, support_changed=()):
+        s=self.map.settings
+        b=s.block_size
+        tiles={(x//b,y//b) for _,x,y in changed}
+        if len(self.map.layers)>1:
+            reach=math.ceil((s.robot_radius+s.safety_margin)/s.resolution+.5)
+            for k,x,y in support_changed:
+                for bx in range((x-reach)//b,(x+reach)//b+1):
+                    for by in range((y-reach)//b,(y+reach)//b+1):
+                        if (k-1,bx,by) in self.map.blocks or (k+1,bx,by) in self.map.blocks:
+                            tiles.add((bx,by))
+        self.update_tiles(tiles)
 
     def update_tiles(self, candidates):
         began=time.monotonic()
@@ -79,12 +89,7 @@ class ConnectivityIndex:
             for k in range(m.first_layer,m.last_layer+1):
                 block=m.blocks.get((k,*tile))
                 if block is None:continue
-                known=np.isfinite(block['G'])&~block['solid']&~block['unknown']
-                safe=known&~block['hard']&(block['inflated_terrain_cost']>=0)&(block['inflated_terrain_cost']<=20)
-                if self.floor is not None:
-                    safe &= abs(block['G']-self.floor[0])<=self.floor[1]+1e-7
-                # A gateway's safe alias shares its XY and passes the same floor filter.
-                mask |= safe
+                mask |= m.traversable_block((k,*tile),block,self.floor)
             old=self.tiles.get(tile)
             if old is not None and np.array_equal(old!=0,mask):continue
             if old is None and not mask.any():continue

@@ -35,7 +35,20 @@ install(PROGRAMS tools/keypoint_recorder_ros2.py
   RENAME scan_keypoint_recorder)
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(scan_voxel_clearance_test test/test_voxel_clearance.cpp
+    algorithm/plan_env/src/grid_map.cpp algorithm/plan_env/src/raycast.cpp)
+  ament_target_dependencies(scan_voxel_clearance_test rclcpp std_msgs geometry_msgs nav_msgs
+    sensor_msgs visualization_msgs tf2 tf2_ros tf2_geometry_msgs message_filters cv_bridge
+    pcl_conversions pcl_ros legbot_runtime)
+  target_link_libraries(scan_voxel_clearance_test ${PCL_LIBRARIES} ${OpenCV_LIBRARIES})
+  target_compile_options(scan_voxel_clearance_test PRIVATE -UNDEBUG)
+  add_test(NAME scan_voxel_clearance COMMAND scan_voxel_clearance_test)
+  add_executable(scan_bounded_sampling_test test/test_bounded_sampling.cpp)
+  add_test(NAME scan_bounded_sampling COMMAND scan_bounded_sampling_test)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_test(NAME scan_first_trajectory_wait COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_plan_wait_ros.py $<TARGET_FILE:scan_go2_cmd_adapter>)
+  set_tests_properties(scan_first_trajectory_wait PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
   add_test(NAME scan_go2_terminal_control COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_go2_terminal_ros.py $<TARGET_FILE:scan_go2_cmd_adapter>)
   set_tests_properties(scan_go2_terminal_control PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
@@ -47,5 +60,9 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_near_goal_ros.py
     $<TARGET_FILE:scan_go2_cmd_adapter> $<TARGET_FILE:scan_planner_node>)
   set_tests_properties(scan_near_goal_arrival PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+  add_test(NAME scan_initialization_budget COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_near_goal_ros.py
+    $<TARGET_FILE:scan_go2_cmd_adapter> $<TARGET_FILE:scan_planner_node> --init-budget)
+  set_tests_properties(scan_initialization_budget PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
 endif()
 ament_package()

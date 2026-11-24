@@ -66,6 +66,7 @@ def setup(context):
                 'sensor_odom_topic': sensor_pose,
                 'cloud_topic': cloud,
                 'frame_id': 'map',
+                'mission_return_home': ParameterValue(LaunchConfiguration('mission_return_home'),value_type=bool),
                 'auxiliary_cloud_topic': ParameterValue('/ground_lidar/points_registered' if
                     LaunchConfiguration('enable_ground_lidar').perform(context) == 'true' else '', value_type=str),
                 # Standalone flat mode has no shared PCT map. Combined mode
@@ -95,6 +96,7 @@ def setup(context):
 def generate_launch_description():
     # 返回本启动文件的参数及启动动作。
     return LaunchDescription([
+        DeclareLaunchArgument('mission_return_home',default_value='false',choices=['true','false']),
         DeclareLaunchArgument('use_sim_time', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('observation_only', default_value='true', choices=['true', 'false']),
         DeclareLaunchArgument('start_waypoint_coordinator', default_value='true',

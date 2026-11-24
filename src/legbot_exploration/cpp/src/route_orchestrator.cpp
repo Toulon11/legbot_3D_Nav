@@ -126,8 +126,9 @@ std::vector<PlannerResult> plan_map_candidates(
         const auto version=shared.current_version.load();
         const double arrival_heading=goal.observation_yaw.value_or(
             std::atan2(target[1]-snapshot.base[1],target[0]-snapshot.base[0]));
-        const auto arrival=explicit_surface?
+        const auto arrival=explicit_surface?(goal.require_observation?
             shared.pct->arrival_area(version,target,goal.xy_tolerance.value_or(0.),arrival_heading):
+            shared.pct->observation_task(version,"navigation_arrival",0,target,arrival_heading,goal.xy_tolerance.value_or(0.))):
             PctObservation{};
         if(explicit_surface && !arrival.ready) {
           pct.reason=arrival.reason;
@@ -152,7 +153,7 @@ std::vector<PlannerResult> plan_map_candidates(
                 if(std::hypot(end[0]-(*i)[0],end[1]-(*i)[1])>1e-6) {from=*i;break;}
               }
               const double approach=std::atan2(end[1]-from[1],end[0]-from[0]);
-              if(std::abs(std::remainder(approach-arrival_heading,2*std::acos(-1.)))>.35) {
+              if(goal.require_observation && std::abs(std::remainder(approach-arrival_heading,2*std::acos(-1.)))>.35) {
                 const auto stop=shared.pct->arrival_area(version,end,goal.xy_tolerance.value_or(0.),approach);
                 arrival_metadata+=",\"arrival_approach_area\":"+stop.metadata;
                 if(!stop.ready) {
@@ -319,6 +320,7 @@ bool PathProcessor::load(const PlanningGoal &goal, const PlannerResult &result,
     // cell center. A single-point route still owns its final arrival below.
     const std::size_t first=1;
     std::vector<Point> endpoints,run;
+    std::optional<Point> join_anchor;
     for(std::size_t i=first;i<xyz_.size();++i) {
       run.push_back(xyz_[i]);
       bool stop=i+1==xyz_.size();
@@ -327,12 +329,18 @@ bool PathProcessor::load(const PlanningGoal &goal, const PlannerResult &result,
         const double ax=xyz_[i][0]-previous[0],ay=xyz_[i][1]-previous[1];
         const double bx=xyz_[i+1][0]-xyz_[i][0],by=xyz_[i+1][1]-xyz_[i][1];
         const double length=std::hypot(ax,ay)*std::hypot(bx,by);
-        stop=(length>1e-8 && (ax*bx+ay*by)<std::cos(std::acos(-1.)/4.)*length) ||
-             std::abs(xyz_[i][2]-previous[2])>.04 || std::abs(xyz_[i+1][2]-xyz_[i][2])>.04;
+        // Height changes alone are reference geometry, not stop requests.
+        // Keep genuine sharp turns (>75 degrees) as controlled-stop boundaries.
+        stop=length>1e-8 && (ax*bx+ay*by)<std::cos(5.*std::acos(-1.)/12.)*length;
       }
       if(stop) {
         endpoints.push_back(xyz_[i]);
+        // A stop can finish within its XY tolerance before reaching the exact
+        // corner. Retain that corner in the following reference so the new
+        // trajectory cannot shortcut from the actual stop to the next leg.
+        if(join_anchor)run.insert(run.begin(),*join_anchor);
         references_.push_back(run.size()>1?std::move(run):std::vector<Point>{});
+        join_anchor=xyz_[i];
         run.clear();
       }
     }

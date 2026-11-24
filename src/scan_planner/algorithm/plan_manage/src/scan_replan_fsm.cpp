@@ -1030,7 +1030,8 @@ namespace scan_planner
         need_hover_stop_ = false;
         replan_fail_count_ = 0;
         changeFSMExecState(WAIT_TARGET, "TERMINAL_PLAN_FAILURE");
-        publishGoalFailure("local_replan_exhausted");
+        publishGoalFailure(planner_manager_->initializationBudgetExhausted()?
+            "initialization_budget_exhausted":"local_replan_exhausted");
         return;
       }
       ROS_WARN("Replan failed %d times. Stop, keep the current target, and retry after %.2fs.",
@@ -1228,7 +1229,7 @@ namespace scan_planner
 
   bool SCANReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
   {
-
+    planner_manager_->clearInitializationStatus();
     if (!getLocalTarget())
       return false;
 
@@ -1242,6 +1243,7 @@ namespace scan_planner
       return false;
     }
 
+    planner_manager_->setGoalStamp(active_goal_stamp_ns_);
     bool plan_success =
         planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj);
     if (plan_success)

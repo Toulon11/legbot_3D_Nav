@@ -40,6 +40,9 @@ if(BUILD_TESTING)
   add_test(NAME go2_execution_idle COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_execution_idle_ros.py)
   set_tests_properties(go2_execution_idle PROPERTIES TIMEOUT 60)
+  add_test(NAME go2_startup_clock COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_startup_clock_ros.py)
+  set_tests_properties(go2_startup_clock PROPERTIES TIMEOUT 25)
   add_test(NAME lidar_near_filter COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_lidar_near_filter_ros.py
     $<TARGET_FILE:cloud_transform> $<TARGET_FILE:global_navigation_adapter>)

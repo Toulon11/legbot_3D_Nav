@@ -1,4 +1,4 @@
-"""Recognize ascending runs of real treads from the committed PCT surfaces."""
+"""Legacy offline stair-shape diagnostics; production uses SupportTargets."""
 from collections import defaultdict, deque, OrderedDict
 from dataclasses import dataclass
 from itertools import islice
@@ -16,54 +16,10 @@ def level_platform(settings, center, direction, supported, dimensions=None):
 
 
 def level_platform_cells(settings, center, direction, supported, dimensions=None):
-    """Check a bounded, four-connected patch and a continuous width/depth within it."""
-    s = settings
-    resolution = s.resolution
-    yaw = math.atan2(direction[1],direction[0])
-    octant = round(yaw/(math.pi/4))
-    dx,dy = round(math.cos(octant*math.pi/4)),round(math.sin(octant*math.pi/4))
-    pitch = resolution/math.hypot(dx,dy)
-    min_width,min_depth,min_area=dimensions or (s.landing_min_width,s.landing_min_depth,s.landing_min_area)
-    width = math.ceil(min_width/pitch-1e-7)
-    depth = math.ceil(min_depth/pitch-1e-7)
-    area = math.ceil(min_area/resolution**2-1e-7)
-    limit = math.ceil(max(min_width,min_depth,math.sqrt(min_area))
-                      /resolution)+math.ceil(.60/resolution)
-    if not supported(*center):
-        return None
-    seen = {center}
-    pending = [center]
-    rows = {}
-    connected = set()
-    while pending:
-        x,y = pending.pop()
-        rows.setdefault(x*dx+y*dy,set()).add(y*dx-x*dy)
-        connected.add((x,y))
-        for nx,ny in ((-1,0),(1,0),(0,-1),(0,1)):
-            next_xy = (x+nx,y+ny)
-            if next_xy in seen or max(abs(next_xy[0]-center[0]),abs(next_xy[1]-center[1]))>limit:
-                continue
-            seen.add(next_xy)
-            if supported(*next_xy):
-                pending.append(next_xy)
-    if len(connected)<area:
-        return None
-    # With diagonal axes, even rows have even columns and odd rows have
-    # odd columns. Intersect each parity separately before measuring width.
-    stride = 2 if dx and dy else 1
-    for first in sorted(rows):
-        shared = set()
-        for start in range(first,first+min(stride,depth)):
-            shared.update(rows.get(start,set()).intersection(
-                *(rows.get(row,()) for row in range(start+stride,first+depth,stride))))
-        run = 0
-        previous = None
-        for column in sorted(shared):
-            run = run+1 if previous is not None and column==previous+1 else 1
-            if run>=width:
-                return connected
-            previous = column
-    return None
+    from .pct_platform import platform_cells
+    cells=platform_cells(settings,center,supported,None if dimensions is None else dimensions[2])
+    area=settings.landing_min_area if dimensions is None else dimensions[2]
+    return cells if len(cells)*settings.resolution**2+1e-7>=area else None
 
 
 @dataclass(frozen=True)
@@ -286,7 +242,7 @@ class StairIndex:
                 # Keep pending geometric hints alongside the traversable index.
                 # This lets verified tread runs win before inspecting raw lips.
                 heights.update(r.height for r in mapping.columns.get(xy, {}).values()
-                               if r.orientation in (0,1))
+                               if r.orientation==1)
             heights=tuple(sorted(heights))
             if self.surfaces.get(xy, ()) == heights:
                 continue

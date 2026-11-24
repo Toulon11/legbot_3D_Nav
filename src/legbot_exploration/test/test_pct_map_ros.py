@@ -21,7 +21,9 @@ with tempfile.TemporaryFile(mode='w+') as log:
     node.create_subscription(PointCloud2,'/exploration/layers/planning_surfaces',surfaces.append,qos)
     node.create_subscription(PointCloud2,'/exploration/layers/measured_returns',returns.append,qos)
     cloud=node.create_publisher(PointCloud2,'/slam/global_cloud_registered',10)
-    points=[(i*.1,j*.1,0.) for i in range(-15,16) for j in range(-15,16)]
+    # Offline import supplies finite room bounds. A lone ground return no
+    # longer establishes infinite, unobserved clearance.
+    points=[(i*.1,j*.1,z) for i in range(-15,16) for j in range(-15,16) for z in (0.,1.5)]
     try:
         deadline=time.monotonic()+15;next_send=0
         while time.monotonic()<deadline:
@@ -34,8 +36,9 @@ with tempfile.TemporaryFile(mode='w+') as log:
         assert states and states[-1]['pct_ready'],states[-1:]
         assert states[-1]['inspection_valid'],states[-1]
         assert states[-1]['pct_map']['safe_cells']>0,states[-1]
-        assert surfaces[-1].point_step==56 and returns[-1].point_step==16
-        assert {'source','flags','cost','ceiling_z'}<={f.name for f in surfaces[-1].fields}
+        assert surfaces[-1].point_step==64 and returns[-1].point_step==16
+        assert {'source','flags','cost','ceiling_z','node_z','C_clear'}<={f.name for f in surfaces[-1].fields}
+        assert states[-1]['pct_map']['mapping_mechanism']=='xy_passage_intervals'
         assert not node.get_publishers_info_by_topic('/scan/waypoint_input')
         assert not node.get_publishers_info_by_topic('/scan/waypoint_request')
         assert not node.get_publishers_info_by_topic('/cmd_vel')

@@ -9,13 +9,21 @@ from legbot_exploration.fixed_layer_map import FixedLayerMap,MapSettings
 from legbot_exploration.pct_frontier_index import rebuild_frontiers
 
 
+def open_settings(**settings):
+    # Scheduling/index fixtures use exposed ground. Indoor interval policy
+    # and endpoint exclusion have their own explicit room fixtures.
+    defaults=dict(allow_open_ceiling=True,origin_z=.5)
+    defaults.update(settings)
+    return MapSettings(**defaults)
+
+
 def floor(heights=(0.,),hole=(),bound=10):
     return np.asarray([(x*.1,y*.1,h) for x in range(-bound,bound+1)
                        for y in range(-bound,bound+1) for h in heights if (x,y) not in hole],dtype='float32')
 
 
 def create(points,num=1):
-    m=FixedLayerMap(MapSettings(robot_radius=0.,safety_margin=0.,maturity_min_points=num))
+    m=FixedLayerMap(open_settings(robot_radius=0.,safety_margin=0.,maturity_min_points=num))
     m.integrate(np.repeat(points,num,axis=0));m.build()
     return m
 
@@ -69,17 +77,17 @@ class FrontierIndexTest(unittest.TestCase):
         self.assertTrue(any(any(k[1:3]==(0,0) for k in index.floor_query_members[c['id']])
                             for c in result['clusters']))
 
-    def test_same_column_ground_incrementally_closes_the_tread_stripe_on_all_slices(self):
+    def test_known_ground_closes_the_stripe_independent_of_neighbor_height(self):
         height=1.425
         stripe={(x,0) for x in range(-9,10)}
         points=floor((height,),hole=stripe,bound=10).tolist()
         # Local high returns retain multiple cuts over the measured tread.
-        points.append((-.9,-.2,2.8))
+        points.append((-.9,-.1,2.8))
         results=[]
         for native in (False,True):
             with self.subTest(native=native):
-                m=FixedLayerMap(MapSettings(robot_radius=0.,safety_margin=0.,maturity_min_points=1,
-                                            step_max=.12),native_updates=native)
+                m=FixedLayerMap(open_settings(robot_radius=0.,safety_margin=0.,maturity_min_points=1,
+                                            step_max=.11),native_updates=native)
                 if native:self.assertIsNotNone(m._boundary_kernel)
                 m.integrate(points);m.build()
                 index=m.frontier_index
@@ -90,86 +98,60 @@ class FrontierIndexTest(unittest.TestCase):
                 near=[(x*.1,0.,height-(.16 if x==-9 else .110)) for x in range(-9,9)]
                 with patch.object(m,'iter_cells',side_effect=AssertionError('whole-map scan')):
                     m.integrate(near+[(.9,0.,height-.161)]);m.build()
-                for xy in stripe-{(9,0)}:
-                    self.assertFalse(before[xy] & index.nodes.keys(),str(xy))
-                self.assertTrue(before[(9,0)] <= index.nodes.keys())
+                first_cut=m.surface_observation.first_ground_slice(height)
+                for xy in stripe:
+                    self.assertFalse(any(key[0]==first_cut for key in index.by_column.get(xy,())),str(xy))
                 self.assertTrue(index.nodes)
                 self.assert_full_equal(m)
                 results.append(dict(index.nodes))
         self.assertEqual(len(results),2)
         self.assertEqual(*results)
 
-    def test_tread_boundary_suppresses_nearby_ordinary_frontier_overlapping_sheets(self):
+    def test_unstored_cut_reuses_a_measured_interval_without_allocating_a_cell(self):
+        m=create(np.asarray([(0.,0.,z) for z in (1.45,2.82)]))
+        # Leave the observed interval in storage, with no resident row at 2 m.
+        m.blocks.pop((4,0,0))
+        m.layers[4].blocks.pop((0,0))
+        evidence=m.surface_observation
+        row=m.observed_cell((4,0,0))
+        self.assertAlmostEqual(row['G'],1.45,places=5)
+        self.assertAlmostEqual(row['C'],2.82,places=5)
+        self.assertTrue(evidence.frontier_settled((0,0),1.45,layer=4))
+        self.assertTrue(evidence.frontier_settled((0,0),1.25,layer=4))
+        self.assertFalse(evidence.has_frontier_ground((0,0),1.25,layer=4))
+        self.assertIsNone(m.cell((4,0,0)))
+        self.assertIsNotNone(m.observed_cell((7,0,0)))
+        self.assertTrue(evidence.frontier_settled((0,0),3.1,layer=7))
+        self.assertFalse(evidence.has_frontier_ground((0,0),3.1,layer=7))
+
+    def test_overlapping_sheets_do_not_make_known_cells_ordinary_frontiers(self):
         points=[(x*.1,y*.1,.915 if y>=0 else 1.025)
                 for x in range(-3,4) for y in range(-3,4)]
         points.extend((x*.1,y*.1,.915) for x in range(-3,4) for y in range(-3,0))
         m=create(points)
-        self.assertFalse(m.frontier_index.by_column.get((0,0)))
+        self.assertNotIn((0,0),m.frontier_index.by_column)
         self.assertTrue(m.surface_observation.matching((0,-1),.915))
         self.assertTrue(m.surface_observation.matching((0,-1),1.025))
+        self.assertFalse(m.surface_observation.has_frontier_ground((0,0),1.025,layer=2))
         self.assert_full_equal(m)
 
-    def test_first_floor_entry_treats_old_ground_as_unknown_until_its_source_is_reobserved(self):
+    def test_floor_entry_keeps_known_geometry_but_explicit_target_stays_unconfirmed(self):
         for native in (False,True):
             with self.subTest(native=native):
-                m=FixedLayerMap(MapSettings(maturity_min_points=1),native_updates=native)
-                if native:self.assertIsNotNone(m._boundary_kernel)
-                evidence=m.surface_observation
-                high=2.95
-                old={(0,0):2.82,(2,0):2.93}
-                plane=[(x*.1,y*.1,high) for x in range(-3,4) for y in range(-3,4)
-                       if (x,y) not in old]
-                self.assertTrue(evidence.enter_frontier_floor((0.,0.,1.45),.08))
-                evidence.visit_height((0.,0.,1.45))
-                m.integrate([(x*.1,0,ground) for (x,_),z in old.items() for ground in (1.45,z)]);m.build()
-                evidence.begin_crossing()
-                cutoff=m.integrated_serial
-                m.integrate(plane);m.build()
-                index=m.frontier_index
-                def members(xy):
-                    return {key for key in index.by_column.get(xy,())
-                            if abs(index.nodes[key].height-high)<1e-5}
-
-                self.assertFalse(members((0,0)))
-                self.assertFalse(members((2,0)))
-                target=(0.,0.,high)
-                inferred=evidence.expect(target,review=True,neighbor_inferred=True)
-                view=evidence.expect((.1,.4,high),kind='frontier')
-                blocker=evidence.expect(target,review=True)
-                stair=evidence.expect((.1,.4,high+.2),kind='search',height_range=(high+.1,high+.3))
+                m=FixedLayerMap(open_settings(maturity_min_points=1),native_updates=native)
+                m.integrate([(x*.1,y*.1,2.95) for x in range(-3,4) for y in range(-3,4)
+                             if (x,y)!=(0,0)]+[(0.,0.,1.45),(0.,0.,2.82)])
+                m.build();evidence=m.surface_observation
+                self.assertNotIn((0,0),m.frontier_index.by_column)
+                self.assertTrue(evidence.frontier_settled((0,0),2.95,layer=5))
+                self.assertFalse(evidence.has_frontier_ground((0,0),2.95,layer=5))
+                blocker=evidence.expect((0.,0.,2.95),review=True)
                 with patch.object(m,'iter_cells',side_effect=AssertionError('whole-map scan')):
-                    self.assertTrue(evidence.enter_frontier_floor((-.1,0.,high),.08))
-                    m.build()
-                self.assertEqual(evidence.floor_ground_band(high).cutoff,cutoff)
-                self.assertEqual(set(evidence.records),{blocker.id,stair.id})
-                self.assertEqual(evidence.by_column[(0,0)],[blocker.id])
-                self.assertNotIn(view.id,evidence.by_column[(1,4)])
-                self.assertNotIn(inferred.id,{identity for tile in evidence.pending_tiles.values() for identity in tile})
-                self.assertEqual(evidence.visit_height((-.1,0.,high))['registered_targets'],0)
-                self.assertTrue(members((0,0)))
-                self.assertTrue(members((2,0)),'the 5 cm matching path must also honor the frame cutoff')
-                key=next(iter(members((0,0))))
-                model=index.observation_model
-                model.task=dict(keys=[key],heights=[high])
-                self.assertTrue(model.arm((-.1,0.,high),0.))
-                self.assertEqual(set(evidence.records),{blocker.id,stair.id})
-                self.assertFalse(model.progress()['ready'])
-                m.integrate([(0.,0.,1.45)]);m.build()
-                self.assertTrue(members((0,0)))
-                self.assertFalse(model.progress()['ready'])
-                version=m.revision
-                m.integrate([(0.,0.,2.82)]);m.build()
-                self.assertGreater(m.revision,version,'a new hit restores even a frozen raw G')
-                self.assertFalse(members((0,0)))
-                self.assertTrue(model.progress()['ready'])
-                self.assertTrue(members((2,0)))
-                m.integrate([(0.,0.,high),(0.2,0.,2.93)]);m.build()
-                self.assertFalse(members((0,0)))
-                self.assertTrue(model.progress()['ready'])
-                self.assertFalse(members((2,0)),'a new hit restores even a frozen raw G')
-                evidence.begin_crossing()
-                self.assertFalse(evidence.enter_frontier_floor((-.1,0.,high),.08))
-                self.assertEqual(evidence.floor_ground_band(high).cutoff,cutoff)
+                    self.assertTrue(evidence.enter_frontier_floor((-.1,0.,2.95),.08));m.build()
+                self.assertEqual(blocker.state,'pending')
+                self.assertNotIn((0,0),m.frontier_index.by_column)
+                m.integrate([(0.,0.,2.95)]);m.build()
+                self.assertTrue(evidence.has_frontier_ground((0,0),2.95,layer=5))
                 self.assert_full_equal(m)
 
     def assert_full_equal(self,m):
@@ -216,12 +198,15 @@ class FrontierIndexTest(unittest.TestCase):
         m=create(floor((0.,1.5),hole={(0,0)}),num=3)
         heights={m.frontier_index.nodes[k].height for k in m.frontier_index.by_column[(0,0)]}
         self.assertEqual(heights,{0.,1.5})
-        m.integrate(np.asarray([[0,0,0.]]*3,dtype='float32'));m.build()
-        heights={m.frontier_index.nodes[k].height for k in m.frontier_index.by_column[(0,0)]}
-        self.assertEqual(heights,{1.5})
+        m.integrate(np.asarray([[0,0,0.]]*3,dtype='float32'))
+        with patch('legbot_exploration.surface_orientation.classify',return_value=np.full(3,-1)):
+            m.integrate([[0.,0.,1.49]]*3,sensor_origin=(0.,0.,.8))
+        m.build()
+        self.assertNotIn((0,0),m.frontier_index.by_column)
+        self.assertAlmostEqual(m.observed_cell((3,0,0))['G'],1.49,places=5)
         self.assert_full_equal(m)
 
-    def test_mature_underside_does_not_resolve_the_unknown_tread(self):
+    def test_known_lower_tread_retires_ordinary_frontier_but_not_an_upper_scan(self):
         # Captured building geometry: underside and top differ by 14.3 cm,
         # within step ability but outside the 5 cm surface noise tolerance.
         top=1.4608803;bottom=1.3181558
@@ -234,47 +219,42 @@ class FrontierIndexTest(unittest.TestCase):
                        return_value=np.full(3,orientation)):
                 m.integrate([[0,0,bottom]]*3,sensor_origin=(0.,-.6,1.7))
             m.build()
-        after={key for key in index.by_column[(0,0)] if abs(index.nodes[key].height-top)<1e-6}
-        self.assertEqual(before,after)
+        self.assertNotIn((0,0),index.by_column)
+        self.assertFalse(m.surface_observation.has_frontier_ground((0,0),top,layer=m.surface_observation.first_ground_slice(top)))
         self.assert_full_equal(m)
         m.integrate(np.asarray([[0,0,top]],dtype='float32'));m.build()
         self.assertFalse(before & index.nodes.keys())
         self.assert_full_equal(m)
 
-    def test_distinct_heights_in_one_cut_have_independent_frontiers(self):
-        # Opposite sides of a gap have different surfaces in the SAME 0.5m cut.
-        # No column-wise maximum may erase the lower side's unknown frontier.
+    def test_different_neighbor_heights_seed_one_member_per_cut_xy(self):
         points=np.array([[x*.1,y*.1,.1 if x<0 else .3]
                          for x in range(-4,5) for y in range(-4,5) if x],dtype='float32')
         m=create(points,num=3);index=m.frontier_index
-        keys={key for key in index.by_column[(0,0)] if key[0]==1}
-        self.assertEqual(len(keys),2)
-        self.assertEqual({round(index.nodes[key].height,2) for key in keys},{.1,.3})
-        low=next(key for key in keys if index.nodes[key].height<.2)
-        high=next(key for key in keys if index.nodes[key].height>.2)
-        self.assertNotEqual(index.membership[low],index.membership[high])
+        cut=m.surface_observation.first_ground_slice(.1)
+        keys={key for key in index.by_column[(0,0)] if key[0]==cut}
+        self.assertEqual(len(keys),1)
+        self.assertAlmostEqual(index.nodes[next(iter(keys))].height,.2,places=5)
         m.integrate(np.asarray([[0,0,.1]]*3,dtype='float32'));m.build()
-        self.assertNotIn(low,index.nodes)
-        self.assertIn(high,index.nodes)
+        self.assertFalse(keys & index.nodes.keys())
         self.assert_full_equal(m)
 
-    def test_close_parallel_frontiers_do_not_merge_by_step_ability(self):
-        # Separate observed strips at different elevations seed parallel tasks;
-        # their 14cm separation is walkable as a step but is not sheet identity.
+    def test_close_neighbor_heights_use_eight_connected_members(self):
         points=np.asarray([[x*.1,y*.1,.1 if x<0 else .24]
                            for x in range(-4,5) for y in range(-4,5) if x],dtype='float32')
         m=create(points);index=m.frontier_index
-        keys={key for key in index.by_column[(0,0)] if key[0]==1}
-        self.assertEqual(len(keys),2)
-        self.assertEqual(len({index.membership[key] for key in keys}),2)
+        cut=m.surface_observation.first_ground_slice(.1)
+        keys={key for key in index.by_column[(0,0)] if key[0]==cut}
+        self.assertEqual(len(keys),1)
+        self.assertAlmostEqual(index.nodes[next(iter(keys))].height,.17,places=5)
         self.assert_full_equal(m)
 
-    def test_one_measured_ground_can_cover_two_ordinary_frontiers(self):
+    def test_actual_ground_closes_the_single_unknown_member(self):
         points=np.asarray([[x*.1,y*.1,.1 if x<0 else .18]
                            for x in range(-3,4) for y in range(-3,4) if x],dtype='float32')
         m=create(points);index=m.frontier_index
-        before={key for key in index.by_column[(0,0)] if key[0]==1}
-        self.assertEqual(len(before),2)
+        cut=m.surface_observation.first_ground_slice(.1)
+        before={key for key in index.by_column[(0,0)] if key[0]==cut}
+        self.assertEqual(len(before),1)
         m.integrate(np.asarray([[0,0,.14]],dtype='float32'));m.build()
         self.assertFalse(before & index.nodes.keys())
         self.assert_full_equal(m)
@@ -291,7 +271,7 @@ class FrontierIndexTest(unittest.TestCase):
 
     def test_unselected_physical_surface_is_not_lost_between_cuts(self):
         # A coarse diagnostic slice spacing need not expose every surface as G.
-        m=FixedLayerMap(MapSettings(slice_dh=2.,robot_radius=0.,safety_margin=0.,maturity_min_points=1))
+        m=FixedLayerMap(open_settings(slice_dh=2.,robot_radius=0.,safety_margin=0.,maturity_min_points=1))
         m.integrate(floor((.1,.8),hole={(0,0)},bound=3));m.build()
         heights={round(m.frontier_index.nodes[key].height,2)
                  for key in m.frontier_index.by_column[(0,0)]}
@@ -391,7 +371,7 @@ class FrontierIndexTest(unittest.TestCase):
             entry=next(c for c in first['clusters'] if c['id']==cid)
             index.settle_floor_attempt(index.begin_floor_attempt(cid),True,
                                       failure_reason=entry.get('floor_failure'))
-        gap_id=index.task_id(next(key for key in index.by_column[gap] if index.nodes[key].height<.08))
+        gap_id=next(c['id'] for c in first['clusters'] if tuple(c['cell'])==gap and c['frontier'][2]<.08)
         self.assertTrue(any(c['id']==gap_id and c['floor_failure']=='floor_missing_connection'
                             for c in first['clusters']))
         with patch.object(index,'_observers',return_value=[]) as before:
@@ -409,20 +389,21 @@ class FrontierIndexTest(unittest.TestCase):
                     index.settle_floor_attempt(index.begin_floor_attempt(cid),True)
         self.assertTrue(result['reviewing'])
         self.assertTrue(any(key[1:3]==gap for call in observers.call_args_list for key in call.args[0]))
-        cid=index.task_id(next(key for key in index.by_column[gap] if index.nodes[key].height<.08))
+        cid=next(c['id'] for c in result['clusters'] if tuple(c['cell'])==gap and c['frontier'][2]<.08)
         self.assertTrue(index.begin_floor_attempt(cid).review)
         self.assertFalse(index._disconnected_on_floor(band,next(iter(index.by_column[gap]))))
 
-    def test_tiny_clusters_get_two_attempts_and_local_queries_cannot_start_review(self):
+    def test_tiny_clusters_with_minimum_one_get_two_attempts_and_no_local_review(self):
         holes={(0,0),(5,0),(6,0)}
         wall=np.asarray([(x*.1,y*.1,.3) for x in range(-16,17) for y in range(-16,17)
                          if abs(x)==16 or abs(y)==16],dtype='float32')
         m=create(np.vstack((floor(hole=holes,bound=15),wall)));index=m.frontier_index
+        m.settings=replace(m.settings,fast_min_visible_cells=1)
         base,band=(0.,0.,0.),(0.,.08)
         with patch.object(index,'_observers',return_value=[]) as observers:
             first=index.query(base,floor=band,fast=True)
         self.assertEqual(sorted(c['cells'] for c in first['clusters']),[1,2])
-        self.assertEqual(sorted(call.kwargs['minimum_gain'] for call in observers.call_args_list),[1,2])
+        self.assertEqual(sorted(call.kwargs['minimum_gain'] for call in observers.call_args_list),[1,1])
         for cid in first['no_view_clusters']:
             self.assertEqual(index.settle_floor_attempt(index.begin_floor_attempt(cid),True),'first_no_progress')
         local=index.query(base,window_size=(.8,.2,.2),floor=band,fast=True)
@@ -445,7 +426,7 @@ class FrontierIndexTest(unittest.TestCase):
         wall=[(x*.1,y*.1,.3) for x in range(-16,17) for y in range(-16,17)
               if abs(x)==16 or abs(y)==16]
         m=create(np.vstack((floor(hole=holes,bound=15),wall)))
-        m.settings=replace(m.settings,floor_failed_small_cluster_max_cells=2)
+        m.settings=replace(m.settings,floor_failed_small_cluster_max_cells=2,fast_min_visible_cells=1)
         index=m.frontier_index
         base,band=(0.,-.5,0.),(0.,.08)
         with patch.object(index,'_observers',return_value=[]) as observers:
@@ -487,6 +468,7 @@ class FrontierIndexTest(unittest.TestCase):
         m.columns[(3,0)]=wall
         for z in np.arange(.05,.56,.05):
             wall.add(float(z),.05,1,1,orientation=-2)
+        wall.remember_obstacles([r.height for r in wall.values()],m.settings.minimum_clearance)
         self.assertTrue(m.surface_relations.measured_floor_barrier((3,0),0.,0))
         self.assertFalse(m.surface_relations.measured_floor_barrier((3,0),0.,1))
 
@@ -501,7 +483,8 @@ class FrontierIndexTest(unittest.TestCase):
                 connectivity,'known_barrier',side_effect=lambda start,stations,deadline:
                 bool(stations) and all(x>=45 for x,y in stations)):
             first=index.query(base,floor=band,prune_disconnected=True,review_remaining=8.)
-        row=next(c for c in first['clusters'] if c['id']==cid)
+        row=next(c for c in first['clusters'] if c['cell']==[70,0] and c['frontier'][2]<.08)
+        cid=row['id']
         self.assertEqual(row['floor_failure'],'floor_known_barrier')
         self.assertEqual(index.settle_floor_attempt(index.begin_floor_attempt(cid),True,
             failure_reason=row['floor_failure']),'blacklisted')
@@ -573,6 +556,22 @@ class FrontierIndexTest(unittest.TestCase):
         self.assertEqual(final['no_view_clusters'],[cluster['id']])
         self.assertEqual(final['clusters'][0]['floor_failure'],'floor_no_route')
 
+    def test_direction_representative_skips_unsafe_parking_in_same_quadrant(self):
+        m=create(floor(hole={(0,0)},bound=12));m.settings=replace(m.settings,floor_four_direction_search=True)
+        index=m.frontier_index;cache=index.observer_cache
+        data=np.asarray([(-.4,-.4,0.,1.,1.,1.),(-.7,-.7,0.,1.,2.,1.)])
+        tested=[]
+        def found(body,*args,**kwargs):
+            tested.append(body[:2]);return dict(views={body:dict(gain=1,yaw=0.)},rays={},unknown_blockers=[])
+        engine=index.observation_model.pose_search
+        with (patch.object(cache,'candidates',return_value=data),
+              patch.object(engine,'_arrival_area',side_effect=lambda body,*a:dict(ready=body[0]<-.5)),
+              patch.object(index.observation_model,'_visibility_view',return_value=dict(gain=1))):
+            result=index.query((0.,0.,0.),floor=(0.,.08),window_size=(1.,1.,1.),
+                floor_selection=(found,lambda *a:(.5,.5,0),.15,2.,4.,.4))
+        self.assertEqual(tested,[(-.7,-.7)])
+        self.assertTrue(result['clusters'])
+
     def test_new_local_ground_reopens_a_failed_frontier_but_distant_updates_do_not(self):
         m=create(floor(hole={(0,0),(6,0)},bound=12))
         index=m.frontier_index;band=(0.,.08)
@@ -594,6 +593,43 @@ class FrontierIndexTest(unittest.TestCase):
         self.assertTrue(index.floor_work_available(band))
         self.assertGreater(index.floor_reopened,0)
 
+    def test_known_ground_becoming_safe_again_does_not_reset_failed_tasks(self):
+        m=create(floor(hole={(0,0)},bound=12));index=m.frontier_index;band=(0.,.08)
+        with patch.object(index,'_observers',return_value=[]):
+            for _ in range(2):
+                result=index.query((0.,-.5,0.),floor=band)
+                for cid in result['no_view_clusters']:
+                    index.settle_floor_attempt(index.begin_floor_attempt(cid),True,
+                                               failure_reason='floor_no_observation')
+        keys=set(index.by_column[(0,0)])
+        self.assertTrue(all(index._floor_records(index.floor_blacklist,band,key) for key in keys))
+        rows=[(row,row.copy()) for _,row in m.layers_at(8,8)]
+        for row,_ in rows:row['inflated_terrain_cost']=50.
+        index.update({(8,8)})
+        for row,original in rows:
+            for name in row.dtype.names:row[name]=original[name]
+        index.update({(8,8)})
+        self.assertTrue(all(index._floor_records(index.floor_blacklist,band,key) for key in keys))
+        self.assertEqual(index.floor_reopened,0)
+
+    def test_all_checked_directions_occluded_by_known_surfaces_retire_without_second_round(self):
+        m=create(floor(hole={(0,0)},bound=15));m.settings=replace(m.settings,floor_four_direction_search=True)
+        index=m.frontier_index;cache=index.observer_cache;band=(0.,.08)
+        key=next(iter(index.by_column[(0,0)]));cid=index.task_id(key)
+        candidates=np.asarray([(x,y,0.,1.,0.,1.) for x,y in ((-.9,-.9),(-.9,.9),(.9,-.9),(.9,.9))])
+        def occluded(*args,**kwargs):
+            return dict(views={},rays={},unknown_blockers=[],rejections={'lidar_occluded':1})
+        limits=(occluded,lambda *args:(.55,.85,0),.15,1.5,1.,.2)
+        with patch.object(cache,'candidates',return_value=candidates),patch.object(
+                index.observation_model,'_visibility_view',return_value=dict(gain=1)):
+            result=index.query((0.,0.,0.),floor=band,floor_selection=limits,review_remaining=8.)
+        row=next(c for c in result['clusters'] if c['id']==cid)
+        self.assertEqual(row['floor_failure'],'floor_known_barrier')
+        self.assertEqual(index.settle_floor_attempt(index.begin_floor_attempt(row['id']),True,
+            failure_reason=row['floor_failure']),'blacklisted')
+        self.assertTrue(index._disconnected_on_floor(band,key))
+        self.assertIn(key,index.nodes)
+
     def test_direction_representative_prefers_observed_room_over_a_cheaper_edge(self):
         m=create(floor(hole={(0,0)},bound=12))
         m.settings=replace(m.settings,floor_four_direction_search=True)
@@ -607,6 +643,20 @@ class FrontierIndexTest(unittest.TestCase):
               patch.object(index.observation_model,'_visibility_view',return_value=dict(gain=1))):
             index.query((0.,0.,0.),floor=(0.,.08),window_size=(1.,.2,.2),floor_selection=options)
         self.assertEqual(tested,[(.7,.7)])
+
+    def test_direction_representative_leaves_room_for_lidar_blind_range(self):
+        m=create(floor(hole={(0,0)},bound=15));m.settings=replace(m.settings,floor_four_direction_search=True)
+        index=m.frontier_index;cache=index.observer_cache;tested=[]
+        candidates=np.asarray([(.7,.7,0.,.99,0.,1.),(.9,.9,0.,1.27,5.,1.)])
+        def observe(body,*args,**kwargs):
+            tested.append(tuple(body[:2]))
+            return dict(views={body:dict(gain=1,yaw=0.)},rays={},unknown_blockers=[])
+        limits=(observe,lambda *args:(.55,.85,0),.15,1.5,1.,.2)
+        with patch.object(cache,'candidates',return_value=candidates),patch.object(
+                index.observation_model,'_visibility_view',return_value=dict(gain=1)):
+            index.query((0.,0.,0.),floor=(0.,.08),floor_selection=limits)
+        self.assertTrue(tested)
+        self.assertTrue(all(point==(.9,.9) for point in tested),tested)
 
     def test_four_direction_fallback_timeout_accumulates_across_batches(self):
         m=create(floor(hole={(0,0)},bound=10))
@@ -638,7 +688,9 @@ class FrontierIndexTest(unittest.TestCase):
         m=create(np.vstack((floor(hole=holes,bound=15),wall)));index=m.frontier_index
         base,band=(0.,0.,0.),(0.,.08)
         with patch.object(index,'_observers',return_value=[]):
-            first=index.query(base,window_size=(.8,.2,.2),floor=band)
+            # A global first-pass failure survives splitting/rekeying. A
+            # local-only failure must now leave global first pass available.
+            first=index.query(base,floor=band)
         self.assertEqual(len(first['no_view_clusters']),1)
         cid=first['no_view_clusters'][0]
         self.assertEqual(index.settle_floor_attempt(index.begin_floor_attempt(cid),True),'first_no_progress')
@@ -673,18 +725,20 @@ class FrontierIndexTest(unittest.TestCase):
             self.assertFalse(index.query(base,floor=band)['clusters'])
 
     def test_platform_handoff_keeps_physical_failure_history_and_other_heights_separate(self):
-        wall=np.asarray([(x*.1,y*.1,.3) for x in range(-16,17) for y in range(-16,17)
-                         if abs(x)==16 or abs(y)==16],dtype='float32')
+        wall=np.asarray([(x*.1,y*.1,z) for x in range(-16,17) for y in range(-16,17)
+                         for z in (.3,1.5) if abs(x)==16 or abs(y)==16],dtype='float32')
         mapping=create(np.vstack((floor((0.,1.5),hole={(0,0)},bound=15),wall)))
         index=mapping.frontier_index
         key=next(k for k in index.by_column[(0,0)] if index.nodes[k].height<.08)
         cid=index.task_id(key)
         with patch.object(index,'_observers',return_value=[]):
-            index.query((-.5,0.,0.),floor=(0.,.05),continuation=(0.,-.02,.1),
+            cross=index.query((-.5,0.,0.),floor=(0.,.05),continuation=(0.,-.02,.1),
                         attempt_scope=('cross_layer',(0.,.08)),max_attempts=4)
+            cid=next(c['id'] for c in cross['clusters'] if c['cell']==[0,0] and c['frontier'][2]<.08)
             self.assertEqual(index.settle_floor_attempt(index.begin_floor_attempt(cid),True),'first_no_progress')
             platform=index.query((-.5,0.,0.),floor=(0.,.05))
             self.assertTrue(platform['reviewing'])
+            cid=next(c['id'] for c in platform['clusters'] if c['cell']==[0,0] and c['frontier'][2]<.08)
             attempt=index.begin_floor_attempt(cid)
             self.assertEqual(attempt.failures,1)
             self.assertEqual(index.settle_floor_attempt(attempt,True),'blacklisted')
@@ -804,8 +858,8 @@ class FrontierIndexTest(unittest.TestCase):
         self.assertTrue(all(np.linalg.norm(np.asarray(p)-chosen)>.25 for p in found['observations']))
 
     def test_equivalent_cuts_keep_distinct_costs(self):
-        m=create(floor(hole={(0,0)}));index=m.frontier_index
-        layers=sorted(k for k,_ in m.layers_at(1,0) if np.isfinite(m.cell((k,1,0))['G']))
+        m=create(floor((0.,1.5),hole={(0,0)}));index=m.frontier_index
+        layers=sorted(k for k,row in m.layers_at(1,0) if abs(row['G'])<1e-7)
         self.assertGreater(len(layers),1)
         m.cell((layers[-1],1,0))['inflated_terrain_cost']=19.
         index.update({(1,0)})
@@ -907,16 +961,16 @@ class FrontierIndexTest(unittest.TestCase):
 
     def test_bridge_at_tile_boundary_splits_and_merges_in_each_cut(self):
         # Construct the hole in world cell coordinates across x=32.
-        points=np.asarray([(x*.1,y*.1,0.) for x in range(20,45) for y in range(-8,9)
-                           if not (28<=x<=36 and y==0)],dtype='float32')
+        points=np.asarray([(x*.1,y*.1,z) for x in range(20,45) for y in range(-8,9)
+                           if not (28<=x<=36 and y==0) for z in (0.,1.5)],dtype='float32')
         m=create(points);index=m.frontier_index
         hole={(x,0) for x in range(28,37)}
         self.assert_slice_clusters(index,hole,1)
-        keys={key for xy in hole for key in index.by_column.get(xy,())}
+        keys={key for xy in hole for key in index.by_column.get(xy,()) if index.nodes[key].height<.05}
         self.assertGreater(len(keys),len(hole))
-        self.assertEqual(len({index.task_id(key) for key in keys}),1)
+        self.assertEqual(len({index.task_id(key) for key in keys}),len({key[0] for key in keys}))
         self.assertEqual(len(index.physical_targets(keys)),len(hole))
-        m.integrate(np.asarray([[3.2,0.,0.]],dtype='float32'));m.build()
+        m.integrate(np.asarray([[3.2,0.,0.],[3.2,0.,1.5]],dtype='float32'));m.build()
         self.assert_slice_clusters(index,hole,2);self.assert_full_equal(m)
         for _,row in m.layers_at(32,0):row['G']=np.nan
         del m.columns[(32,0)];index.update({(32,0)})
@@ -943,7 +997,7 @@ class FrontierIndexTest(unittest.TestCase):
 
     def test_local_growth_relabels_only_tiles_not_a_large_component(self):
         m=create(floor(bound=50));index=m.frontier_index
-        m.integrate(np.asarray([[5.1,0.,0.]],dtype='float32'));m.build()
+        m.integrate(np.asarray([[5.1,y,0.] for y in (-.1,0.,.1)],dtype='float32'));m.build()
         self.assertGreater(index.last_work['topology_changed_layers'],0)
         self.assertLess(index.last_work['reclustered_layers'],len(index.nodes)//2)
         self.assertLess(index.last_work['checked_columns'],30)

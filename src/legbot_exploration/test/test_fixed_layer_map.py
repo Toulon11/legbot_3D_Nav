@@ -13,64 +13,43 @@ def floor_grid(bound=1.,height=0.,hole=()):
                        for j in range(-round(bound*10),round(bound*10)+1) if (i,j) not in hole],dtype='float32')
 
 
+def open_settings(**settings):
+    # Cost/fusion fixtures model exposed surfaces. Keep cuts off the measured
+    # endpoints; strict indoor bounds are covered by test_slice_intervals.
+    defaults=dict(allow_open_ceiling=True,origin_z=1e-5)
+    defaults.update(settings)
+    return MapSettings(**defaults)
+
+
 def mapping(**settings):
     defaults=dict(maturity_min_points=1,robot_radius=.15,relief_update_threshold=0.,
                   terrain_update_threshold=0.,inflation_update_threshold=0.)
     defaults.update(settings)
-    return FixedLayerMap(MapSettings(**defaults))
+    return FixedLayerMap(open_settings(**defaults))
 
 
 class FixedMapTest(unittest.TestCase):
-    def test_entering_lower_new_floor_rechecks_ceiling_without_clearing_ground(self):
+    def test_floor_arrival_keeps_measured_ceiling_until_this_column_changes(self):
         for native in (False,True):
             with self.subTest(native=native):
-                m=FixedLayerMap(MapSettings(maturity_min_points=1,robot_radius=0.,safety_margin=0.),
-                                native_updates=native)
+                m=FixedLayerMap(open_settings(maturity_min_points=1),native_updates=native)
                 below,new,upper=.98,1.40,2.10
                 m.integrate(np.vstack((floor_grid(.5,below),floor_grid(.5,upper))))
-                m.integrate([[.2,0.,1.25]])
                 m.build()
                 evidence=m.surface_observation
                 evidence.enter_frontier_floor((0.,0.,upper),.08)
-                evidence.visit_height((0.,0.,upper))
-                m.integrate([[.1,0.,new]])
-                m.build()
+                m.integrate([[.1,0.,new]]);m.build()
+                before=m.cell((2,0,0)).tobytes()
                 self.assertTrue(evidence.enter_frontier_floor((.1,0.,new),.08))
-                m.build()
-                old=m.cell((2,0,0))
-                self.assertAlmostEqual(old['G'],below,places=5)
-                self.assertAlmostEqual(old['C'],upper,places=5)
-                self.assertAlmostEqual(old['pending_ceiling_z'],new,places=5)
-                self.assertFalse(old['unknown'] or old['solid'])
-                self.assertTrue(old['unknown_hard'])
-                self.assertEqual(old['passage_cost'],-1.)
-                self.assertEqual(m.planning_cost((2,0,0)),50.)
-                self.assertAlmostEqual(next(m.unknown_blockers(2,[(0,0)],below))[2],new,places=5)
-                self.assertTrue(np.isnan(m.cell((2,1,0))['pending_ceiling_z']))
-                self.assertAlmostEqual(m.cell((5,0,0))['G'],upper,places=5)
-                nearer=m.cell((2,2,0))
-                self.assertAlmostEqual(nearer['C'],1.25,places=5)
-                self.assertTrue(np.isnan(nearer['pending_ceiling_z']))
-
-                # An unrelated higher return cannot confirm the nearer C.
-                m.integrate([[0.,0.,upper]])
-                m.build()
-                self.assertAlmostEqual(m.cell((2,0,0))['pending_ceiling_z'],new,places=5)
-                record=evidence.expect((0.,0.,new),review=True,kind='geometry')
-                rays=[(x,y,below) for x in (-.075,-.025,.025,.075)
-                      for y in (-.075,-.025,.025,.075)]
-                m.integrate(rays,sensor_origin=(0.,0.,1.8))
-                m.build()
-                self.assertEqual(record.state,'refuted')
-                self.assertTrue(np.isnan(m.cell((2,0,0))['pending_ceiling_z']))
+                self.assertFalse(m.build())
+                self.assertEqual(m.cell((2,0,0)).tobytes(),before)
                 self.assertAlmostEqual(m.cell((2,0,0))['C'],upper,places=5)
-                m.integrate([[0.,0.,new]])
-                m.build()
-                old=m.cell((2,0,0))
-                self.assertAlmostEqual(old['G'],below,places=5)
-                self.assertAlmostEqual(old['C'],new,places=5)
-                self.assertTrue(np.isnan(old['pending_ceiling_z']))
-                self.assertTrue(old['solid'])
+
+                m.integrate([[0.,0.,new]]);m.build()
+                row=m.cell((2,0,0))
+                self.assertAlmostEqual(row['G'],below,places=5)
+                self.assertAlmostEqual(row['C'],new,places=5)
+                self.assertTrue(row['solid'])
 
     def test_surface_groups_reject_a_chain_beyond_the_full_noise_span(self):
         column=SurfaceColumn()
@@ -106,83 +85,58 @@ class FixedMapTest(unittest.TestCase):
         self.assertAlmostEqual(middle['G'],.915,places=6)
         self.assertAlmostEqual(middle['C'],1.025,places=6)
         self.assertAlmostEqual(above['G'],1.025,places=6)
-        self.assertTrue(np.isnan(above['C']))
+        self.assertTrue(np.isposinf(above['C']))
         m.integrate([(0.,0.,1.04)])
         m.build()
         self.assertAlmostEqual(m.cell((10,0,0))['G'],.915,places=6)
         self.assertAlmostEqual(m.cell((11,0,0))['G'],1.03,places=6)
 
-    def test_mature_return_bound_change_rechecks_near_ground_suppression(self):
+    def test_mature_height_group_ignores_roles_and_keeps_full_span_noise_limit(self):
         m=mapping(maturity_min_points=3)
-        with patch('legbot_exploration.surface_orientation.classify',
-                   return_value=np.asarray([1]*3+[0]*3)):
-            m.integrate([(0,0,0.)]*3+[(0,0,.03)]*3,sensor_origin=(0,0,.8))
-        m.build()
-        self.assertAlmostEqual(m.cell((1,0,0))['G'],0.)
-        with patch('legbot_exploration.surface_orientation.classify',return_value=np.asarray([0])):
-            m.integrate([(0,0,.07)],sensor_origin=(0,0,.8))
-        m.build()
-        self.assertAlmostEqual(m.cell((1,0,0))['G'],.03,places=6)
+        m.integrate([(0,0,0.)]*3+[(0,0,.03)]*3,sensor_origin=(0,0,.8));m.build()
+        self.assertAlmostEqual(m.cell((0,0,0))['G'],0.)
+        m.integrate([(0,0,.07)],sensor_origin=(0,0,.8));m.build()
+        self.assertAlmostEqual(m.cell((0,0,0))['G'],0.)
+        self.assertAlmostEqual(m.cell((0,0,0))['C'],.07,places=6)
+        self.assertAlmostEqual(m.observed_cell((1,0,0))['G'],.07,places=6)
+        self.assertEqual(len(m.columns[0,0]),2)
 
-    def test_mature_ground_with_uncertain_orientation_uses_pct_terrain_cost(self):
-        m = mapping(maturity_min_points=3, robot_radius=.35)
-        ground = floor_grid(1., .30, hole=[(0,0)])
-        m.integrate(np.repeat(ground, 3, axis=0))
-        m.integrate(np.repeat(floor_grid(1., 1.20), 3, axis=0))
-        with patch('legbot_exploration.surface_orientation.classify', return_value=np.zeros(3, dtype=int)):
-            m.integrate([(0.,0.,.306)]*3, sensor_origin=(0.,0.,.8))
-        m.build()
-        pose = (.20, 0., .62)
+    def test_sparse_measured_ground_immediately_fills_parking_hole(self):
+        m=mapping(maturity_min_points=3,robot_radius=.35)
+        m.integrate(np.repeat(floor_grid(1.,.30,hole=[(0,0)]),3,axis=0))
+        m.integrate(np.repeat(floor_grid(1.,1.20),3,axis=0));m.build()
+        pose=(.20,0.,.62)
+        self.assertFalse(m.point_safe_check(pose)['ready'])
+        with patch('legbot_exploration.surface_orientation.classify',side_effect=AssertionError('role gate')):
+            m.integrate([(0.,0.,.306)]*3,sensor_origin=(0.,0.,.306));m.build()
         self.assertTrue(m.point_safe_check(pose)['ready'])
-        self.assertAlmostEqual(m.cell((1,0,0))['G'], .306)
-        self.assertAlmostEqual(m.cell((1,0,0))['C'], 1.20)
-        self.assertLess(m.cell((1,0,0))['terrain_cost'], 20.)
+        self.assertAlmostEqual(m.cell((1,0,0))['G'],.306,places=6)
+        self.assertAlmostEqual(m.cell((1,0,0))['C'],1.20,places=6)
+        self.assertLess(m.cell((1,0,0))['terrain_cost'],20.)
 
-    def test_floor_underside_is_ceiling_and_close_top_can_mature_separately(self):
+    def test_opposite_views_of_close_heights_reuse_noise_group(self):
         m=mapping(maturity_min_points=3,robot_radius=0.,safety_margin=0.)
-        patch=np.array([(x*.025,y*.025) for x in range(-12,13) for y in range(-12,13)])
-        plane=lambda z:np.column_stack((patch,np.full(len(patch),z)))
-        m.integrate(plane(0.),sensor_origin=(0.,0.,.4))
-        m.integrate(plane(1.20),sensor_origin=(0.,0.,.4))
-        m.build()
-        self.assertTrue(m.point_safe_check((0.,0.,.32))['ready'])
-        self.assertAlmostEqual(m.cell((2,0,0))['G'],0.,places=5)
+        m.integrate(np.repeat(floor_grid(.3,0.),3,axis=0),sensor_origin=(0.,0.,.4))
+        m.integrate(np.repeat(floor_grid(.3,1.20),3,axis=0),sensor_origin=(0.,0.,.4));m.build()
+        self.assertEqual(m.column_layers[0,0],{0,1,2,3})
         self.assertAlmostEqual(m.cell((2,0,0))['C'],1.20,places=5)
-        self.assertAlmostEqual(m.cell((3,0,0))['G'],0.,places=5)
-        self.assertAlmostEqual(m.cell((3,0,0))['C'],1.20,places=5)
-        # The 3 cm thickness is smaller than the 5 cm noise tolerance.
-        m.integrate(plane(1.23),sensor_origin=(0.,0.,1.65))
-        m.build()
-        surfaces=[(round(r.height,2),r.orientation) for r in m.columns[(0,0)].values() if r.mature]
-        self.assertEqual(surfaces,[(0.,1),(1.2,-1),(1.23,1)])
-        self.assertAlmostEqual(m.cell((3,0,0))['G'],1.23,places=5)
-        self.assertTrue(m.point_safe_check((0.,0.,1.55))['ready'])
+        m.integrate(floor_grid(.3,1.23),sensor_origin=(0.,0.,1.65));m.build()
+        self.assertEqual(len(m.columns[0,0]),2)
+        self.assertAlmostEqual(m.cell((3,0,0))['G'],1.20,places=5)
         self.assertAlmostEqual(m.cell((2,0,0))['C'],1.20,places=5)
 
-    def test_support_wins_over_a_nearby_historical_underside_without_inventing_ground(self):
+    def test_close_height_reuses_frozen_g_then_distinct_ceiling_limits_support(self):
         m=mapping(maturity_min_points=1,robot_radius=0.,safety_margin=0.)
-        def hit(height,orientation):
-            points=floor_grid(.5,height)
-            with patch('legbot_exploration.surface_orientation.classify',
-                       return_value=np.full(len(points),orientation)):
-                m.integrate(points,sensor_origin=(0.,0.,1.5))
-            m.build()
-        hit(1.177,-1)
-        self.assertTrue(m.cell((3,0,0))['unknown'])
-        self.assertFalse(m.point_safe_check((0.,0.,1.497))['ready'])
-        hit(1.174,1)
-        row=m.cell((3,0,0))
-        self.assertAlmostEqual(row['G'],1.174)
-        record=next(r for r in m.columns[(0,0)].values() if r.id==row['g_surface_id'])
-        self.assertEqual(record.orientation,1)
-        self.assertTrue(m.point_safe_check((0.,0.,1.494))['ready'])
-        self.assertTrue(any(r.orientation==-1 for r in m.columns[(0,0)].values()))
-        # A separate low ceiling below this same cut is retained and blocks
-        # support, instead of being skipped along with the invalid G source.
-        hit(1.30,-1)
-        self.assertAlmostEqual(m.cell((3,0,0))['G'],1.174)
-        self.assertAlmostEqual(m.cell((3,0,0))['C'],1.30)
-        self.assertFalse(m.point_safe_check((0.,0.,1.494))['ready'])
+        m.integrate(floor_grid(.5,1.177),sensor_origin=(0.,0.,.8));m.build()
+        self.assertTrue(m.point_safe_check((0.,0.,1.497))['ready'])
+        m.integrate(floor_grid(.5,1.174),sensor_origin=(0.,0.,1.5));m.build()
+        self.assertAlmostEqual(m.observed_cell((3,0,0))['G'],1.177,places=5)
+        self.assertEqual(len(m.columns[0,0]),1)
+        m.integrate(floor_grid(.5,1.30),sensor_origin=(0.,0.,1.5));m.build()
+        self.assertFalse(m.point_safe_check((0.,0.,1.497),floor=(1.177,.05))['ready'])
+        self.assertAlmostEqual(m.point_safe_check((0.,0.,1.62))['ground_z'],1.30,places=5)
+        self.assertTrue(m.frontier_observed(3,(0,0)))
+        self.assertFalse(m.surface_observation.has_frontier_ground((0,0),1.177,layer=3))
 
     def test_near_ground_noise_uses_the_configured_tolerance(self):
         samples=[(0.,0.,.091),(0.,0.,.097),(0.,0.,.099),(0.,0.,.30)]
@@ -201,38 +155,28 @@ class FixedMapTest(unittest.TestCase):
                            return_value=np.asarray([-1])):
                     m.integrate([(0.,0.,.095)],sensor_origin=(0.,0.,0.))
                 m.build()
-                self.assertAlmostEqual(m.cell((0,0,0))['C'],.095,places=6)
+                self.assertAlmostEqual(m.cell((0,0,0))['C'],expected_ceiling,places=6)
 
-    def test_next_tread_does_not_remove_ceiling_from_the_mixed_cell(self):
+    def test_nearby_hits_share_frozen_ground_across_zero_cut(self):
+        m=mapping(maturity_min_points=1,robot_radius=0.,safety_margin=0.)
+        for h in (-.004,.002):m.integrate(floor_grid(.3,h),sensor_origin=(0.,0.,.8));m.build()
+        self.assertAlmostEqual(m.observed_cell((0,0,0))['G'],-.004,places=6)
+        self.assertAlmostEqual(m.observed_cell((1,0,0))['G'],-.004,places=6)
+        self.assertTrue(np.isposinf(m.observed_cell((1,0,0))['C']))
+        self.assertTrue(m.point_safe_check((0.,0.,.322))['ready'])
+        self.assertFalse(any(key[1:3] in m.columns for key in m.frontier_index.nodes))
+
+    def test_neighbor_tread_does_not_change_this_columns_measured_gc(self):
         m=mapping(maturity_min_points=3,slice_dh=.30)
-
-        def integrate(rows, labels):
-            with patch('legbot_exploration.surface_orientation.classify',return_value=np.asarray(labels)):
-                m.integrate(rows,sensor_origin=(0.,0.,.8))
-            m.build()
-
-        integrate([(-.1,0,.23),(-.025,0,.23),(-.025,.03,.23),(.008,0,.335),(.009,0,.329)]*3,
-                  [1,1,1,-2,0]*3)
-        self.assertAlmostEqual(m.cell((1,0,0))['C'],.329,places=5)
-        integrate([(.125,0,.36)]*2,[1,1])
-        self.assertAlmostEqual(m.cell((1,0,0))['C'],.329,places=5)
-        integrate([(.125,0,.36)],[1])
-        row=m.cell((1,0,0))
-        self.assertAlmostEqual(row['G'],.23,places=5)
-        self.assertAlmostEqual(row['C'],.329,places=5)
-        self.assertEqual(row['passage_cost'],50.)
-        row=m.cell((2,0,0))
-        self.assertAlmostEqual(row['G'],.335,places=5)
+        m.integrate([(-.025,0.,.23),(.008,0.,.335),(.009,0.,.329)]*3);m.build()
+        original=tuple(float(m.cell((1,0,0))[f]) for f in ('G','C'))
+        m.integrate([(.125,0.,.36)]*3);m.build()
+        self.assertEqual(tuple(float(m.cell((1,0,0))[f]) for f in ('G','C')),original)
+        self.assertEqual(m.cell((1,0,0))['passage_cost'],50.)
+        self.assertAlmostEqual(m.cell((2,0,0))['G'],.333,places=5)
         self.assertAlmostEqual(m.cell((2,1,0))['G'],.36,places=5)
-        self.assertEqual(len(m.columns[(0,0)].surfaces),3)
 
-        # A verified underside remains in the geometry even on the same stripe.
-        integrate([(.009,0,.34)]*3,[-1]*3)
-        row=m.cell((2,0,0))
-        self.assertAlmostEqual(row['G'],.335,places=5)
-        self.assertAlmostEqual(m.cell((1,0,0))['C'],.329,places=5)
-
-    def test_two_measured_support_heights_keep_clearance_without_neighboring_treads(self):
+    def test_non_ground_barrier_keeps_clearance_without_supplying_g(self):
         m=mapping(maturity_min_points=3,slice_dh=.10)
         points=[(-.02,0,0.),(.002,0,.10),(.02,0,.16),(.02,0,.27)]*3
         with patch('legbot_exploration.surface_orientation.classify',return_value=np.asarray([1,-2,1,1]*3)):
@@ -241,8 +185,9 @@ class FixedMapTest(unittest.TestCase):
         self.assertAlmostEqual(m.cell((0,0,0))['G'],0.)
         self.assertAlmostEqual(m.cell((0,0,0))['C'],.10,places=5)
         self.assertEqual(m.cell((0,0,0))['passage_cost'],50.)
-        self.assertAlmostEqual(m.cell((1,0,0))['G'],.10,places=5)
-        self.assertAlmostEqual(m.cell((1,0,0))['C'],.16,places=5)
+        blocked=m.observed_cell((1,0,0))
+        self.assertFalse(blocked['unknown']);self.assertTrue(blocked['solid'])
+        self.assertAlmostEqual(blocked['G'],.10,places=5)
         self.assertAlmostEqual(m.cell((2,0,0))['G'],.16,places=5)
         self.assertAlmostEqual(m.cell((3,0,0))['G'],.27,places=5)
 
@@ -257,13 +202,13 @@ class FixedMapTest(unittest.TestCase):
         m.build()
         low,high=m.cell((0,0,0)),m.cell((2,0,0))
         self.assertAlmostEqual(low['G'],0.)
-        self.assertAlmostEqual(low['C'],.09,places=5)
+        self.assertAlmostEqual(low['C'],.13,places=5)
         self.assertEqual(low['passage_cost'],50.)
         self.assertAlmostEqual(high['G'],.13,places=5)
         self.assertAlmostEqual(high['C'],.23,places=5)
         self.assertEqual(high['passage_cost'],50.)
         self.assertAlmostEqual(m.cell((2,1,0))['G'],.13,places=5)
-        self.assertEqual(len(m.columns[(0,0)].surfaces),4)
+        self.assertEqual(len(m.columns[(0,0)].surfaces),3)
 
     def test_step_boundary_keeps_g_and_c_when_samples_are_sparse_or_overlap(self):
         for upper_xy in [[(.035,.035)], [(-.035,-.035),(-.01,-.01),(.035,.035),(.01,.01)]]:
@@ -298,27 +243,27 @@ class FixedMapTest(unittest.TestCase):
         self.assertAlmostEqual(record.height,.028/3)
 
     def test_same_frame_stops_at_num_and_does_not_average_all_later_returns(self):
-        m=FixedLayerMap(MapSettings())
+        m=FixedLayerMap(open_settings())
         m.integrate(np.asarray([[0,0,z] for z in (0.,.01,.018,.02,.015)],dtype='float32'));m.build()
         self.assertAlmostEqual(m.columns[(0,0)].surfaces[0].height,.028/3,places=7)
         self.assertEqual(m.ignored_static_points,2)
 
     def test_count_is_per_surface_not_per_referencing_slice(self):
-        m=FixedLayerMap(MapSettings())
+        m=FixedLayerMap(open_settings())
         m.integrate(np.asarray([[0,0,0.],[0,0,3.]],dtype='float32'));m.build()
         self.assertGreater(len(m.column_layers[(0,0)]),5)
         self.assertEqual([r.count for r in m.columns[(0,0)].surfaces],[1,1])
         self.assertFalse(any(row['g_mature'] for _,row in m.iter_cells()))
 
     def test_cross_cut_noise_is_one_shared_ground_instead_of_a_low_ceiling(self):
-        m=FixedLayerMap(MapSettings())
+        m=FixedLayerMap(open_settings())
         heights=(-.0000256598,.0007749796,.008226186)
         m.integrate(np.vstack([floor_grid(height=z) for z in heights]));m.build()
         rows=[row for _,row in m.layers_at(0,0) if np.isfinite(row['G'])]
         self.assertTrue(rows)
         for row in rows:
             self.assertAlmostEqual(row['G'],sum(heights)/3,places=7)
-            self.assertTrue(np.isnan(row['C']))
+            self.assertTrue(np.isposinf(row['C']))
             self.assertTrue(row['g_mature'])
         self.assertEqual(len({row['g_surface_id'] for row in rows}),1)
         self.assertTrue(m.point_safe_check([0,0,.32383])['ready'])
@@ -332,7 +277,7 @@ class FixedMapTest(unittest.TestCase):
         self.assertEqual(row['passage_cost'],50.)
 
     def test_shared_G_C_ids_are_distinct_and_match_the_authoritative_mean(self):
-        m=FixedLayerMap(MapSettings())
+        m=FixedLayerMap(open_settings())
         points=[[0,0,z] for z in (0.,.004,.008,1.5,1.502,1.504)]
         m.integrate(np.asarray(points,dtype='float32'));m.build()
         records={r.id:r for r in m.columns[(0,0)].surfaces}
@@ -365,7 +310,7 @@ class FixedMapTest(unittest.TestCase):
         self.assertEqual(c.surfaces[0].count,3)
 
     def test_out_of_band_new_obstacle_is_accepted_after_ground_matures(self):
-        m=FixedLayerMap(MapSettings())
+        m=FixedLayerMap(open_settings())
         m.integrate(np.repeat(floor_grid(),3,axis=0));m.build()
         ground=m.columns[(0,0)].surfaces[0];height=ground.height
         m.integrate(np.asarray([[0,0,.3]],dtype='float32'));m.build()
@@ -382,17 +327,22 @@ class FixedMapTest(unittest.TestCase):
         self.assertEqual(m.cell((0,0,0))['passage_cost'],50.)
         upper=m.cell((1,0,0))
         self.assertAlmostEqual(upper['G'],.301,places=6)
-        self.assertTrue(np.isnan(upper['C']))
+        self.assertTrue(np.isposinf(upper['C']))
         self.assertEqual(upper['passage_cost'],0.)
         self.assertFalse(m.point_safe_check([0,0,.32])['ready'])
 
-    def test_single_stair_return_replaces_mature_ground_in_all_higher_cuts(self):
+    def test_new_stair_surface_patch_replaces_mature_ground_in_all_higher_cuts(self):
         m=mapping(maturity_min_points=3)
         # Heights recorded at the blocking stair cell (7.10, 1.90).
         x,y=7.10,1.90
         m.integrate([(x,y,z) for z in (3.828,5.880)*3]);m.build()
         higher=[m.cell((k,71,19)) for k in range(8,12)]
         self.assertTrue(all(row['g_mature'] for row in higher))
+        m.integrate([(x,y,3.892)],sensor_origin=(7.1,1.1,4.2));m.build()
+        self.assertAlmostEqual(higher[0]['G'],3.892,places=6)
+        m.integrate([(x+dx*.1,y+dy*.1,3.892) for dx in range(-2,3) for dy in range(-2,3)
+                     if dx or dy],sensor_origin=(7.1,1.1,4.2));m.build()
+        # Reobserve the center using the now measured local surface geometry.
         m.integrate([(x,y,3.892)],sensor_origin=(7.1,1.1,4.2));m.build()
         for row in higher:
             self.assertAlmostEqual(row['G'],3.892,places=6)
@@ -418,13 +368,13 @@ class FixedMapTest(unittest.TestCase):
     def test_recorded_four_centimetre_noise_does_not_close_mature_ground(self):
         for ground,noise in ((-.005091389,.036241353),(-.009104222,.031170696)):
             with self.subTest(ground=ground):
-                m=FixedLayerMap(MapSettings())
+                m=FixedLayerMap(open_settings())
                 m.integrate(np.repeat(floor_grid(height=ground),3,axis=0));m.build()
                 version=m.revision
                 m.integrate(np.asarray([[0,0,noise]],dtype='float32'));m.build()
                 self.assertEqual(m.revision,version)
                 self.assertEqual(len(m.columns[(0,0)]),1)
-                self.assertTrue(np.isnan(m.cell((0,0,0))['C']))
+                self.assertTrue(np.isposinf(m.cell((0,0,0))['C']))
                 self.assertTrue(m.point_safe_check([0,0,ground+.32])['ready'])
 
     def test_closer_C_and_higher_G_change_only_their_affected_layers(self):
@@ -442,13 +392,13 @@ class FixedMapTest(unittest.TestCase):
 
     def test_missing_C_is_filled_even_after_G_matures(self):
         m=mapping();m.integrate(floor_grid());m.build()
-        self.assertTrue(np.isnan(m.cell((0,0,0))['C']))
+        self.assertTrue(np.isposinf(m.cell((0,0,0))['C']))
         m.integrate(np.asarray([[0,0,.8]],dtype='float32'));m.build()
         self.assertAlmostEqual(m.cell((0,0,0))['C'],.8,places=6)
         self.assertEqual(m.cell((0,0,0))['G'],0.)
 
     def test_mature_repeats_do_not_change_geometry_or_store_more_samples(self):
-        m=FixedLayerMap(MapSettings());points=np.repeat(floor_grid(),3,axis=0)
+        m=FixedLayerMap(open_settings());points=np.repeat(floor_grid(),3,axis=0)
         m.integrate(points);m.build();version=m.revision;blocks={k:v.tobytes() for k,v in m.blocks.items()}
         self.assertEqual(m.integrate(points),m.surface_records)
         self.assertFalse(m.build())
@@ -457,7 +407,7 @@ class FixedMapTest(unittest.TestCase):
         self.assertTrue(all(not r.pending for c in m.columns.values() for r in c.values()))
 
     def test_closed_hole_stays_unknown_until_real_hits_arrive(self):
-        m=FixedLayerMap(MapSettings())
+        m=FixedLayerMap(open_settings())
         m.integrate(np.repeat(floor_grid(hole=[(0,0)]),3,axis=0));m.build()
         self.assertFalse(m.point_safe_check([0,0,.32])['ready'])
         m.integrate(np.asarray([[0,0,0.]]*3,dtype='float32'));m.build()
@@ -472,15 +422,15 @@ class FixedMapTest(unittest.TestCase):
                 self.assertEqual(m.point_safe_check(query)['reason'],'unknown_footprint')
                 m.integrate(np.asarray([[0,0,cut-.01]],dtype='float32'));m.build()
                 self.assertTrue(m.point_safe_check(query)['ready'])
-                self.assertFalse(m.cell((round(cut/.5)+1,0,0))['g_mature'])
+                self.assertFalse(m.cell((round(cut/.5),0,0))['g_mature'])
                 m.integrate(np.asarray([[0,0,cut-.01]]*2,dtype='float32'));m.build()
                 check=m.point_safe_check(query)
                 self.assertTrue(check['ready'],check)
-                layer=round(cut/.5)+1
+                layer=round(cut/.5)
                 row=m.cell((layer,0,0))
                 self.assertAlmostEqual(row['G'],cut-.01,places=6)
                 self.assertTrue(row['g_mature'])
-                self.assertFalse(m.cell((layer,3,0))['unknown_hard'])
+                self.assertAlmostEqual(m.observed_cell((layer+1,0,0))['G'],cut-.01,places=6)
                 self.assertEqual(m.columns[(0,0)].surfaces[0].count,3)
 
     def test_slice_coverage_is_independent_of_observation_batch_order(self):
@@ -501,25 +451,31 @@ class FixedMapTest(unittest.TestCase):
                     if field in ('G','C') and np.isnan(a) and np.isnan(b):continue
                     self.assertAlmostEqual(float(a),float(b),places=7,msg=str((key,field)))
 
-    def test_inherited_cut_does_not_relay_demands_into_unobserved_region(self):
+    def test_neighbor_hit_does_not_materialize_a_new_cut_in_another_column(self):
         m=mapping()
-        for point in ((0.,0.,.01),(.9,0.,-.01),(1.8,0.,-.01)):
-            m.integrate(np.asarray([point],dtype='float32'));m.build()
-        self.assertIn(1,m.column_layers[(9,0)])
-        self.assertNotIn(1,m.column_layers[(18,0)])
-        self.assertNotIn((5,0),m.columns)
-        self.assertFalse(m.point_safe_check([.5,0.,.32])['ready'])
-
-    def test_inherited_cut_can_later_become_a_real_local_demand(self):
-        m=mapping()
-        for point in ((0.,0.,-.01),(.9,0.,.01)):
-            m.integrate(np.asarray([point],dtype='float32'));m.build()
+        m.integrate([(0.,0.,-.01)]);m.build()
+        m.integrate([(.9,0.,.01)]);m.build()
+        self.assertEqual(m.column_layers[(0,0)],{0})
+        self.assertIsNotNone(m.observed_cell((1,0,0)))
+        self.assertFalse(m.cell((1,0,0))['measured'])
+        m.integrate([(0.,0.,.06)]);m.build()
         self.assertIn(1,m.column_layers[(0,0)])
-        # A real new surface at the origin now owns that previously borrowed
-        # cut. Its own halo must extend west, not stop at the old east source.
-        m.integrate(np.asarray([[0.,0.,.06]],dtype='float32'));m.build()
-        m.integrate(np.asarray([[-.9,0.,-.01]],dtype='float32'));m.build()
-        self.assertIn(1,m.column_layers[(-9,0)])
+        self.assertAlmostEqual(m.observed_cell((1,0,0))['G'],.06,places=6)
+
+    def test_cut_move_retires_the_old_local_demand(self):
+        m=mapping(maturity_min_points=3)
+        m.integrate([(0.,0.,.51),(.1,0.,.15)]);m.build()
+        self.assertEqual(m.column_layers[(0,0)],{2})
+        self.assertAlmostEqual(m.cell((2,0,0))['G'],.51,places=5)
+        self.assertFalse(m.ground_pending((1,0),2))
+        # The mean of the same measured surface moves across the cut.
+        m.integrate([(0.,0.,.47)]);m.build()
+        self.assertEqual(m.column_layers[(0,0)],{1})
+        self.assertEqual(m.column_layers[(1,0)],{1})
+        self.assertTrue(m.cell((2,0,0))['unknown'])
+        self.assertTrue(np.isnan(m.cell((2,0,0))['G']))
+        self.assertAlmostEqual(m.observed_cell((2,1,0))['G'],.15,places=5)
+        self.assertAlmostEqual(m.cell((1,0,0))['G'],.49,places=5)
 
     def test_inherited_slices_use_this_columns_true_surfaces_and_keep_floors_distinct(self):
         m=mapping(maturity_min_points=3,robot_radius=.35,safety_margin=.05)
@@ -534,10 +490,11 @@ class FixedMapTest(unittest.TestCase):
         for _ in range(3):
             m.integrate(np.asarray([[0.,0.,1.49]],dtype='float32'));m.build()
         self.assertTrue(m.point_safe_check([0.,0.,1.81])['ready'])
-        lower=m.cell((1,0,0));upper=m.cell((4,0,0))
+        lower=m.cell((1,0,0));upper=m.cell((3,0,0))
         self.assertAlmostEqual(lower['G'],-.01,places=6)
         self.assertAlmostEqual(lower['C'],1.49,places=6)
         self.assertAlmostEqual(upper['G'],1.49,places=6)
+        self.assertAlmostEqual(m.observed_cell((4,0,0))['G'],1.49,places=5)
         self.assertNotEqual(lower['g_surface_id'],upper['g_surface_id'])
 
     def test_late_real_low_ceiling_remains_blocked_after_slice_inheritance(self):
@@ -551,12 +508,12 @@ class FixedMapTest(unittest.TestCase):
     def test_outdoor_zero_passage_does_not_make_missing_ground_safe(self):
         m=mapping();m.integrate(floor_grid());m.build()
         self.assertEqual(m.cell((0,0,0))['passage_cost'],0.)
-        self.assertTrue(np.isnan(m.cell((0,0,0))['C']))
+        self.assertTrue(np.isposinf(m.cell((0,0,0))['C']))
         self.assertTrue(m.point_safe_check([0,0,.32])['ready'])
         self.assertFalse(m.point_safe_check([3,3,.32])['ready'])
 
     def test_isolated_first_hit_is_observed_with_unassessed_terrain(self):
-        m=FixedLayerMap()
+        m=FixedLayerMap(open_settings())
         m.integrate([(0.,0.,0.)]);m.build()
         row=m.cell((0,0,0))
         self.assertEqual(row['G'],0.)
@@ -564,10 +521,9 @@ class FixedMapTest(unittest.TestCase):
         self.assertFalse(row['unknown'])
         self.assertEqual(row['passage_cost'],0.)
         self.assertEqual(row['terrain_cost'],-1.)
-        below=m.cell((-1,0,0))
-        self.assertTrue(below['unknown'])
-        self.assertEqual(below['C'],0.)
-        self.assertFalse(below['c_mature'])
+        self.assertEqual(m.column_layers[(0,0)],{0})
+        self.assertIsNone(m.cell((-1,0,0)))
+        self.assertIsNone(m.cell((1,0,0)))
 
     def test_low_structure_outside_tolerance_remains_blocked(self):
         m=mapping();m.integrate(np.asarray([[0,0,0.],[0,0,.06]],dtype='float32'));m.build()
@@ -586,8 +542,8 @@ class FixedMapTest(unittest.TestCase):
         self.assertTrue(all(m.blocks[k] is v for k,v in blocks.items()))
         self.assertEqual(m.cell((0,0,0)).tobytes(),before.tobytes())
         self.assertLess(m.last_work['base_cells'],20)
-        self.assertLess(m.settings.origin_z+m.first_layer*m.settings.slice_dh,-1.2)
-        self.assertGreater(m.settings.origin_z+m.last_layer*m.settings.slice_dh,2.1)
+        self.assertAlmostEqual(m.settings.origin_z+m.first_layer*m.settings.slice_dh,-1.+m.settings.origin_z)
+        self.assertAlmostEqual(m.settings.origin_z+m.last_layer*m.settings.slice_dh,2.5+m.settings.origin_z)
 
     def test_incremental_costs_match_full_dependency_recompute(self):
         m=mapping();m.integrate(floor_grid(height=-.1));m.build()
@@ -620,7 +576,7 @@ class FixedMapTest(unittest.TestCase):
         self.assertAlmostEqual(m.cell(key)['inflated_terrain_cost'],expected)
 
     def test_capacity_rejection_is_atomic_for_mean_counts_and_columns(self):
-        m=FixedLayerMap(MapSettings(max_surface_records=1))
+        m=FixedLayerMap(open_settings(max_surface_records=1))
         m.integrate(np.asarray([[0,0,0.]],dtype='float32'))
         m.integrate(np.asarray([[0,0,.01],[1,0,0.]],dtype='float32'))
         self.assertEqual(m.surface_records,1)
@@ -632,7 +588,7 @@ class FixedMapTest(unittest.TestCase):
     def test_invalid_settings_and_unimplemented_dynamic_mode_are_rejected(self):
         for args in ({'mapping_mode':'dynamic'},{'inflation_kernel_size':12},
                      {'surface_noise_tolerance':-.1},{'maturity_min_points':0}):
-            with self.assertRaises(ValueError):MapSettings(**args)
+            with self.assertRaises(ValueError):open_settings(**args)
 
 
 if __name__=='__main__':unittest.main()

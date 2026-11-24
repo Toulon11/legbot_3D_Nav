@@ -202,6 +202,7 @@ public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
 private:
+  friend struct GridMapCollisionTest;
   MappingParameters mp_;
   MappingData md_;
 
@@ -227,6 +228,7 @@ private:
 
   inline void inflatePoint(const Eigen::Vector3i& pt, int inf_step_xy, int inf_step_z_up, int inf_step_z_down, vector<Eigen::Vector3i>& pts);
   inline int getInflateOccupancyFromBuffer(Eigen::Vector3d pos, const std::vector<char>& buffer);
+  int refineInflationHeight(const Eigen::Vector3d& pos, const Eigen::Vector3i& id);
   inline int getLocalIndex(int id, int dim) const;
   inline int toAddressLocal(const Eigen::Vector3i& id_l) const;
   inline int toAddressLocal(int x, int y, int z) const;
@@ -396,7 +398,8 @@ inline int GridMap::getInflateOccupancyFromBuffer(Eigen::Vector3d pos, const std
   Eigen::Vector3i id;
   posToIndex(pos, id);
 
-  return int(buffer[toAddress(id)]);
+  if (!buffer[toAddress(id)]) return 0;
+  return refineInflationHeight(pos, id);
 }
 
 inline int GridMap::getOccupancy(Eigen::Vector3i id) {

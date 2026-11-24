@@ -3,6 +3,12 @@
 `go2_demo_sequencer` owns navigation/recovery gait activation. Exploration does
 not switch gait modes. No arrival or planner safety tolerance changes are needed.
 
+Startup mode pulses and the crouch/stand waits use the node's ROS clock. The
+controller interpolates in simulation time; wall-clock waits can otherwise
+finish too early when Gazebo runs slowly and release navigation while the dog
+is still crouched. Runtime task-idle and physical-stop checks retain their own
+existing timing and feedback requirements.
+
 ## Task lifetime and idle
 
 - A new `/scan/goal` cancels pending stand immediately. A task stays active while
@@ -115,3 +121,7 @@ This verifies this handover sequence, not all terrain or real-robot stability.
 Artifacts: `build/legbot_bringup/Testing/gazebo_settle_20261106/summary.json`,
 `telemetry.jsonl` and `launch.log`. Isolated `go2_execution_idle` and
 `exploration_pct_controller` tests also passed, including task activity pause/resume.
+
+启动顺序先查询 /controller_manager/list_controllers，确认 rl_quadruped_controller 为 active，
+再启动两次 mode-2 脉冲及其仿真时间等待。关节状态广播器先于执行控制器就绪时，
+不能提前发送脉冲，否则第二次脉冲可能才完成趴下而导航已经放行。

@@ -92,19 +92,23 @@ le::ExplorationSettings declare_exploration_settings(
   options.cross_layer_enabled_=node.declare_parameter<bool>("cross_layer_enabled",true);
   options.floor_exploration_=node.declare_parameter<bool>("pct_floor_exploration",false);
   options.skip_start_floor_exploration_=node.declare_parameter<bool>("skip_start_floor_exploration",false);
+  options.mission_return_home_=node.declare_parameter<bool>("mission_return_home",false);
+  options.mission_target_height_=node.declare_parameter<double>("mission_target_height",4.43);
+  const auto home=node.declare_parameter<std::vector<double>>("mission_home",{-6.75,9.60,0.});
+  if(home.size()!=3 || !std::all_of(home.begin(),home.end(),[](double v){return std::isfinite(v);}) ||
+     !std::isfinite(options.mission_target_height_))throw std::invalid_argument("invalid home mission geometry");
+  std::copy(home.begin(),home.end(),options.mission_home_.begin());
   options.floor_height_tolerance_=node.declare_parameter<double>("pct_floor_height_tolerance",.08);
   options.foot_force_min_=node.declare_parameter<double>("pct_foot_contact_force",12.);
   if(!std::isfinite(options.floor_height_tolerance_) || options.floor_height_tolerance_<=0. ||
      !std::isfinite(options.foot_force_min_) || options.foot_force_min_<=0.)
     throw std::invalid_argument("invalid PCT floor settings");
-  if(shared)options.cross_layer.minimum_rise=shared->surface_noise_tolerance+1e-7;
+  options.cross_layer.minimum_rise=options.floor_height_tolerance_+1e-7;
   options.cross_layer.height_slack=node.declare_parameter<double>("cross_layer_height_slack",.05);
-  options.cross_layer.corridor_radius=node.declare_parameter<double>("cross_layer_corridor_radius",1.5);
   options.cross_layer.progress_slack=options.observation_goal_xy_tolerance_;
   if(!std::isfinite(options.cross_layer.minimum_rise) || !std::isfinite(options.cross_layer.height_slack) ||
-     !std::isfinite(options.cross_layer.corridor_radius) ||
      options.cross_layer.minimum_rise<=0. ||
-     options.cross_layer.height_slack<0. || options.cross_layer.corridor_radius<=0.)
+     options.cross_layer.height_slack<0.)
     throw std::invalid_argument("invalid cross-layer task policy");
   if(!std::isfinite(options.pct_local_above_) || !std::isfinite(options.pct_local_below_) ||
      !std::isfinite(options.pct_direction_weight_) || options.pct_local_above_<=0 || options.pct_local_below_<=0 || options.pct_direction_weight_<0)
@@ -131,6 +135,7 @@ le::ExplorationSettings declare_exploration_settings(
   options.observation_wait_=node.declare_parameter<double>("observation_frame_wait",2.0);
   options.observation_flat_wait_=node.declare_parameter<double>("observation_flat_frame_wait",1.0);
   options.observation_timeout_=node.declare_parameter<double>("observation_task_timeout",60.0);
+  options.observation_pose_wait_timeout_=node.declare_parameter<double>("observation_pose_wait_timeout",5.0);
   options.observation_sweep_=node.declare_parameter<double>("observation_sweep_half_angle",.35);
   options.observation_full_sweep_=node.declare_parameter<bool>("observation_full_sweep_fallback",false);
   options.pct_query_budget_=node.declare_parameter<double>("pct_query_budget_seconds",.20);
@@ -153,6 +158,7 @@ le::ExplorationSettings declare_exploration_settings(
   if(!std::isfinite(options.observation_wait_) || !std::isfinite(options.observation_flat_wait_) ||
      options.observation_flat_wait_<=0. || options.observation_timeout_<=options.observation_flat_wait_ ||
      !std::isfinite(options.observation_timeout_) ||
+     !std::isfinite(options.observation_pose_wait_timeout_) || options.observation_pose_wait_timeout_<=0. ||
      !std::isfinite(options.observation_sweep_) || options.observation_wait_<=0 || options.observation_timeout_<=options.observation_wait_ ||
      options.observation_sweep_<0 || options.observation_sweep_>M_PI)
     throw std::invalid_argument("invalid observation task settings");

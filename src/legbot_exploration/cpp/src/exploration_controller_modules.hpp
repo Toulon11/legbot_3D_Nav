@@ -29,8 +29,9 @@ class ExplorationPolicy {
                                 double direction_weight);
   const char *check_ascent(const Point &start, const std::vector<Point> &route,
                            std::optional<double> departure_height, bool starts_climb) const;
+  bool observer_failed(const Point &point,double current) const;
   bool adopt_ascent(const Point &start, const std::vector<Point> &route,
-                    std::optional<double> departure_height, std::optional<double> yaw);
+                    std::optional<double> departure_height, std::optional<double> yaw, bool scheduled_ascent=false);
 
  private:
   friend class ExplorationController;
@@ -42,7 +43,12 @@ class ExplorationPolicy {
   std::optional<std::uint64_t> cross_deferred_signature_;
   std::optional<Point> cross_deferred_pose_;
   bool cross_deferred_checked_=false,cross_deferred_scan_blocked_=false,cross_deferred_feet_stable_=false;
+  bool cross_priority_pending_=false;
   bool floor_complete_=false;
+  // Explicit ordinary-exploration lifetime, independent of climb state and
+  // height-band numbering. Recorder maps its height to an independent floor.
+  std::optional<double> floor_exploration_started_sim_,floor_exploration_started_wall_;
+  std::optional<double> floor_exploration_ended_sim_,floor_exploration_ended_wall_;
   std::uint64_t floor_work_checked_version_=0;
   std::optional<double> floor_selection_wait_started_;
   double floor_longest_selection_wait_ms_=0.;
@@ -51,18 +57,13 @@ class ExplorationPolicy {
   std::size_t floor_review_resolved_=0,floor_known_barriers_=0;
   std::size_t floor_number_=0;
   std::optional<double> floor_height_;
-  std::string stair_climb_result_,stair_step_result_;
+  std::string upward_result_;
   std::string floor_confirmation_reason_="no_contact_data";
   std::map<std::uint64_t,double> pct_timeout_pending_;
   std::map<Point,double> pct_timed_out_observers_;
   std::uint64_t pct_next_candidate_=0;
-  std::set<Point> failed_stair_observers_;
-  std::uint64_t failed_stair_version_=0;
+  std::map<Point,double> failed_stair_observers_;
   PctFrontiers pct_frontiers_;
-  std::string stair_probe_last_diagnostic_;
-  bool local_stair_probe_active_=false;
-  struct FloorAscent { Point start; double yaw; };
-  std::optional<FloorAscent> floor_ascent_;
   StairScanBudget stair_scan_budget_;
   double pct_floor_wait_for_frame_after_=-1.;
   struct PctCooldown { Point xyz; double expiry; };

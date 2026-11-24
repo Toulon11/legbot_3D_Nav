@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <limits>
@@ -52,6 +53,8 @@ bool execution_failure_sent = false;
 enum class NavigationPhase { waiting, translating, rotating };
 NavigationPhase navigation_phase = NavigationPhase::waiting;
 bool navigation_started = false;
+std::chrono::steady_clock::time_point goal_accepted_at;
+double first_trajectory_timeout = 5.;
 bool trajectory_has_motion = false;
 legbot::Time navigation_started_at, navigation_progress_at;
 double best_navigation_distance = std::numeric_limits<double>::infinity();
@@ -187,6 +190,9 @@ void loadParams(const legbot::NodeHandle &nh)
   nh.param("terminal_rotate_enter", terminal_rotate_enter, 0.50);
   nh.param("terminal_rotate_exit", terminal_rotate_exit, 0.30);
   nh.param("execution_timeout", execution_timeout, 600.0);
+  nh.param("first_trajectory_timeout", first_trajectory_timeout, 5.0);
+  if(!std::isfinite(first_trajectory_timeout) || first_trajectory_timeout<=0.)
+    first_trajectory_timeout=5.;
   nh.param("recovery_reverse_speed", reverse_speed, 0.12);
   nh.param("recovery_shift_speed", shift_speed, 0.22);
   nh.param("recovery_turn_speed", turn_speed, 0.35);
@@ -582,6 +588,7 @@ void acceptGoal(const scan_planner::msg::GoalRequest &request)
   goal_ack_sent = false;
   execution_failure_sent = false;
   navigation_started = false;
+  goal_accepted_at = std::chrono::steady_clock::now();
   navigation_phase = NavigationPhase::waiting;
   latest_goal_msg = *msg;
   current_goal_request=request;
@@ -635,7 +642,8 @@ void bsplineCallback(const scan_planner::msg::Bspline::ConstSharedPtr &msg)
   }
 
   const legbot::Time candidate_start(msg->start_time);
-  if (have_goal_time && !candidate_start.isZero() && candidate_start < latest_goal_time)
+  if(execution_failure_sent)return;
+  if (have_goal_time && (candidate_start.isZero() || candidate_start < latest_goal_time))
   {
     ROS_WARN("[scan_go2_cmd_adapter] Ignore trajectory older than the latest goal.");
     return;
@@ -645,7 +653,14 @@ void bsplineCallback(const scan_planner::msg::Bspline::ConstSharedPtr &msg)
   Eigen::VectorXd knots(msg->knots.size());
 
   for (size_t i = 0; i < msg->knots.size(); ++i)
+  {
+    if(!std::isfinite(msg->knots[i]) || (i && msg->knots[i]<msg->knots[i-1]))return;
     knots(i) = msg->knots[i];
+  }
+  const double candidate_duration=knots(msg->pos_pts.size())-knots(msg->order);
+  if(!std::isfinite(candidate_duration) || candidate_duration<=0.)return;
+  if(candidate_start.isZero() || !std::isfinite((legbot::Time::now()-candidate_start).toSec()) ||
+     (legbot::Time::now()-candidate_start).toSec() >= candidate_duration)return;
 
   for (size_t i = 0; i < msg->pos_pts.size(); ++i)
   {
@@ -898,6 +913,13 @@ void cmdCallback(const legbot::TimerEvent &)
   {
     publishExecutionFrozen(false);
     publishStop();
+    return;
+  }
+  if(have_goal_position && !navigation_started &&
+     std::chrono::duration<double>(std::chrono::steady_clock::now()-goal_accepted_at).count() >= first_trajectory_timeout &&
+     !(have_odom && (legbot::Time::now()-last_odom_time).toSec()<=odom_timeout &&
+       insideGoalTolerance((latest_goal_pos.head<2>()-odom_pos.head<2>()).norm()))) {
+    failNavigation("planning_wait_timeout");
     return;
   }
   if (!have_odom ||

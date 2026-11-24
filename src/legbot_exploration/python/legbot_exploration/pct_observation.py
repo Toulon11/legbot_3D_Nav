@@ -61,6 +61,60 @@ class ObservationModel:
             if barrier is not None:bands=(*bands,barrier)
         return bands
 
+    def ray_evidence(self, key):
+        """Cache dependencies include both optical returns and known grid barriers."""
+        if len(key)==4 and key[3]=='selection_layer':
+            return self.map.frontier_selection_layer(key[:3])[0]
+        if len(key)==4 and key[3]=='support_obstacle':
+            return self.support_obstacle(key[:2],key[2])
+        if len(key)==4 and key[3]=='known_obstacle':
+            x,y,layer,_=key
+            row=self.map.observed_cell((layer,x,y))
+            return row is not None and (bool(row['solid']) or row['terrain_cost']>=50.)
+        if len(key)==5 and key[4]=='ground_band_obstacle':
+            x,y,layer,height,_=key
+            return (self.ray_evidence((x,y,layer,'known_obstacle')) or
+                    self.map.ground_band_obstacle((x,y),height))
+        return self.column_blockers(key)
+
+    def support_obstacle(self, xy, height):
+        """A measured obstacle in the observer's ground space, across cuts."""
+        tolerance=self.map.settings.surface_noise_tolerance+1e-7
+        records=self.map._column_known_intervals.get(tuple(xy),())
+        if self.map.ground_band_obstacle(xy,height):
+            column=self.map.columns[tuple(xy)]
+            step=min(.16,self.map.settings.step_max)
+            bands=[(a,b) for a,b in column.obstacle_intervals
+                   if a<height+self.map.settings.minimum_clearance-1e-7 and b>height+step+1e-7]
+            # A measured short riser ending at a real upper tread is not a
+            # wall on the observer's floor. Unobserved tops get no exemption.
+            if any(b-a>step+1e-7 or not any(abs(g-b)<=tolerance for g,_,_,_,_ in records)
+                   for a,b in bands):return True
+        for g,c,_,lo,hi in records:
+            if abs(g-height)>tolerance:continue
+            # A valid cut inside this measured interval may itself be virtual.
+            row=self.map.observed_cell((lo,*xy))
+            if row is not None and (bool(row['solid']) or row['terrain_cost']>=50.):return True
+        s=self.map.settings
+        layer=self.map.frontier_selection_layer((s.origin_x+xy[0]*s.resolution,
+                                                s.origin_y+xy[1]*s.resolution,height))[0]
+        row=self.map.observed_cell((layer,*xy))
+        return (row is not None and np.isfinite(row['G']) and abs(row['G']-height)<=tolerance and
+                (bool(row['solid']) or row['terrain_cost']>=50.))
+
+    def grid_view_blocked(self, point, target, layer, dependencies):
+        """An observation stance may not look across a known obstacle cell.
+
+        Only the XY projection and measured obstacles in the stance's ground
+        space matter. Unknown inflation is not a measured wall. A different
+        floor is not occlusion evidence for this view.
+        """
+        for xy,first,last in ray_columns(np.asarray(point),np.asarray(target),self.map.settings):
+            key=(*xy,float(point[2]),'support_obstacle')
+            if key not in dependencies:dependencies[key]=self.ray_evidence(key)
+            if dependencies[key]:return True
+        return False
+
     def ray_blocked(self, sensor, target, dependencies=None):
         """Trace observed surfaces, including vertical bands, independently of FOV."""
         sensor=np.asarray(sensor,dtype=float)
@@ -80,14 +134,16 @@ class ObservationModel:
                 return True
         return False
 
-    def visible(self, point, yaw, targets, occlusion=True, ray_dependencies=None, sensor_pose=None):
+    def visible(self, point, yaw, targets, occlusion=True, ray_dependencies=None, sensor_pose=None,
+                range_margin=0.):
         """Expected ground points in the mounted LiDAR frame (level body model)."""
         s = self.map.settings
         targets = np.asarray(targets, dtype=float).reshape(-1, 3)
-        key=(tuple(point),float(yaw),targets.tobytes(),sensor_pose)
+        layer=self.map.frontier_selection_layer(point)[0] if occlusion else None
+        key=(tuple(point),float(yaw),targets.tobytes(),sensor_pose,float(range_margin),layer)
         if occlusion and key in self.visibility_cache:
             cached,dependencies=self.visibility_cache[key]
-            if all(self.column_blockers(xy)==bands for xy,bands in dependencies.items()):
+            if all(self.ray_evidence(xy)==bands for xy,bands in dependencies.items()):
                 self.visibility_cache.move_to_end(key)
                 if ray_dependencies is not None:ray_dependencies.update(dependencies)
                 return cached.copy()
@@ -110,25 +166,14 @@ class ObservationModel:
         valid = (abs(az) <= s.ground_lidar_horizontal_half_angle) & \
             (el >= s.ground_lidar_elevation_min) & (el <= s.ground_lidar_elevation_max) & \
             (dist <= s.ground_lidar_max_range) & (dist > 0.)
-        valid &= dist>=s.ground_lidar_min_range
+        valid &= (dist>=s.ground_lidar_min_range+range_margin) & (dist<=s.ground_lidar_max_range-range_margin)
         if occlusion:
-            dependencies={}
+            dependencies={(*map(float,point),'selection_layer'):layer}
             for at in np.flatnonzero(valid):
                 target=targets[at]
-                target_xy=tuple(self.map.indices(target))
-                dz=target[2]-sensor[2]
-                for xy,first,last in ray_columns(sensor,target,s):
-                    if xy==target_xy:continue
-                    first,last=max(first,1e-7),min(last,1.-1e-7)
-                    if first>last:continue
-                    dependency=(*xy,float(point[2]))
-                    bands=dependencies.get(dependency)
-                    if bands is None:
-                        bands=dependencies[dependency]=self.column_blockers(dependency)
-                    z0,z1=sorted((sensor[2]+first*dz,sensor[2]+last*dz))
-                    if any(lo<=z1 and hi>=z0 for lo,hi in bands):
-                        valid[at]=False
-                        break
+                if self.grid_view_blocked(point,target,layer,dependencies):
+                    valid[at]=False
+                    continue
             self.visibility_cache[key]=(valid.copy(),dependencies)
             if ray_dependencies is not None:ray_dependencies.update(dependencies)
             while len(self.visibility_cache)>256:self.visibility_cache.popitem(last=False)
@@ -260,8 +305,7 @@ class ObservationModel:
                 completed=[p for p in completed if p!=retry]
                 view=self._admitted_view(point,unique,completed,diagnostics=diagnostics)
             if current_yaw is not None:
-                minimum_gain=max(s.fast_min_visible_cells if fast else 1,
-                                 math.ceil(.8*view['gain']) if view is not None else 0)
+                minimum_gain=max(1,math.ceil(.8*view['gain']) if view is not None else 0)
                 in_field=self.visible(point,current_yaw,unique,False)
                 if in_field.sum()>=minimum_gain and not self._tried_heading(point,current_yaw,completed):
                     current=self._admitted_view(point,unique,completed,[current_yaw],minimum_gain,diagnostics)
@@ -294,15 +338,16 @@ class ObservationModel:
                     side=self._admitted_view(point,targets,headings=[forward+offset],minimum_gain=0,diagnostics=diagnostics)
                     if side is not None:visible |= side['mask']
                 view=dict(yaw=forward,gain=len(np.unique(targets[visible],axis=0)))
-        if view is None or (attempt is not None and view['gain']==0) or (fast and view['gain']<min(s.fast_min_visible_cells,len(unique))):
+        if view is None or (attempt is not None and view['gain']==0):
             diagnostics.update(physical_frontiers=len(unique),visible_count=view['gain'] if view else 0,
-                               required_visible=min(s.fast_min_visible_cells,len(unique)) if fast else 1)
+                               required_visible=1)
             return dict(ready=False,reason=self._view_failure(diagnostics) if view is None else 'insufficient_visible_frontier',
                         diagnostic=diagnostics,
                         floor_attempt=index.settle_floor_attempt(attempt,True,tuple(point)))
         mask=view['mask'][inverse] if forward is None else visible
         keys=[key for key,keep in zip(keys,mask) if keep]
         self.task=dict(keys=keys,heights=[index.nodes[k].height for k in keys],floor_attempt=attempt,
+                       cluster=cid,members={k:index.nodes[k] for k in keys},
                        serial=self.map.integrated_serial,point=tuple(point),yaw=view['yaw'],
                        armed=False,view_yaws=[],side_yaw=side_yaw,side_keys=side_keys)
         return dict(ready=True,reason='ok',yaw=view['yaw'],gain=view['gain'],
@@ -323,7 +368,7 @@ class ObservationModel:
         evidence=self.map.surface_observation
         for key in self.task['keys']:
             boundary=index.nodes.get(key)
-            if boundary is None or self.map.ground_pending(key[1:3],key[0]):
+            if boundary is None:
                 continue
             target=(s.origin_x+key[1]*s.resolution,s.origin_y+key[2]*s.resolution,boundary.height)
             sources=[(x,y,sid) for x,y,_,sid in boundary.sources]
@@ -368,16 +413,14 @@ class ObservationModel:
     def progress(self):
         task=self.task
         if not task or not task['armed']:return dict(ready=False,reason='not_armed',gain=0,fresh=False)
-        s=self.map.settings;gain=0;fresh=False
+        s=self.map.settings;resolved=set();fresh=False
         evidence=self.map.surface_observation
         for key,height in zip(task['keys'],task['heights']):
             x,y=key[1:3]
             target=(*self.map.position((0,x,y)),height)
             check=evidence.query(target,kind='frontier',layer=key[0])
-            if check['ready']:gain+=1
+            if check['ready']:resolved.add((x,y,height))
             if evidence.has_frontier_ground((x,y),height,task['serial'],layer=key[0]):fresh=True
-            if self.map.ground_pending((x,y),key[0]):
-                continue
             if check['state']=='refuted' and evidence.refuted((x,y),height,after=task['serial'],include_step=False):
                 fresh=True
             # Frame must actually have integrated measured points near the
@@ -385,6 +428,7 @@ class ObservationModel:
             for dx,dy in ((0,0),(1,0),(-1,0),(0,1),(0,-1)):
                 if self.map.surface_observation.matching((x+dx,y+dy),height,task['serial'],kind='frontier'):fresh=True
         self._record_floor_view()
+        gain=len(resolved)
         return dict(ready=bool(gain and fresh),reason='observed' if gain and fresh else 'waiting_local_observations',gain=gain,fresh=fresh)
 
     def finish(self, point, yaw, half_angle):
@@ -405,7 +449,8 @@ class ObservationModel:
             minimum=min(covered,max(self.map.settings.floor_min_resolved_frontier_cells,
                                     math.ceil(.10*covered)))
             outcome=index.settle_floor_attempt(attempt,task.get('floor_frame_received',False),record,
-                                               sufficient_progress=0<minimum<=resolved)
+                                               sufficient_progress=0<minimum<=resolved,
+                                               failure_reason='floor_low_progress')
             settlement.update(floor_attempt=outcome,covered_frontier_cells=covered,
                               resolved_frontier_cells=resolved,minimum_resolved_frontier_cells=minimum)
         if settlement['floor_attempt']!='inconclusive':

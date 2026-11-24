@@ -1,36 +1,50 @@
-"""Transient normals of real returns; no surface fitting/filling is stored."""
+"""Observed surface sides from local geometry and the synchronized viewpoint."""
 import numpy as np
 from scipy.spatial import cKDTree
 
 
-def classify(points, origin, radius=.25, minimum=6, vertical=.5, thickness=.03):
-    """+1 upward support, -1 underside, -2 vertical, 0 insufficient evidence.
+def classify(points, origin):
+    """+1 upper face, -1 underside, -2 steep face, 0 insufficient evidence.
 
-    Orient each local normal towards the timestamp-matched sensor origin.
-    Covariances are temporary frame-local measurements, never map evidence.
+    Orient a locally fitted normal toward the observing LiDAR. Absolute point
+    height relative to that LiDAR is never a ground/ceiling classifier. Keep
+    sparse, mixed and grazing returns without promoting them to open ground.
     """
-    points=np.asarray(points,dtype=float)
+    points=np.asarray(points,dtype=float).reshape(-1,3)
+    origin=np.asarray(origin,dtype=float)
+    if origin.shape!=(3,) or not np.isfinite(origin).all():
+        raise ValueError('pct_invalid_sensor_origin')
     result=np.zeros(len(points),dtype=np.int8)
-    if len(points)<minimum:return result
-    tree=cKDTree(points)
-    for start in range(0,len(points),2048):
-        batch=points[start:start+2048]
-        distances,ids=tree.query(batch,k=min(12,len(points)),distance_upper_bound=radius,workers=1)
-        valid=ids<len(points);ids=np.minimum(ids,len(points)-1)
-        count=valid.sum(axis=1)
-        samples=points[ids];mean=(samples*valid[:,:,None]).sum(1)/np.maximum(count[:,None],1)
-        delta=(samples-mean[:,None,:])*valid[:,:,None]
-        covariance=np.einsum('nki,nkj->nij',delta,delta)/np.maximum(count[:,None,None],1)
-        values,vectors=np.linalg.eigh(covariance)
-        normals=vectors[:,:,0]
-        facing=np.einsum('ni,ni->n',normals,np.asarray(origin)-mean)
-        normals=np.where((facing<0)[:,None],-normals,normals)
-        usable=(count>=minimum)&(values[:,1]>1e-6)&(values[:,0]<=thickness*thickness)&\
-               (values[:,0]<=.15*values[:,1])&(abs(facing)>.01)
-        labels=np.where(normals[:,2]>=vertical,1,np.where(normals[:,2]<=-vertical,-1,-2))
-        # At grazing incidence a small fitted tilt can reverse the sign.
-        # Require the sensor to have viewed a horizontal face from its side.
-        height_delta=origin[2]-batch[:,2]
-        usable &= (labels==-2) | (labels*height_delta>.03)
-        result[start:start+len(batch)]=np.where(usable,labels,0)
-    return result
+    if len(points)<6:return result
+    # One representative per 2.5 cm voxel bounds duplicate-hit work and avoids
+    # treating six identical returns as a measured plane.
+    _,selected,inverse=np.unique(np.floor(points/.025).astype(np.int64),axis=0,
+                                 return_index=True,return_inverse=True)
+    samples=points[selected]
+    if len(samples)<6:return result
+    tree=cKDTree(samples)
+    distances,indices=tree.query(samples,k=min(16,len(samples)),distance_upper_bound=.25)
+    valid=np.isfinite(distances)
+    neighbors=samples[np.minimum(indices,len(samples)-1)]
+    count=valid.sum(axis=1)
+    mean=(neighbors*valid[:,:,None]).sum(axis=1)/np.maximum(count,1)[:,None]
+    delta=(neighbors-mean[:,None,:])*valid[:,:,None]
+    covariance=np.einsum('nki,nkj->nij',delta,delta)/np.maximum(count,1)[:,None,None]
+    values,vectors=np.linalg.eigh(covariance)
+    normals=vectors[:,:,0]
+    planar=(count>=6)&(values[:,1]>1e-6)&(values[:,0]<=.03*np.maximum(values.sum(axis=1),1e-12))
+    sight=origin-mean
+    side=np.einsum('ni,ni->n',normals,sight)
+    # A grazing ray cannot establish which face of a horizontal sheet was seen.
+    # At long, grazing range a small normal error can invert the observed
+    # side. Reject statistically ambiguous signs instead of using absolute Z
+    # as a fallback. This also prevents false low ceilings on noisy ground.
+    angular_error=np.sqrt(np.maximum(values[:,0],0.)/np.maximum(count*values[:,1],1e-12))
+    uncertainty=3.*np.linalg.norm(sight,axis=1)*angular_error
+    observed=planar&(np.abs(side)>np.maximum(.005,uncertainty))
+    normals*=np.where(side>=0.,1.,-1.)[:,None]
+    roles=np.zeros(len(samples),dtype=np.int8)
+    roles[observed & (normals[:,2]>.5)]=1
+    roles[observed & (normals[:,2]<-.5)]=-1
+    roles[observed & (np.abs(normals[:,2])<=.5)]=-2
+    return roles[inverse]

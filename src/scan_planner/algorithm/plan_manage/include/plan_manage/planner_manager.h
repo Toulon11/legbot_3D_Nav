@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #include <string>
+#include <cstdint>
 
 #include <bspline_opt/bspline_optimizer.h>
 #include <bspline_opt/uniform_bspline.h>
@@ -38,6 +39,9 @@ namespace scan_planner
                                  const std::vector<Eigen::Vector3d> &waypoints, const Eigen::Vector3d &end_vel, const Eigen::Vector3d &end_acc);
 
     void initPlanModules(legbot::NodeHandle &nh, PlanningVisualization::Ptr vis = NULL);
+    void setGoalStamp(std::uint64_t stamp) { current_goal_stamp_ns_ = stamp; }
+    void clearInitializationStatus() { initialization_budget_exhausted_=false; }
+    bool initializationBudgetExhausted() const { return initialization_budget_exhausted_; }
 
     PlanParameters pp_;
     LocalTrajData local_data_;
@@ -51,6 +55,10 @@ namespace scan_planner
     BsplineOptimizer::Ptr bspline_optimizer_rebound_;
 
     int continuous_failures_count_{0};
+    std::uint64_t current_goal_stamp_ns_{0}, trajectory_goal_stamp_ns_{0};
+    bool have_goal_trajectory_{false};
+    double initialization_timeout_{.1};
+    bool initialization_budget_exhausted_{false};
     std::string global_reference_mode_;
 
     void updateTrajInfo(const UniformBspline &position_traj, const legbot::Time time_now);

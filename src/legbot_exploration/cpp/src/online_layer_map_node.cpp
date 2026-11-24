@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <iomanip>
+#include <limits>
 #include <deque>
 #include <optional>
 #include <mutex>
@@ -22,7 +23,7 @@ sensor_msgs::msg::PointCloud2 cloud_message(std::vector<std::uint8_t> data,
     const std_msgs::msg::Header &header,bool surfaces) {
   using Field=sensor_msgs::msg::PointField;
   sensor_msgs::msg::PointCloud2 out;out.header=header;out.height=1;
-  out.is_bigendian=false;out.is_dense=false;out.point_step=surfaces?56:16;
+  out.is_bigendian=false;out.is_dense=false;out.point_step=surfaces?64:16;
   out.width=data.size()/out.point_step;out.row_step=out.width*out.point_step;out.data=std::move(data);
   const auto field=[&](const char *name,int offset,int type) {
     Field f;f.name=name;f.offset=offset;f.datatype=type;f.count=1;out.fields.push_back(f);
@@ -33,6 +34,7 @@ sensor_msgs::msg::PointCloud2 cloud_message(std::vector<std::uint8_t> data,
     field("source",28,Field::UINT32);field("flags",32,Field::UINT32);field("slice_index",36,Field::UINT32);
     field("passage_cost",40,Field::FLOAT32);field("relief_cost",44,Field::FLOAT32);
     field("terrain_cost",48,Field::FLOAT32);field("inflated_terrain_cost",52,Field::FLOAT32);
+    field("node_z",56,Field::FLOAT32);field("C_clear",60,Field::FLOAT32);
   }
   return out;
 }
@@ -42,6 +44,7 @@ double wall_now() {return std::chrono::duration<double>(std::chrono::steady_cloc
 class OnlineLayerMapNode : public rclcpp::Node {
   struct CloudInput {
     std::string topic,pose_topic;
+    bool frontier_query_reference=false;
     std::deque<nav_msgs::msg::Odometry::ConstSharedPtr> poses;
     std::deque<sensor_msgs::msg::PointCloud2::ConstSharedPtr> pending;
     std::atomic<std::uint64_t> filtered_far{0},dropped_pose{0},matched{0};
@@ -74,15 +77,17 @@ class OnlineLayerMapNode : public rclcpp::Node {
       settings<<'"'<<key<<"\":"<<std::quoted(declare_parameter<std::string>(parameter,value));
     };
     text("mapping_mode","pct_mapping_mode","static");
+    settings<<",\"allow_open_ceiling\":"
+        <<(declare_parameter<bool>("pct_allow_open_ceiling",true)?"true":"false");
     integer("block_size","pct_block_size",32);
     integer("slice_update_workers","pct_slice_update_workers",0);
     integer("maturity_min_points","pct_maturity_min_points",3);
+    integer("ascent_lookahead_slices","pct_ascent_lookahead_slices",3);
     shared_->surface_noise_tolerance=number("surface_noise_tolerance","pct_surface_noise_tolerance",.05);
+    number("open_ceiling_share_height","pct_open_ceiling_share_height",5.);
+    number("column_continuity_threshold","pct_column_continuity_threshold",.10);
+    reliable_range_=number("reliable_observation_range","pct_reliable_observation_range",5.);
     number("new_height_threshold","pct_new_height_threshold",.10);
-    number("surface_normal_radius","pct_surface_normal_radius",.25);
-    integer("surface_normal_min_points","pct_surface_normal_min_points",6);
-    number("surface_normal_vertical","pct_surface_normal_vertical",.5);
-    number("surface_normal_thickness","pct_surface_normal_thickness",.03);
     number("planning_budget_seconds","pct_planning_budget_seconds",1.5);
     number("observation_revisit_radius","pct_observation_revisit_radius",1.0);
     integer("floor_min_resolved_frontier_cells","pct_floor_min_resolved_frontier_cells",5);
@@ -94,10 +99,6 @@ class OnlineLayerMapNode : public rclcpp::Node {
     settings<<",\"floor_four_direction_search\":"
         <<(declare_parameter<bool>("pct_floor_four_direction_search",false)?"true":"false");
     number("floor_direction_search_timeout","pct_floor_direction_search_timeout_seconds",1.5);
-    number("landing_support_radius","pct_landing_support_radius",.60);
-    number("landing_min_area","pct_landing_min_area",1.50);
-    number("landing_min_width","pct_landing_min_width",.80);
-    number("landing_min_depth","pct_landing_min_depth",1.00);
     number("ground_lidar_x","ground_lidar_x",.35);
     number("ground_lidar_z","ground_lidar_z",.20);
     number("ground_lidar_pitch","ground_lidar_pitch",.6108652381980153);
@@ -145,7 +146,6 @@ class OnlineLayerMapNode : public rclcpp::Node {
     graph_pub_=create_publisher<visualization_msgs::msg::MarkerArray>("/exploration/layers/graph_preview",qos);
     path_pub_=create_publisher<nav_msgs::msg::Path>("/exploration/layers/candidate_path",qos);
     cloud_group_=create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-    reliable_range_=declare_parameter<double>("pct_reliable_observation_range",5.0);
     if(!std::isfinite(reliable_range_) || reliable_range_<0)throw std::invalid_argument("invalid PCT reliable observation range");
     add_input(cloud,declare_parameter<std::string>("cloud_sensor_odom_topic","/slam/odometry_lidar"));
     const auto auxiliary=declare_parameter<std::string>("auxiliary_cloud_topic","");
@@ -156,6 +156,7 @@ class OnlineLayerMapNode : public rclcpp::Node {
     base_sub_=create_subscription<nav_msgs::msg::Odometry>(base,rclcpp::SensorDataQoS(),[this](nav_msgs::msg::Odometry::ConstSharedPtr msg){
       if(msg->header.frame_id!=frame_)return;
       base_={msg->pose.pose.position.x,msg->pose.pose.position.y,msg->pose.pose.position.z};base_wall_=wall_now();
+      body_height_.store(base_[2]);body_wall_.store(base_wall_);
     });
     timer_=create_wall_timer(std::chrono::duration<double>(period),[this]{publish_map();});
     RCLCPP_INFO(get_logger(),"Online PCT map: %zu LiDAR inputs, registered XYZ only",inputs_.size());
@@ -181,6 +182,9 @@ class OnlineLayerMapNode : public rclcpp::Node {
   }
   void add_input(const std::string &cloud,const std::string &pose_topic) {
     auto owned=std::make_unique<CloudInput>();auto *input=owned.get();input->topic=cloud;input->pose_topic=pose_topic;
+    // The first (cloud_topic) input is the fixed query reference. Auxiliary
+    // LiDARs contribute geometry without alternating the query height.
+    input->frontier_query_reference=inputs_.empty();
     rclcpp::SubscriptionOptions options;options.callback_group=cloud_group_;
     if(reliable_range_>0)input->pose_sub=create_subscription<nav_msgs::msg::Odometry>(pose_topic,rclcpp::SensorDataQoS(),
       [this,input](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
@@ -207,39 +211,57 @@ class OnlineLayerMapNode : public rclcpp::Node {
     inputs_.push_back(std::move(owned));
   }
   void on_cloud(const sensor_msgs::msg::PointCloud2 &msg,CloudInput &input,const std::optional<le::Point> &origin) {
-    std::vector<le::LayerPoint> points;points.reserve(static_cast<std::size_t>(msg.width)*msg.height);
+    if(wall_now()<shared_->reader_yield_until.load()) {++shared_->dropped_planning;return;}
+    std::vector<le::LayerPoint> points,free_rays;points.reserve(static_cast<std::size_t>(msg.width)*msg.height);
     try {
       sensor_msgs::PointCloud2ConstIterator<float> x(msg,"x"),y(msg,"y"),z(msg,"z");
       for(;x!=x.end();++x,++y,++z)if(std::isfinite(*x)&&std::isfinite(*y)&&std::isfinite(*z)) {
-        if(origin && std::pow(*x-(*origin)[0],2)+std::pow(*y-(*origin)[1],2)+std::pow(*z-(*origin)[2],2)>reliable_range_*reliable_range_) {++input.filtered_far;continue;}
+        if(origin && std::pow(*x-(*origin)[0],2)+std::pow(*y-(*origin)[1],2)+std::pow(*z-(*origin)[2],2)>reliable_range_*reliable_range_) {
+          ++input.filtered_far;free_rays.push_back({*x,*y,*z});continue;
+        }
         points.push_back({*x,*y,*z});
       }
     }catch(const std::runtime_error &e){++invalid_cloud_;RCLCPP_WARN(get_logger(),"Invalid registered XYZ: %s",e.what());return;}
-    if(points.empty())return;
+    if(points.empty()&&free_rays.empty())return;
     shared_->last_sensor_wall_seconds.store(wall_now());
     if(shared_->planning_active.load()){++shared_->dropped_planning;return;}
     const auto start=wall_now();
     std::unique_lock<std::shared_mutex> lock(shared_->mutex,std::try_to_lock);
-    if(!lock.owns_lock()||shared_->planning_active.load()){++shared_->dropped_planning;return;}
-    shared_->pct->append(points,origin);
+    if(!lock.owns_lock()||shared_->planning_active.load() || wall_now()<shared_->reader_yield_until.load()) {
+      ++shared_->dropped_planning;return;
+    }
+    const double body=body_height_.load();
+    shared_->pct->append(points,origin,std::isfinite(body)&&wall_now()-body_wall_.load()<.5?
+                        std::optional<double>{body}:std::nullopt,free_rays,
+                        input.frontier_query_reference&&origin?std::optional<double>{(*origin)[2]}:std::nullopt);
     if(!shared_->pct->last_error().empty()) {
       ++rejected_;RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),5000,"PCT integration failed: %s",shared_->pct->last_error().c_str());return;
     }
+    const auto version=++shared_->current_version;
+    // This callback runs on the map executor. Keep fusion and commit in the
+    // same write phase; the explorer never sees half-integrated evidence and
+    // never has to finish a build in an odometry/action callback.
+    if(!shared_->pct->refresh(version)) {
+      ++rejected_;RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),5000,"PCT commit failed: %s",shared_->pct->last_error().c_str());return;
+    }
+    shared_->committed_version.store(version);
+    shared_->published_wall_seconds.store(wall_now());
     ++input.integrated;
-    ++received_;integrated_+=points.size();last_raw_=points.size();++shared_->current_version;
+    ++received_;integrated_+=points.size();last_raw_=points.size();
     shared_->last_integration_wall_seconds.store(wall_now());
     integration_ms_=1000*(wall_now()-start);
+    shared_->writer_finished();
   }
   void publish_map() {
     const auto started=wall_now();
-    if(shared_->planning_active.load())return;
+    if(shared_->planning_active.load() || started<shared_->reader_yield_until.load())return;
     le::PctInspection inspection;std::string metadata;std::uint64_t version;bool ready=false;
     double lock_wait_ms=0,commit_ms=0,inspection_ms=0,locked_ms=0;
     std::size_t surface_records=0;
     {
       std::unique_lock<std::shared_mutex> lock(shared_->mutex);
       const auto acquired=wall_now();lock_wait_ms=1000*(acquired-started);
-      if(shared_->planning_active.load())return;
+      if(shared_->planning_active.load() || wall_now()<shared_->reader_yield_until.load())return;
       version=shared_->current_version.load();
       if(shared_->pct->point_count())ready=shared_->pct->refresh(version);
       const auto committed=wall_now();commit_ms=1000*(committed-acquired);
@@ -252,6 +274,7 @@ class OnlineLayerMapNode : public rclcpp::Node {
       metadata=shared_->pct->map_metadata();
       surface_records=shared_->pct->point_count();
       inspection_ms=1000*(wall_now()-committed);locked_ms=1000*(wall_now()-acquired);
+      shared_->writer_finished();
     }
     std_msgs::msg::Header header;header.frame_id=frame_;header.stamp=now();
     if(show_ && inspection.valid) {
@@ -262,7 +285,7 @@ class OnlineLayerMapNode : public rclcpp::Node {
     }
     if(show_)publish_preview(inspection,header);
     std::ostringstream json;
-    json<<"{\"backend\":\"project_pct_fixed_online\",\"version\":"<<version
+    json<<"{\"backend\":\"project_pct_interval_online\",\"version\":"<<version
       <<",\"reliable_observation_range\":"<<reliable_range_
       <<",\"pct_version\":"<<version<<",\"pct_ready\":"<<(ready?"true":"false")
       <<",\"pct_surface_records\":"<<surface_records
@@ -289,6 +312,7 @@ class OnlineLayerMapNode : public rclcpp::Node {
       json<<"{\"topic\":"<<std::quoted(input.topic)<<",\"seen\":"<<input.seen.load()
           <<",\"integrated\":"<<input.integrated.load()
           <<",\"sensor_pose_topic\":"<<std::quoted(input.pose_topic)
+          <<",\"frontier_query_reference\":"<<(input.frontier_query_reference?"true":"false")
           <<",\"matched_pose_frames\":"<<input.matched.load()<<",\"waiting_pose_frames\":"<<input.waiting_pose.load()
           <<",\"dropped_pose_frames\":"<<input.dropped_pose.load()<<",\"filtered_far_points\":"<<input.filtered_far.load()<<'}';
     }
@@ -313,6 +337,7 @@ class OnlineLayerMapNode : public rclcpp::Node {
   std::shared_ptr<le::SharedLayerMap> shared_;
   std::vector<std::unique_ptr<CloudInput>> inputs_;
   le::Point base_{};double base_wall_=0,graph_radius_=7,graph_gain_=.07,reliable_range_=5.;
+  std::atomic<double> body_height_{std::numeric_limits<double>::quiet_NaN()},body_wall_{0.};
   std::atomic<double> integration_ms_{0};
   int max_display_=120000,graph_candidates_=8,graph_nodes_=4000;
   bool show_=true,preview_=true;std::string frame_;

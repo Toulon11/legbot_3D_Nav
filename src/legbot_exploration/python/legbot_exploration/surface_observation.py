@@ -5,32 +5,6 @@ from dataclasses import dataclass, field
 import math
 import numpy as np
 
-FRONTIER_GROUND_TOLERANCE = .16
-
-
-@dataclass(frozen=True)
-class FloorGroundBand:
-    height: float
-    lower_ground: float
-    upper_ground: float
-    cutoff: int
-    arrival_frame: int
-    first_slice: int
-
-    def includes(self, layer, ground):
-        # G is nondecreasing within a column. A higher independent G
-        # terminates this floor's dependency range, including all its aliases.
-        return layer >= self.first_slice and (
-            not math.isfinite(ground) or ground <= self.upper_ground+1e-7)
-
-    def ground_seen(self, ground):
-        if ground is None:
-            return False
-        # Near-platform hits from the approach are reusable. After arrival,
-        # a new hit can resolve a work cell at its measured G.
-        cutoff = self.cutoff if ground.height >= self.lower_ground-1e-7 else self.arrival_frame
-        return ground.last_seen > cutoff
-
 
 @dataclass
 class SurfaceExpectation:
@@ -80,8 +54,6 @@ class SurfaceObservation:
         self.last_height = None
         self.height_serial = 0
         self.frontier_floors = {}
-        self.ground_bands = ()
-        self.last_registered_floor_frame = None
         self.last_work = dict(ray_bands=0, ray_targets=0, changed_columns=0)
 
     @staticmethod
@@ -97,59 +69,29 @@ class SurfaceObservation:
         column = self.map.columns.get(tuple(xy))
         return tuple(r for r in column.values()
                      if math.isfinite(r.height) and
-                     (kind not in ('ground','search') or r.orientation in (0, 1)) and
-                     (kind != 'frontier' or r.orientation != -1) and
+                     (kind not in ('ground','search','frontier') or r.orientation==1) and
                      (after is None or r.last_seen > after)) if column else ()
 
     def matching(self, xy, height, after=None, kind='ground'):
         tolerance = self.map.settings.surface_noise_tolerance + 1e-7
         return tuple(r for r in self.observed(xy,after,kind) if abs(r.height-height) <= tolerance)
 
-    def floor_ground_band(self, height):
-        nearest = min((floor for floor, (tolerance, _, _) in self.frontier_floors.items()
-                       if floor is not None and abs(floor-height) <= tolerance+1e-7),
-                      key=lambda floor: abs(floor-height), default=None)
-        return next((band for band in self.ground_bands if band.height==nearest),None)
+    def registered_floor(self, height):
+        return any(abs(floor-height) <= tolerance+1e-7
+                   for floor,tolerance in self.frontier_floors.items())
 
     def first_ground_slice(self, height):
         s=self.map.settings
-        # Match SurfaceColumn.at: a return at the cut can supply G.
-        return math.ceil((height-s.origin_z-1e-7)/s.slice_dh)
-
-    def begin_crossing(self):
-        self.frontier_floors.setdefault(None,(0.,self.map.integrated_serial,None))
-
-    def cancel_crossing(self):
-        self.frontier_floors.pop(None,None)
+        # A cut is strictly above G, including exact grid-aligned surfaces.
+        return math.floor((height-s.origin_z+1e-7)/s.slice_dh)+1
 
     def enter_frontier_floor(self, ground, tolerance):
         height = float(ground[2])
-        crossing=self.frontier_floors.pop(None,None)
-        if any(abs(floor-height) <= max(tolerance, band)+1e-7
-               for floor, (band, _, _) in self.frontier_floors.items()):
+        if any(abs(floor-height) <= max(tolerance,band)+1e-7
+               for floor,band in self.frontier_floors.items()):
             return False
-        cutoff=None
-        if crossing is not None:
-            cutoff=crossing[1]
-        elif self.frontier_floors:
-            cutoff=(self.last_registered_floor_frame if self.last_registered_floor_frame is not None
-                    else self.map.integrated_serial)
-        self.frontier_floors[height] = (tolerance, cutoff, self.map.integrated_serial)
-        heights=sorted(self.frontier_floors,reverse=True)
-        bands=[]
-        above=math.inf
-        for h in heights:
-            band_tolerance,start,arrival=self.frontier_floors[h]
-            if start is not None:
-                lower_ground=h-min(band_tolerance,self.map.settings.surface_noise_tolerance)
-                bands.append(FloorGroundBand(h,lower_ground,min(h+band_tolerance,(h+above)*.5),start,arrival,
-                                             self.first_ground_slice(h)))
-            above=h
-        self.ground_bands=tuple(bands)
-        if cutoff is not None:
-            affected = self._discard_inferred_floor_records(height,tolerance)
-            self.map.evidence_dirty.update(affected)
-            self.map.schedule_floor_ground(self.floor_ground_band(height))
+        self.frontier_floors[height] = tolerance
+        self.map.evidence_dirty.update(self._discard_inferred_floor_records(height,tolerance))
         return True
 
     def _discard_inferred_floor_records(self, height, tolerance):
@@ -176,24 +118,29 @@ class SurfaceObservation:
         return affected
 
     def has_frontier_ground(self, xy, height, after=None, *, height_span=None, layer=None):
-        """An observed ground can cover an ordinary frontier without matching its surface."""
+        """Explicit target-height evidence; ordinary knownness is frontier_settled."""
         low, high = (height, height) if height_span is None else height_span
-        tolerance = FRONTIER_GROUND_TOLERANCE + 1e-7
+        s = self.map.settings
+        tolerance = s.surface_noise_tolerance + 1e-7
         if layer is None:layer=self.first_ground_slice(height)
-        if self.map.ground_pending(xy,layer):
+        row = self.map.observed_cell((layer,*xy),ground_height=height)
+        in_interval = row is not None
+        if not in_interval:
             return False
-        return any(high-tolerance <= r.height <= low+tolerance
-                   for r in self.observed(xy,after,kind='ground'))
+        if after is None and height_span is None:
+            return in_interval
+        records = self.observed(xy,after,kind='ground')
+        return (row['G']<=low+tolerance and high<row['C']-1e-7 and
+                (after is None or any(r.id==row['g_surface_id'] for r in records)))
 
     def frontier_settled(self, xy, height, sources=(), *, layer=None):
         if layer is None:layer=self.first_ground_slice(height)
-        return not self.map.ground_pending(xy,layer) and (
-            self.has_frontier_ground(xy,height,layer=layer) or self.refuted(xy,height,sources,include_step=False))
+        return self.map.frontier_observed(layer,xy)
 
     def is_ground_source(self, xy, identity):
         # Explicit imported/test planner cells may have no column reference.
         # Real online cells always retain their physical surface identity.
-        return not identity or any(r.id==identity and r.orientation!=-1 for r in self.observed(xy))
+        return not identity or any(r.id==identity and r.orientation==1 for r in self.observed(xy))
 
     def local_sources(self, point, kind='ground'):
         x,y=map(int,self.map.indices(point))
@@ -319,7 +266,7 @@ class SurfaceObservation:
                height_range=None, neighbor_inferred=False):
         height = float(point[2])
         neighbor_inferred = neighbor_inferred or kind=='frontier'
-        if neighbor_inferred and self.floor_ground_band(height) is not None:
+        if neighbor_inferred and self.registered_floor(height):
             return None
         xy = tuple(map(int, self.map.indices(point)))
         sources = tuple(sorted(set(tuple(map(int, source)) for source in sources)))
@@ -372,11 +319,6 @@ class SurfaceObservation:
                    self._compatible(r.sources, sources) and (after is None or r.resolved_at > after)
                    for identity in self.by_column.get(tuple(xy), ()) for r in (self.records[identity],))
 
-    def ceiling_band_seen_free(self,xy,height,after):
-        return any(r.state=='refuted' and r.kind!='search' and r.resolved_at>after and
-                   r.center_range[0]-1e-7<=height<=r.center_range[1]+1e-7 and self._covers_height(r,height)
-                   for identity in self.by_column.get(xy,()) for r in (self.records[identity],))
-
     def _band(self, record):
         noise=self.map.settings.surface_noise_tolerance
         lo,hi=record.height_range if record.height_range is not None else (
@@ -408,20 +350,20 @@ class SurfaceObservation:
         xy = tuple(map(int, self.map.indices(point)))
         ordinary=kind=='frontier' or (expectation is not None and expectation.neighbor_inferred)
         if layer is None:layer=self.first_ground_slice(point[2])
-        if ordinary and self.map.ground_pending(xy,layer):
-            return dict(state='unresolved',ready=False,
-                        surfaces=[],new_heights=[],lower_observed=False,higher_observed=False)
         matches = (self._matches(expectation,after) if expectation is not None and expectation.height_range is not None
                    else self.matching(xy,float(point[2]),after,kind))
         fresh = self.observed(xy,after,kind) if after is not None else ()
         state='unresolved'
-        if matches:
+        if ordinary:
+            covered=(self.frontier_settled(xy,point[2],layer=layer) if after is None else
+                     self.has_frontier_ground(xy,point[2],after,layer=layer))
+            if covered:
+                state='frontier_covered'
+        elif matches:
             state='matched'
-        elif ordinary and self.has_frontier_ground(xy,point[2],after,layer=layer):
-            state='frontier_covered'
         elif self.refuted(xy,point[2],sources,after,include_step=not ordinary):
             state='refuted'
-        if (not matches and expectation is not None and expectation.state in ('refuted','superseded') and
+        if (not ordinary and not matches and expectation is not None and expectation.state in ('refuted','superseded') and
                 (expectation.height_range is not None or self._covers_height(expectation,point[2])) and
                 (after is None or expectation.resolved_at>after)):
             state='refuted'
@@ -435,9 +377,6 @@ class SurfaceObservation:
     def visit_height(self, ground):
         """One trigger per newly reached height; all anchors below are real G."""
         height = float(ground[2])
-        if any(h is not None and abs(h-height)<=min(tolerance,.04)+1e-7
-               for h,(tolerance,_,_) in self.frontier_floors.items()):
-            self.last_registered_floor_frame=self.map.integrated_serial
         self.highest_measured=height if self.highest_measured is None else max(height,self.highest_measured)
         if not self.visited_heights:
             self.visited_heights.append(height)
@@ -451,68 +390,16 @@ class SurfaceObservation:
         self.height_triggers += 1
         self.last_height = height
         self.height_serial=self.map.integrated_serial
-        if self.floor_ground_band(height) is not None:
-            return dict(triggered=True, reason='new_measured_height', registered_targets=0, **self.status())
-        m, s = self.map, self.map.settings
-        radius = max(s.robot_radius+s.safety_margin, s.ground_lidar_min_range)+.15
-        cells = {(x, y) for x, y, _ in m.footprint_cells(ground, radius)}
-        # Grow a real, same-height component, not an inferred surface patch.
-        center = tuple(map(int, m.indices(ground)))
-        anchors, pending = {}, [center]
-        seen = set()
-        while pending:
-            xy = pending.pop()
-            if xy in seen or xy not in cells:
-                continue
-            seen.add(xy)
-            choices = [(k, row) for k, row in m.layers_at(*xy) if s.origin_z+k*s.slice_dh>height+1e-7 and
-                       row['measured'] and not row['unknown'] and
-                       not row['solid'] and self.is_ground_source(xy,int(row['g_surface_id'])) and
-                       abs(float(row['G'])-height) <= s.surface_noise_tolerance+1e-7]
-            if not choices:
-                continue
-            k, row = min(choices, key=lambda item: (abs(float(item[1]['G'])-height), item[0]))
-            h,sid=float(row['G']),int(row['g_surface_id'])
-            cuts={cut for cut,other in choices if int(other['g_surface_id'])==sid and
-                  abs(float(other['G'])-h)<=s.surface_noise_tolerance+1e-7}
-            anchors[xy] = (h,sid,cuts)
-            pending.extend((xy[0]+dx, xy[1]+dy) for dx, dy in ((0,1),(0,-1),(1,0),(-1,0)))
-        targets=defaultdict(list)
-        for xy, (h, sid, cuts) in anchors.items():
-            if self.floor_ground_band(h) is not None:
-                continue
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    target = xy[0]+dx, xy[1]+dy
-                    if target not in cells:
-                        continue
-                    if self.has_frontier_ground(target,h):
-                        continue
-                    # All anchors belong to this measured connected patch.
-                    # Merge compatible height spans before registering, so a
-                    # different neighboring source does not create another task.
-                    group=next((g for g in targets[target] if
-                                max(g['high'],h)-min(g['low'],h)<=s.surface_noise_tolerance+1e-7),None)
-                    if group is None:
-                        group=dict(height=h,low=h,high=h,sources=set(),slices=set())
-                        targets[target].append(group)
-                    group['low']=min(group['low'],h);group['high']=max(group['high'],h)
-                    group['sources'].add((*xy,sid));group['slices'].update(cuts)
-        made=set()
-        for target,groups in targets.items():
-            for group in groups:
-                record=self.expect((*m.position((0,*target)),group['height']),sources=group['sources'],
-                                   slices=group['slices'],review=True,neighbor_inferred=True)
-                made.add(record.id)
-        return dict(triggered=True, reason='new_measured_height', registered_targets=len(made), **self.status())
+        # Height changes register navigation context only. Ordinary mapping
+        # and the cut's known/unknown boundary generate all exploration work.
+        return dict(triggered=True, reason='new_measured_height', registered_targets=0, **self.status())
 
     def status(self):
         return dict(highest_visited=self.highest_measured,
                     height_serial=self.height_serial,
                     height_anchor=self.last_height if self.last_height is not None else next(iter(self.visited_heights),None),
                     visited_heights=list(self.visited_heights),height_triggers=self.height_triggers,
-                    frontier_floors=[dict(height=height,observation_start_frame=self.frontier_floors[height][1])
-                                     for height in sorted(h for h in self.frontier_floors if h is not None)],
+                    frontier_floors=[dict(height=height) for height in sorted(self.frontier_floors)],
                     trigger_threshold=self.map.settings.new_height_threshold,
                     expectations=len(self.records), pending=sum(map(len, self.pending_tiles.values())),
                     **self.last_work)

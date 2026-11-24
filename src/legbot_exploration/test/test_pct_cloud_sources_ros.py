@@ -36,6 +36,7 @@ with tempfile.TemporaryFile(mode='w+') as log:
     down=node.create_publisher(PointCloud2,'/test/down_cloud',10)
     main_pose=node.create_publisher(Odometry,'/test/main_pose',10)
     down_pose=node.create_publisher(Odometry,'/test/down_pose',10)
+    body_pose=node.create_publisher(Odometry,'/slam/global_odometry_base',10)
     points=[(x*.1,y*.1,0.) for x in range(-10,11) for y in range(-10,11) if (x,y)!=(0,0)]*3
     def patch(x, y, z):
         return [(x+dx,y+dy,z) for dx in (-.02,0.,.02) for dy in (-.02,0.,.02)]
@@ -47,6 +48,9 @@ with tempfile.TemporaryFile(mode='w+') as log:
             if condition():return
         raise AssertionError('timeout; states='+str(states[-1:]))
     def pose(publisher,header,origin):
+        body=Odometry();body.header=header;body.pose.pose.orientation.w=1.
+        body.pose.pose.position.x=origin[0];body.pose.pose.position.y=origin[1]
+        body.pose.pose.position.z=.32;body_pose.publish(body)
         msg=Odometry();msg.header=header;msg.pose.pose.orientation.w=1.
         msg.pose.pose.position.x=origin[0];msg.pose.pose.position.y=origin[1];msg.pose.pose.position.z=origin[2]
         publisher.publish(msg)
@@ -65,14 +69,18 @@ with tempfile.TemporaryFile(mode='w+') as log:
     def auxiliary():
         return next(s for s in states[-1]['cloud_sources'] if s['topic']=='/test/down_cloud')
     try:
-        spin_until(lambda:cloud.get_subscription_count()>0 and down.get_subscription_count()>0 and main_pose.get_subscription_count()>0 and down_pose.get_subscription_count()>0)
+        spin_until(lambda:cloud.get_subscription_count()>0 and down.get_subscription_count()>0 and main_pose.get_subscription_count()>0 and down_pose.get_subscription_count()>0 and body_pose.get_subscription_count()>0)
         send(cloud,points)
         spin_until(lambda:states and states[-1]['clouds_received']>=1 and surfaces)
+        assert states[-1]['cloud_sources'][0]['frontier_query_reference']
+        assert abs(states[-1]['pct_map']['frontier_query_height']-.5)<1e-6
         assert not len(center()),'enclosed hole was filled without real hits'
         # A registered second sensor can complete the observed floor; no
         # synthetic pose publisher, shared ray origin, or interpolation needed.
-        send(down,patch(0.,0.,0.))
+        send(down,patch(0.,0.,0.),origin=(0.,0.,.7))
         spin_until(lambda:auxiliary()['integrated']>=1 and len(center())>0)
+        assert not auxiliary()['frontier_query_reference']
+        assert abs(states[-1]['pct_map']['frontier_query_height']-.5)<1e-6,'auxiliary sensor changed the primary query height'
         assert ((center()['flags']&32)!=0).all(),'real G did not mature'
         assert abs(center()['z']).max()<1e-6
         send(down,[(.3,.3,1.)]*3,frame='wrong_frame')
@@ -100,6 +108,26 @@ with tempfile.TemporaryFile(mode='w+') as log:
         spin_until(lambda:auxiliary()['integrated']>integrated and len(at(8.,0.))>0)
         assert ((at(8.,0.)['flags']&32)!=0).all()
         assert not len(at(8.,0.,.07)), 'far noise leaked into a second height group'
+        # A new upper hit must not turn an old underside into third-floor G.
+        integrated=states[-1]['cloud_sources'][0]['integrated']
+        send(cloud,patch(-4.,0.,1.46)+patch(-4.,0.,2.87),origin=(-4.,0.,1.8))
+        spin_until(lambda:states[-1]['cloud_sources'][0]['integrated']>integrated)
+        integrated=states[-1]['cloud_sources'][0]['integrated']
+        send(cloud,patch(-4.,0.,4.36),origin=(-4.,0.,3.3))
+        spin_until(lambda:states[-1]['cloud_sources'][0]['integrated']>integrated and
+                   states[-1]['pct_map'].get('pending_ground_intervals',0)>0)
+        assert abs(states[-1]['pct_map']['frontier_query_height']-3.3)<1e-6
+        assert not len(at(-4.,0.,2.87)), 'upper return promoted the unconfirmed underside'
+        integrated=states[-1]['cloud_sources'][0]['integrated']
+        send(cloud,[(-3.949,0.,2.87)]*3,origin=(-4.,0.,3.7))
+        spin_until(lambda:states[-1]['cloud_sources'][0]['integrated']>integrated)
+        assert not len(at(-4.,0.,2.87)), 'traversed free rays substituted for a direct ground hit'
+        # The true ground is inside the old candidate interval. It must be
+        # integrated, not discarded because the old G/C already covered it.
+        send(cloud,patch(-4.,0.,2.96),origin=(-4.,0.,3.7))
+        spin_until(lambda:len(at(-4.,0.,2.96))>0)
+        assert abs(float(at(-4.,0.,2.96)['ceiling_z'][0])-4.36)<1e-5
+        print('PASS finite ground admission: upper hits and traversed free rays cannot promote underside; direct interior ground hit and actual headroom enable the new node')
         print('PASS near-only, exact-stamp multi-sensor evidence; far points never mature, approaching sensor can mature the same world cell')
         print('PASS real-only multi-cloud fusion: enclosed hole stays unknown, real hits fill it, wrong frame rejected')
     except Exception:

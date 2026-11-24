@@ -95,7 +95,7 @@ class PctFrontierTest(unittest.TestCase):
         points=np.asarray([[i*.1,j*.1,z] for i in range(-20,21) for j in range(-20,21) for z in (0.,1.5)],dtype='float32')
         a.integrate(memoryview(points));a.prepare(b'',7)
         result=a.frontiers(b'',7)
-        observation=result['clusters'][0]['observations'][0]
+        observation=next(c for c in result['clusters'] if abs(c['frontier'][2])<.05)['observations'][0]
         target=np.asarray(observation)+[0,0,.32]
         reason,route,_=a.plan_surface(b'',7,(0,0,.32),target)
         self.assertEqual(reason,'ok');self.assertTrue(route)

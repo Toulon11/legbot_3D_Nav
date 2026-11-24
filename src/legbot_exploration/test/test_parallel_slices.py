@@ -24,7 +24,8 @@ class ParallelSliceTest(unittest.TestCase):
                    (-.1+.12*(x>=1), 1.5+.14*(x>=5), 3.)]
         batches = [
             (initial, None),
-            # One ambiguous return resolves lower floor aliases only.
+            # One ambiguous return resolves the lower cut; its other local
+            # cuts still need compatible vertical evidence.
             ([(0.,0.,-.1)], (0.,0.,.5)),
             ([(0.,0.,1.5),(0.,.1,.25),(.3,.1,-.03),(-.4,.3,1.53)], None),
             ([(x*.1,0.,1.5) for x in range(-2,3)], None),
@@ -61,15 +62,15 @@ class ParallelSliceTest(unittest.TestCase):
                         self.assertIs(mapping.layers[key[0]].blocks[key[1:]],block)
                         for name in block.dtype.names:
                             if block.dtype[name].kind=='f':
+                                tolerance=1e-12 if name in ('G','C') else 1e-7
                                 np.testing.assert_allclose(block[name],reference.blocks[key][name],
-                                                           atol=1e-12,rtol=0)
+                                                           atol=tolerance,rtol=0,err_msg=f'{key} {name}')
                             else:
                                 np.testing.assert_array_equal(block[name],reference.blocks[key][name])
                 if batch_id == 1:
                     frontier=maps[2].frontier_index
-                    heights={frontier.nodes[key].height for key in frontier.by_column[(0,0)]}
-                    self.assertTrue(any(abs(h-1.5)<1e-5 for h in heights))
-                    self.assertFalse(any(abs(h+.1)<1e-5 for h in heights))
+                    self.assertNotIn((0,0),frontier.by_column)
+                    self.assertFalse(maps[2].surface_observation.has_frontier_ground((0,0),1.5,layer=2))
         self.assertIs(maps[2]._cost_kernel,_legbot_layer_kernels.update_costs)
         self.assertIs(maps[2]._boundary_kernel,_legbot_layer_kernels.find_boundaries)
         self.assertGreater(parallel_workers,1)
@@ -117,7 +118,7 @@ class ParallelSliceTest(unittest.TestCase):
             self.assertTrue(expected<=selected,(expected-selected,previous,current))
 
     def test_new_neighbor_cuts_and_maturity_keep_full_recompute_geometry(self):
-        settings=MapSettings(block_size=8,slice_dh=.1,maturity_min_points=3)
+        settings=MapSettings(block_size=8,slice_dh=.1,maturity_min_points=3,origin_z=1e-5)
         reference=FixedLayerMap(settings,update_workers=1,native_updates=False)
         mapping=FixedLayerMap(settings,update_workers=4)
         initial=[(x*.1,y*.1,z) for x in range(-2,3) for y in range(-2,3)
@@ -148,8 +149,9 @@ class ParallelSliceTest(unittest.TestCase):
             if i==3:
                 self.assertTrue(mapping.cell((8,0,0))['g_mature'])
             if i==4:
-                self.assertIn(34,mapping.column_layers[(0,0)])
-                self.assertAlmostEqual(mapping.cell((34,0,0))['G'],2.4,places=5)
+                self.assertNotIn(34,mapping.column_layers[(0,0)])
+                self.assertAlmostEqual(mapping.observed_cell((34,0,0))['G'],2.4,places=5)
+                self.assertFalse(mapping.cell((34,0,0))['measured'])
             if i==6:
                 self.assertAlmostEqual(mapping.cell((2,0,0))['G'],0.,places=5)
                 self.assertAlmostEqual(mapping.cell((3,0,0))['G'],.204,places=5)

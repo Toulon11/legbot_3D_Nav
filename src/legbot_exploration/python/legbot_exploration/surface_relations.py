@@ -51,13 +51,13 @@ class SurfaceRelations:
                 memo[cell]=tuple(column.values()) if column else ()
             return memo[cell]
         def ground(cell,height):
-            return any(r.orientation in (0,1) and abs(r.height-height)<=tolerance for r in hits(cell))
+            return any(r.orientation==1 and abs(r.height-height)<=tolerance for r in hits(cell))
         def finish(state,actual=None,direction=None):
             result=SurfaceRelation(state,actual,direction,frozenset(dependencies))
             self.cache[key]=result
             for cell in dependencies:self.readers[cell].add(key)
             return result
-        measured=[r.height for r in hits(xy) if r.orientation in (0,1)]
+        measured=[r.height for r in hits(xy) if r.orientation==1]
         if not measured:return finish('unobserved')
         actual=min(measured,key=lambda h:abs(h-expected))
         if abs(expected-actual)<=tolerance:return finish('matched',actual)
@@ -79,14 +79,14 @@ class SurfaceRelations:
         # A one-cell mixed stripe needs spatially separated returns and an
         # independent high-only row beyond it. Missing/overlapping sheets stay unknown.
         low,high=actual,expected
-        underside_margin=min(tolerance,s.surface_normal_thickness+1e-7)
+        underside_margin=tolerance
         def bands(cell):
             records=hits(cell)
             if any(r.orientation==-1 and low+underside_margin<r.height<=high+tolerance for r in records):
                 return False,False,0,0
             present=[False,False];masks=[0,0]
             for r in records:
-                if r.orientation not in (0,1):continue
+                if r.orientation!=1:continue
                 distances=abs(r.height-low),abs(r.height-high)
                 side=int(distances[1]<distances[0])
                 if distances[side]<=tolerance and abs(distances[0]-distances[1])>1e-7:
@@ -137,17 +137,19 @@ class SurfaceRelations:
         if not column:
             return False
         # Require continuous vertical evidence in the body-height band.
-        # Horizontal returns and inflation costs cannot seal the diagnostic.
-        pad=min(.5*s.resolution,s.surface_noise_tolerance)
+        # A stored traversal span can seal this floor without a surface-side
+        # classifier. Freshness still belongs to this diagnostic request.
         highest=ground+min(s.step_max,.16)
         top=ground+max(s.minimum_clearance,s.observer_reference_height)
-        for low,high in sorted((r.low-pad,r.high+pad) for r in column.values()
-                               if r.orientation==-2 and r.last_seen>cutoff):
-            if low>highest:
-                break
-            highest=max(highest,high)
-            if highest>=top:
-                return True
+        if any(low<=highest+1e-7 and high>=top-1e-7
+               for low,high in column.obstacle_intervals):
+            recent=sorted((r.low,r.high) for r in column.values() if r.last_seen>cutoff)
+            spans=[]
+            for low,high in recent:
+                if spans and low-spans[-1][1]<s.minimum_clearance-1e-7:
+                    spans[-1]=(spans[-1][0],max(spans[-1][1],high))
+                else:spans.append((low,high))
+            if any(low<=highest+1e-7 and high>=top-1e-7 for low,high in spans):return True
         return self.fresh_clearance_barrier(xy,ground,after=cutoff) is not None
 
     def fresh_clearance_barrier(self, xy, ground, *, after=None):
@@ -172,6 +174,6 @@ class SurfaceRelations:
         records={r.id:r for r in column.values()}
         for ground_id,ceiling_id in source_ids:
             support,ceiling=records.get(ground_id),records.get(ceiling_id)
-            if (support is None or ceiling is None or support.orientation not in (0,1) or
+            if (support is None or ceiling is None or support.orientation!=1 or
                     min(support.last_seen,ceiling.last_seen)<serial):return None
         return ground,ground+height

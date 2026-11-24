@@ -41,7 +41,7 @@ struct PctFrontier {
   std::vector<PctUnknownBlocker> unknown_blockers;
 };
 struct PctFrontiers {
-  struct StairView {
+  struct SupportView {
     Point ground;
     double yaw;
     std::uint64_t evidence=0;
@@ -59,23 +59,21 @@ struct PctFrontiers {
   bool fast_floor=false;
   std::size_t fast_skipped_clusters=0,fast_skipped_cells=0;
   std::size_t small_skipped_clusters=0,small_skipped_cells=0;
-  std::size_t stair_flights=0;
-  std::size_t stair_step_unsafe=0;
-  bool stair_platform_visible=false;
-  double stair_index_ms=0.;
+  std::size_t low_yield_deferred_clusters=0,low_yield_deferred_cells=0;
+  std::size_t global_first_after_local_failure_clusters=0,global_first_after_local_failure_cells=0;
   std::vector<PctUnknownBlocker> unknown_blockers;
   std::string scope="global";
   Point window_center{};
   double query_ms=0.;
   bool query_pending=false;
+  bool support_query_pending=false;
   std::size_t query_checked_clusters=0;
   double observer_prepare_ms=0.,observer_geometry_ms=0.,observer_visibility_ms=0.;
   std::map<std::string,double> observer_phase_ms;
-  std::size_t pending_stair_candidates=0;
   double extraction_ms=0.0;
   std::vector<PctFrontier> clusters;
   std::vector<std::uint64_t> no_view_clusters, observer_timeout_clusters;
-  std::vector<StairView> stair_targets, stair_step_targets, stair_landing_targets, saved_stair_entrances;
+  std::vector<SupportView> upward_support_targets;
   std::string error, metadata="{}";
 };
 struct PctResult {
@@ -106,11 +104,6 @@ struct PctObservationPose {
   double yaw;
   Motion motion;
 };
-struct PctStairProbe {
-  PctFrontier frontier;
-  bool active=false,finished=false,returning=false,approaching=false,climbing=false;
-  std::string reason,metadata="{}";
-};
 // The map owner serializes append with plan/read operations using SharedLayerMap.
 // Only the current frame is exposed to Python; cumulative storage is sparse height evidence.
 class PctBackend {
@@ -118,7 +111,10 @@ class PctBackend {
   PctBackend(std::string root, double reference_height,
              std::size_t max_surface_records, std::size_t max_cells, std::string settings_json="{}");
   ~PctBackend();
-  void append(const std::vector<LayerPoint> &points,std::optional<Point> sensor_origin=std::nullopt);
+  void append(const std::vector<LayerPoint> &points,std::optional<Point> sensor_origin=std::nullopt,
+              std::optional<double> body_height=std::nullopt,
+              const std::vector<LayerPoint> &free_ray_endpoints={},
+              std::optional<double> frontier_query_height=std::nullopt);
   bool refresh(std::uint64_t version);
   PctInspection inspect(std::uint64_t version,const Point &base,bool display,
                         std::size_t max_display,bool preview,double radius,
@@ -144,9 +140,8 @@ class PctBackend {
                         std::optional<XY> platform_floor=std::nullopt,
                         std::optional<FloorViewLimits> floor_selection=std::nullopt,
                         std::optional<double> stair_heading=std::nullopt,bool seek_ascent=false);
-  PctStairProbe floor_stair_probe(std::uint64_t version,const Point &base,const XY &floor,double yaw,
-                                bool depart,bool review,double tolerance);
   bool complete_observation(std::uint64_t version,const PctFrontier &frontier,const Point &point);
+  bool refresh_frontier_displays(std::uint64_t version,std::vector<PctFrontier> &clusters);
   std::vector<Point> recovery_targets(std::uint64_t version, const Point &start);
   std::vector<Point> stair_review_points(std::uint64_t version,const Point &base,double heading);
   PctPointCheck point_check(std::uint64_t version, const Point &point,bool platform=false,
@@ -164,6 +159,7 @@ class PctBackend {
   std::size_t point_count() const;
   const std::string &last_error() const;
   const std::string &map_metadata() const;
+  bool committed_floor_task_resolved(std::uint64_t cluster) const;
  private:
   PctResult plan_with_method(const char *method,std::uint64_t version,const Point &start,
                              const Point &target,std::optional<XY> floor=std::nullopt,

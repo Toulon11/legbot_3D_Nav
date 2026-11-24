@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <tuple>
 #include <unordered_map>
@@ -30,6 +31,8 @@ class Node {
   double f = 1e9;
   double g = 1e9;
   double height = 0.0;
+  double ceiling = std::numeric_limits<double>::infinity();
+  double interval_center = 0.;
   double ele = 0;
   double cost = 0.0;
   std::int64_t surface_id = -1;  // Legacy map entries have no surface metadata.
@@ -75,10 +78,15 @@ class Astar {
   using SurfaceCellReader = std::function<std::tuple<double, double, double, std::int64_t>(int, int, int)>;
   void InitSurfaceAccessor(double cost_threshold, int num_layers, int rows, int columns,
                            double resolution, double step_cost_weight, SurfaceCellReader reader);
+  using IntervalCellReader = std::function<std::tuple<double,double,double,std::int64_t,double,double,int>(int,int,int)>;
+  void InitIntervalAccessor(double cost_threshold, int num_layers, int rows, int columns,
+                            double resolution, double step_cost_weight, IntervalCellReader reader);
   std::size_t GetSearchNodeCount() const { return sparse_nodes_.size(); }
   void SetTimeLimit(double seconds);
   bool TimedOut() const { return timed_out_; }
   void SetBlockedEdgeRadius(int cells) { blocked_edge_radius_ = cells; }
+  void SetSurfaceStepLimit(double metres) { surface_step_limit_ = metres; }
+  void SetPassageClearance(double metres) { passage_clearance_ = metres; }
   const auto& GetBlockedEdges() const { return blocked_edges_; }
 
   void Reset();
@@ -99,6 +107,9 @@ class Astar {
   double time_limit_seconds_ = 0.; // Original API is unlimited unless requested.
   bool timed_out_ = false;
   int blocked_edge_radius_ = 0;
+  double surface_step_limit_ = 0.;
+  double passage_clearance_ = 0.;
+  bool interval_accessor_ = false;
   std::unordered_map<std::int64_t, std::array<int, 6>> blocked_edges_;
   double CalculateStepCost(const Node* node1, const Node* node2) const;
 
@@ -138,8 +149,9 @@ class Astar {
   int xy_size_ = 0;
   double resolution_ = 0;
   MultiLayerGridMap grid_map_;
-  SurfaceCellReader reader_;
+  IntervalCellReader reader_;
   mutable std::unordered_map<std::int64_t, std::unique_ptr<Node>> sparse_nodes_;
+  mutable std::unordered_map<std::int64_t, std::int64_t> sparse_aliases_;
   double cost_threshold_ = 35;
   double step_cost_weight_ = 1.0;
 

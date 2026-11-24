@@ -38,30 +38,33 @@ class TomographicSlice:
         row[field+'_surface_id']=identity
         return changed
 
-    def update_geometry(self, evidence):
+    def update_geometry(self, evidence, kernel=None):
+        if kernel is not None:
+            return kernel(self.blocks,self.settings.block_size,evidence)
         size = self.settings.block_size
         ground_changed, base_changed = set(), set()
-        for (x,y), (ground,ceiling,pending_ceiling) in evidence.items():
+        for (x,y), (ground,ceiling) in evidence.items():
             row = self.blocks[x//size,y//size][x%size,y%size]
             row['measured'] = True
             g = self._commit_surface(row, 'G', ground)
             c = self._commit_surface(row, 'C', ceiling)
-            c |= different(float(row['pending_ceiling_z']),pending_ceiling)
-            row['pending_ceiling_z']=pending_ceiling
             if g:
                 ground_changed.add((x,y))
             if g or c:
                 base_changed.add((x,y))
         return base_changed, ground_changed
 
-    def update_costs(self, evidence, kernel, geometry_kernel=None):
-        base, ground = (geometry_kernel(self.blocks,self.settings.block_size,evidence)
-                        if geometry_kernel is not None else self.update_geometry(evidence))
-        if not (base or ground):
+    def update_costs(self, mapping, changes):
+        base, ground = changes.get(self.index,(set(),set()))
+        neighbors = (self.index-1,self.index+1)
+        neighbor_changes = set().union(*(changes.get(k,((),()))[1] for k in neighbors))
+        if not (base or ground or neighbor_changes):
             return base, set(), {}
         settings = self.settings
-        if kernel is not None:
-            result = kernel(self.blocks, settings.block_size, base, ground, vars(settings))
+        adjacent = [mapping.layers[k].blocks if k in mapping.layers else {} for k in neighbors]
+        if mapping._cost_kernel is not None:
+            result = mapping._cost_kernel(self.blocks, settings.block_size, base, ground,
+                                          vars(settings), *adjacent, neighbor_changes)
             for tile,counts in result['counts'].items():
                 old = self._block_counts.get(tile, {})
                 for name,count in counts.items():
@@ -85,7 +88,13 @@ class TomographicSlice:
                     return block[x%settings.block_size,y%settings.block_size]
                 return None
 
+            def nearby_height(self, key, reference):
+                _,x,y=key
+                return mapping.nearby_cut_height(self_layer,x,y,reference)
+
+        self_layer=self.index
         view = CostView(self)
         changed = update_costs(view, {(self.index,*xy) for xy in base},
-                              {(self.index,*xy) for xy in ground})
+                              {(self.index,*xy) for xy in ground},
+                              {(self.index,*xy) for xy in neighbor_changes})
         return base, {key[1:] for key in changed}, view.last_work

@@ -8,7 +8,7 @@ from legbot_exploration.fixed_layer_map import FixedLayerMap, MapSettings
 
 class SurfaceObservationTest(unittest.TestCase):
     def setUp(self):
-        self.map=FixedLayerMap(MapSettings(maturity_min_points=1),update_workers=1,native_updates=False)
+        self.map=FixedLayerMap(MapSettings(maturity_min_points=1,allow_open_ceiling=True,origin_z=1e-5),update_workers=1,native_updates=False)
         self.evidence=self.map.surface_observation
 
     def frame(self, points, origin=None):
@@ -19,6 +19,8 @@ class SurfaceObservationTest(unittest.TestCase):
         points=[(x*.1,y*.1,0. if y<=0 else .13)
                 for x in range(-4,5) for y in range(-4,5) if (x,y)!=(1,0)]
         self.frame(points)
+        with patch('legbot_exploration.surface_orientation.classify',return_value=np.full(len(points),-1)):
+            self.frame([(x,y,2.) for x,y,_ in points],origin=(0.,0.,.8))
         record=self.evidence.expect((0.,0.,.13),slices=[1],review=True)
         self.assertEqual(record.state,'pending')
         self.assertFalse(self.evidence.ground_observed((0,0),0.,1))
@@ -27,7 +29,7 @@ class SurfaceObservationTest(unittest.TestCase):
         self.assertEqual(record.state,'step_boundary')
         self.assertTrue(self.evidence.ground_observed((0,0),0.,1))
         self.assertEqual(self.evidence.query((0.,0.,.13),expectation=record)['state'],'refuted')
-        self.assertAlmostEqual(self.map.cell((1,0,0))['G'],0.)
+        self.assertAlmostEqual(self.map.cell((0,0,0))['G'],0.)
         self.assertFalse(any(abs(self.map.frontier_index.nodes[k].height-.13)<1e-5
                              for k in self.map.frontier_index.by_column.get((0,0),())))
         self.frame([(0.,.1,0.)])
@@ -55,16 +57,17 @@ class SurfaceObservationTest(unittest.TestCase):
         frontier=self.evidence.expect(point,slices=[3],kind='frontier')
         blocker=self.evidence.expect(point,slices=[3],review=True)
         self.assertIsNot(inferred,blocker)
-        self.frame([(0.,0.,1.315)])
-        self.assertEqual(inferred.state,'frontier_covered')
-        self.assertEqual(frontier.state,'frontier_covered')
+        self.frame([(0.,0.,1.315),(0.,0.,2.1)])
+        self.frame([(0.,0.,1.315),(0.,0.,2.1)])
+        self.assertEqual(self.evidence.query(point,expectation=inferred)['state'],'frontier_covered')
+        self.assertEqual(self.evidence.query(point,expectation=frontier)['state'],'frontier_covered')
         self.assertEqual(blocker.state,'pending')
         self.assertFalse(self.evidence.matching((0,0),point[2]))
         self.assertFalse(self.evidence.refuted((0,0),point[2]))
         self.assertTrue(self.evidence.query(point,kind='frontier')['ready'])
         self.assertFalse(self.evidence.query(point,expectation=blocker)['ready'])
 
-    def test_fresh_multicut_clearance_obstacle_rejects_view_but_not_as_physical_shadow(self):
+    def test_partial_clearance_evidence_does_not_invent_a_full_column_wall(self):
         self.frame([(.6,0.,z) for z in (0.,.3,1.5)])
         ceiling=next(r for r in self.map.columns[6,0].values() if abs(r.height-.3)<.01)
         ceiling.orientation=-1
@@ -72,27 +75,17 @@ class SurfaceObservationTest(unittest.TestCase):
         self.map.build()
         self.evidence.height_serial=2
         relation=self.map.surface_relations
-        self.assertIsNone(relation.fresh_clearance_barrier((6,0),0.))
         self.frame([(.6,0.,0.)])
-        self.assertIsNone(relation.fresh_clearance_barrier((6,0),0.),'old ceiling must not count as fresh')
         with patch('legbot_exploration.surface_orientation.classify',return_value=np.array([-1])):
             self.frame([(.6,0.,.3)],origin=(0.,0.,.1))
-        self.assertEqual(relation.fresh_clearance_barrier((6,0),0.),(0.,.5))
-        self.assertEqual(list(self.map.unknown_blockers(1,[(6,0)],0.)),[],
-                         'fresh, confirmed low clearance must not request another scan')
-        model=self.map.frontier_index.observation_model
-        sensor=np.array([.35,0.,.52]);target=np.array([2.,0.,0.])
-        self.assertFalse(model.ray_blocked(sensor,target),'view policy is not proof of a real shadow')
-        self.assertTrue(model.visible((0.,0.,0.),0.,[target],occlusion=False)[0])
-        self.assertFalse(model.visible((0.,0.,0.),0.,[target])[0])
-        upper = self.map.cell((2,6,0))
-        upper['passage_cost']=0.
+        self.assertGreaterEqual(self.map.observed_cell((0,6,0))['passage_cost'],50.)
+        self.assertAlmostEqual(self.map.observed_cell((1,6,0))['G'],.3,places=5)
         self.assertIsNone(relation.fresh_clearance_barrier((6,0),0.),
-                          'one blocked slice cannot establish a column barrier')
-        # Terrain/inflation red alone is insufficient for the clearance rule.
-        for _,row in self.map.layers_at(6,0):row['passage_cost']=0.
+                          'a cut outside the measured interval remains unknown')
+        # Red terrain is not extra physical evidence or a finite G/C interval.
+        for _,row in self.map.layers_at(6,0):
+            row['terrain_cost']=row['inflated_terrain_cost']=50.
         self.assertIsNone(relation.fresh_clearance_barrier((6,0),0.))
-        self.assertTrue(model.visible((0.,0.,0.),0.,[target])[0],'cached view must recheck blocker source')
 
     @staticmethod
     def rays(z=0.):
@@ -260,7 +253,7 @@ class SurfaceObservationTest(unittest.TestCase):
         with patch.object(self.map,'iter_cells',side_effect=AssertionError('global traversal forbidden')):
             result=self.evidence.visit_height((0.,0.,.13))
         self.assertTrue(result['triggered'])
-        self.assertGreater(result['registered_targets'],0)
+        self.assertEqual(result['registered_targets'],0)
         count=len(self.evidence.records)
         self.assertFalse(self.evidence.visit_height((0.,0.,.13))['triggered'])
         self.assertFalse(self.evidence.visit_height((0.,0.,0.))['triggered'])
@@ -277,17 +270,12 @@ class SurfaceObservationTest(unittest.TestCase):
         self.assertEqual(self.evidence.visited_heights,[.8,1.5,2.2,3.])
         self.assertEqual(self.evidence.status()['height_triggers'],3)
 
-    def test_height_reviews_share_one_target_and_reference_only_cuts_above_support(self):
+    def test_new_height_registers_context_without_inferred_targets_or_clearing(self):
         self.frame([(x*.1,y*.1,z) for x in range(-3,4) for y in range(-3,4) for z in (0.,.63)])
         self.evidence.visit_height((0.,0.,0.))
         before={(k,x,y):float(r['G']) for (k,x,y),r in self.map.iter_cells(True)}
         self.assertTrue(self.evidence.visit_height((0.,0.,.63))['triggered'])
-        self.assertTrue(self.evidence.records)
-        unique={(r.xy,r.height) for r in self.evidence.records.values()}
-        self.assertEqual(len(unique),len(self.evidence.records))
-        self.assertTrue(any(len(r.sources)>1 for r in self.evidence.records.values()))
-        self.assertTrue(all(r.slices and all(self.map.settings.origin_z+k*self.map.settings.slice_dh>.63
-                                             for k in r.slices) for r in self.evidence.records.values()))
+        self.assertFalse(self.evidence.records)
         self.assertEqual(before,{(k,x,y):float(r['G']) for (k,x,y),r in self.map.iter_cells(True)})
 
     def test_high_cut_pending_review_does_not_invalidate_lower_cut_support(self):
@@ -297,9 +285,9 @@ class SurfaceObservationTest(unittest.TestCase):
         self.assertFalse(self.evidence.ground_observed((0,0),.45,2))
         self.assertEqual(self.evidence.pending_at((0,0),.45,1),())
         check=self.evidence.describe_ground((0,0),.45,2)
-        self.assertEqual(check['reason'],'surface_observation_pending')
-        self.assertEqual(check['layers'][0]['pending_expectations'][0]['id'],record.id)
-        self.assertEqual(check['layers'][0]['pending_expectations'][0]['slices'],[2])
+        self.assertEqual(check['reason'],'ground_unobserved')
+        self.assertEqual(check['layers'],[])
+        self.assertEqual(self.evidence.pending_at((0,0),.45,2),(record,))
         self.frame([(0.,0.,.45)])
         self.assertTrue(self.evidence.ground_observed((0,0),.45,2))
 
@@ -309,8 +297,7 @@ class SurfaceObservationTest(unittest.TestCase):
         self.assertTrue(self.evidence.visit_height((.1,0.,.63))['triggered'])
         self.frame([(0.,0.,.08)])
         self.assertAlmostEqual(self.map.cell((1,0,0))['G'],.08,places=5)
-        self.assertTrue(any(r.state=='pending' and r.xy==(0,0) and abs(r.height-.63)<.05
-                            for r in self.evidence.records.values()))
+        self.assertFalse(self.evidence.records)
 
     def test_diagnostics_distinguish_missing_ground_and_invalid_surface_identity(self):
         self.assertEqual(self.evidence.describe_ground((0,0),1.)['reason'],'ground_unobserved')
@@ -326,32 +313,28 @@ class SurfaceObservationTest(unittest.TestCase):
     def test_later_frame_can_resolve_frontier_without_changing_frozen_G(self):
         self.check_evidence_only_frontier_update()
 
-    def test_native_frontier_update_uses_the_same_negative_evidence(self):
-        self.map=FixedLayerMap(MapSettings(maturity_min_points=1),update_workers=1)
+    def test_native_frontier_update_uses_the_same_interval_evidence(self):
+        self.map=FixedLayerMap(MapSettings(maturity_min_points=1,allow_open_ceiling=True,origin_z=1e-5),update_workers=1)
         if self.map._boundary_kernel is None:
             self.skipTest('native boundary kernel unavailable')
         self.evidence=self.map.surface_observation
         self.check_evidence_only_frontier_update()
 
     def check_evidence_only_frontier_update(self):
-        origin=np.array([0.,0.,2.])
-        points=[(x*1.20,y*1.20,.80) for x in (-.0375,-.0125,.0125,.0375)
-                for y in (-.0375,-.0125,.0125,.0375)]+[(.1,0.,1.)]
-        self.frame(points,origin)
-        nodes=self.map.frontier_index.nodes
-        keys=[key for key in nodes if key[1:3]==(0,0) and abs(nodes[key].height-1.)<.05]
-        self.assertTrue(keys)
-        boundary=nodes[keys[0]]
-        record=self.evidence.expect((0.,0.,1.),sources=[(x,y,sid)for x,y,_,sid in boundary.sources],review=True)
+        from legbot_exploration.pct_frontier_index import Boundary
+        points=[(x*.1,y*.1,z) for x in range(-3,4) for y in range(-3,4) for z in (.1,1.6)]
+        self.frame(points)
+        k=self.evidence.first_ground_slice(.1)
+        self.assertNotIn((0,0),self.map.layers[k].frontiers.by_column)
+        boundary=Boundary(.1,((1,0,.1,1),),k)
+        record=self.evidence.expect((0.,0.,.1),kind='frontier',slices=[k])
         version=self.map.revision
-        self.map.integrate(np.asarray(points,dtype='float32'),sensor_origin=origin)
-        self.assertEqual(record.state,'refuted')
-        self.assertIn((0,0),self.map.evidence_dirty)
-        self.map.build()
+        self.frame(points)
+        self.assertEqual(record.state,'matched')
+        self.assertEqual(self.evidence.query((0.,0.,.1),kind='frontier',layer=k)['state'],'frontier_covered')
         self.assertEqual(self.map.revision,version)
-        self.assertFalse(any(key[1:3]==(0,0) and abs(node.height-1.)<.05
-                             for key,node in self.map.frontier_index.nodes.items()))
         self.assertEqual(self.map.last_work['geometry_update_cells'],0)
+        self.assertNotIn((0,0),self.map.layers[k].frontiers.by_column)
         self.assertEqual(self.map.frontier_index.floor_observation_counts({((0,0),boundary):set()}),(1,1))
 
 

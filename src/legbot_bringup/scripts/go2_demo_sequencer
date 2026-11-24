@@ -18,6 +18,7 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profi
 from scan_planner.msg import Bspline, GoalRequest
 from sensor_msgs.msg import JointState, PointCloud2
 from std_msgs.msg import Bool, Int32, String
+from controller_manager_msgs.srv import ListControllers
 
 
 class PoseSettling:
@@ -127,6 +128,11 @@ class DemoSequencer(Node):
         self.localization_label = str(self.declare_parameter(
             'localization_label', 'FAST-LIO').value)
         self.joint_seen = self.odom_seen = self.cloud_seen = self.plan_seen = False
+        self.controller_name = str(self.declare_parameter('actuator_controller', 'rl_quadruped_controller').value)
+        self.controller_client = self.create_client(ListControllers, '/controller_manager/list_controllers')
+        self.controller_query = None
+        self.controller_active = False
+        self.controller_checked_at = 0.0
         self.plan_ready_source_seen = False
         self.mission_complete = False
         self.navigation_stamp = 0
@@ -137,6 +143,7 @@ class DemoSequencer(Node):
         self.navigation_enabled = False
         self.state = 'waiting_for_joint_states'
         self.state_started = time.monotonic()
+        self.state_started_ros = self.get_clock().now().nanoseconds * 1e-9
         self.last_wait_log = 0.0
 
         latched = QoSProfile(depth=1)
@@ -172,6 +179,7 @@ class DemoSequencer(Node):
     def enter(self, state):
         self.state = state
         self.state_started = time.monotonic()
+        self.state_started_ros = self.get_clock().now().nanoseconds * 1e-9
 
     def on_joint(self, msg):
         self.joint_seen = len(msg.name) >= 12 and len(msg.position) >= 12
@@ -366,11 +374,33 @@ class DemoSequencer(Node):
         self.mode_pub.publish(Int32(data=mode))
         self.walking_active = mode == 3
 
+    def startup_controller_ready(self):
+        if self.controller_query is not None and self.controller_query.done():
+            try:
+                response = self.controller_query.result()
+                self.controller_active = any(c.name == self.controller_name and c.state == 'active'
+                                             for c in response.controller)
+            except Exception as error:
+                self.controller_active = False
+                self.get_logger().warning('Controller readiness query failed: %s' % error)
+            self.controller_query = None
+        if (not self.controller_active and self.controller_query is None and
+                time.monotonic()-self.controller_checked_at >= .25 and
+                self.controller_client.service_is_ready()):
+            self.controller_checked_at = time.monotonic()
+            self.controller_query = self.controller_client.call_async(ListControllers.Request())
+        return self.controller_active
+
     def tick(self):
         self.publish_execution_status()
         elapsed = time.monotonic() - self.state_started
+        if self.state in ('first_stand_pulse','crouch_wait','second_stand_pulse','stand_wait'):
+            # Controller interpolation runs in ROS time. At a low Gazebo
+            # real-time factor, wall-time pulses can expire before FIXEDDOWN
+            # accepts the next stand request, leaving navigation on a crouch.
+            elapsed=max(0.,self.get_clock().now().nanoseconds*1e-9-self.state_started_ros)
         if self.state == 'waiting_for_joint_states':
-            if self.joint_seen:
+            if self.joint_seen and self.startup_controller_ready():
                 self.get_logger().info('Controller ready: requesting crouch transition')
                 self.enter('first_stand_pulse')
         elif self.state == 'first_stand_pulse':

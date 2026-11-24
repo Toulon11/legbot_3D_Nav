@@ -259,6 +259,25 @@ void GridMap::rebuildInflationOffsets()
     }
 }
 
+int GridMap::refineInflationHeight(const Eigen::Vector3d& pos, const Eigen::Vector3i& id)
+{
+  // The coarse mask rounds vertical padding up to whole voxels. With a 10 cm
+  // voxel and 3 cm padding this falsely occupies the entire next 10 cm band.
+  // Keep the existing horizontal footprint, but test the requested height
+  // against the full occupied source voxel plus the actual vertical margin.
+  for (const auto& offset : md_.inflate_offsets_)
+  {
+    const Eigen::Vector3i source = id - offset;
+    if (!isInMap(source) ||
+        md_.occupancy_buffer_[toAddress(source)] <= mp_.min_occupancy_log_)
+      continue;
+    const double low = source.z() * mp_.resolution_ - std::max(0.0, mp_.obstacles_inflation_z_down);
+    const double high = (source.z() + 1) * mp_.resolution_ + std::max(0.0, mp_.obstacles_inflation_z_up);
+    if (pos.z() >= low - 1e-9 && pos.z() <= high + 1e-9) return 1;
+  }
+  return 0;
+}
+
 void GridMap::resetAllMapData()
 {
   std::fill(md_.occupancy_buffer_.begin(), md_.occupancy_buffer_.end(), mp_.clamp_min_log_ - mp_.unknown_flag_);

@@ -28,12 +28,11 @@
     pct_local_height_below: 1.5            # 向下高度；水平为±local_search_radius，不裁剪规划图。
     pct_direction_weight: 0.5             # PCT目标方向变化的软惩罚，0关闭。
     cross_layer_enabled: true
-    pct_floor_exploration: true          # 当前层收尾后跨层，以连通实测平台确认新层 G。
-    skip_start_floor_exploration: false  # 跨层测试。共用普通探索识别楼梯，确认可上行后提前结束起始层；新层正常探索。
+    pct_floor_exploration: true          # 同高簇优先，耗尽后上行；实测 G 变化超过 8 cm 后重新优先同高簇。
+    skip_start_floor_exploration: false  # 测试时跳过起始层普通任务，直接选择上升簇/已知上行支撑；新层正常探索。
     pct_floor_height_tolerance: 0.08     # 同层前沿的优先高度带半宽，也是上升簇切换跨层的实测升高阈值，单位米。
     pct_foot_contact_force: 12.0        # 用于判定足端接地的受力，单位牛顿。
     cross_layer_height_slack: 0.05        # 上行进度允许的高度误差，单位米。
-    cross_layer_corridor_radius: 1.5      # 后续观察位置与当前路线方向的侧向范围，单位米。
     global_search: true                   # 二维选点范围；PCT独立采用三维局部优先、全局后备。
     frontier_source: pct                 # occupancy / pct；PCT 选点要求同进程在线 PCT，第一阶段只交给层析规划。
     planner_mode: layer                  # both / occupancy / layer；脱困沿用同一规划器选择。
@@ -66,6 +65,7 @@
     observation_frame_wait: 2.0          # 定向补扫和跨层单侧等待相关回波的上限，单位秒。
     observation_flat_frame_wait: 1.0     # 普通观察点每个视角的等待时间，单位秒。
     observation_task_timeout: 60.0
+    observation_pose_wait_timeout: 5.0   # 连续位姿过期的独立等待预算；恢复后继续观测。
     observation_sweep_half_angle: 0.35
     observation_full_sweep_fallback: false
     pct_query_budget_seconds: 0.20      # Per-batch compute slice; total budgets remain 2s/4s.

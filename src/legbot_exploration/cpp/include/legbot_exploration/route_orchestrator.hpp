@@ -40,6 +40,7 @@ struct PlanningGoal {
   double recovery_yaw = 0.0, recovery_turn_angle = 0.0;
   std::optional<double> xy_tolerance; // Requested only on the final position waypoint.
   ExplorationCandidate candidate;
+  bool require_observation = true; // Known support navigation still checks the full stopping disk.
 };
 
 struct PlannerResult {

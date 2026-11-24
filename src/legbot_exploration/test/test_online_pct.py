@@ -32,6 +32,21 @@ def stair_probe(adapter, *args, **kwargs):
 
 
 class PctAdapterTest(unittest.TestCase):
+    def test_indoor_missing_ceiling_waits_then_real_interval_enables_exploration(self):
+        adapter=OnlinePct(str(PCT))
+        adapter.configure({'robot_radius':.15,'safety_margin':0.,'maturity_min_points':1,'allow_open_ceiling':False})
+        floor=np.asarray([(x*.1,y*.1,0.) for x in range(-6,7) for y in range(-6,7)],dtype='float32')
+        adapter.integrate(floor.tobytes());adapter.prepare(b'',1)
+        self.assertFalse(adapter.map.settings.allow_open_ceiling)
+        self.assertFalse(adapter.map.layers)
+        self.assertFalse(adapter.start_ready(b'',1,(0.,0.,.32)))
+        self.assertEqual(adapter.plan(b'',1,(0.,0.,.32),(.2,0.,.32))[0],'pct_unsafe_start')
+        ceiling=floor.copy();ceiling[:,2]=1.5
+        adapter.integrate(ceiling.tobytes());adapter.prepare(b'',2)
+        self.assertEqual(adapter.map.column_layers[0,0],{1})
+        self.assertTrue(adapter.start_ready(b'',2,(0.,0.,.32)))
+        self.assertEqual(adapter.plan(b'',2,(0.,0.,.32),(.2,0.,.32))[0],'ok')
+
     def test_local_stair_heading_uses_measured_treads_instead_of_approach_bearing(self):
         adapter=OnlinePct(str(PCT));adapter.configure({'robot_radius':.15})
         cloud=np.asarray([(x*.1,y*.1,z) for x in range(-15,16) for y in range(-15,19)
@@ -293,32 +308,40 @@ class PctAdapterTest(unittest.TestCase):
         for version,point in ((2,(.1,0.,1.46)),(3,(0.,0.,0.))):
             adapter.integrate(np.asarray([point],dtype='float32').tobytes())
             progress=op(version,'blocker_review_progress')
-            self.assertEqual(progress['ready'],version==3)
+            self.assertFalse(progress['ready'])
             self.assertEqual(progress['matched_count'],0)
             self.assertEqual(progress['unresolved_count'],1)
         adapter.integrate(np.asarray([(0.,0.,1.46)],dtype='float32').tobytes())
-        self.assertTrue(op(4,'blocker_review_progress')['ready'])
+        self.assertFalse(op(4,'blocker_review_progress')['ready'])
         self.assertEqual(op(4,'blocker_review_progress')['target_count'],1)
         rows=dict(adapter.map.layers_at(0,0))
-        self.assertAlmostEqual(rows[0]['G'],0.)
-        self.assertAlmostEqual(rows[0]['C'],1.46,places=6)
-        self.assertAlmostEqual(rows[3]['G'],1.46,places=6)
-        self.assertTrue(op(4,'finish_blocker_review')['ready'])
-        self.assertFalse(op(5,'begin_blocker_review')['ready'])
+        self.assertAlmostEqual(rows[1]['G'],0.)
+        self.assertAlmostEqual(rows[1]['C'],1.46,places=6)
+        self.assertTrue(any(abs(r.height-1.46)<1e-6 for r in adapter.map.columns[0,0].values()))
+        # A fresh raw height cannot settle a missing navigation interval.
+        self.assertFalse(any(abs(r['G']-1.46)<1e-6 for r in rows.values()))
+        self.assertFalse(op(4,'finish_blocker_review')['ready'])
+        self.assertTrue(op(5,'begin_blocker_review')['ready'])
         review=adapter.map.frontier_index.observation_model.blocker_review
-        self.assertFalse(review.available((0.,0.,1.47)))
+        self.assertTrue(review.available((0.,0.,1.47)))
         self.assertTrue(review.available((0.,0.,3.0)))
+        op(5,'arm_blocker_review')
+        adapter.integrate(np.asarray([(0.,0.,3.)]*3,dtype='float32').tobytes())
+        self.assertTrue(op(6,'finish_blocker_review')['ready'])
+        self.assertFalse(review.available((0.,0.,1.47)))
+        self.assertTrue(review.available((0.,0.,3.)))
 
     def test_blocker_review_accepts_the_actual_tread_without_inventing_expected_height(self):
         adapter=OnlinePct(str(PCT))
-        adapter.integrate(np.asarray([(0.,0.,.65)]*3,dtype='float32').tobytes())
+        adapter.integrate(np.asarray([(0.,0.,z) for z in (.65,2.)]*3,dtype='float32').tobytes())
         adapter.prepare(b'',1)
         review=adapter.map.frontier_index.observation_model.blocker_review
         review.begin([(0.,0.,.78)]);review.arm()
         adapter.integrate(np.asarray([(0.,0.,.65)],dtype='float32').tobytes())
         adapter.prepare(b'',2)
         self.assertTrue(review.progress()['ready'])
-        self.assertAlmostEqual(adapter.map.cell((2,0,0))['G'],.65,places=6)
+        self.assertAlmostEqual(next(adapter.map.columns[0,0].values()).height,.65,places=6)
+        self.assertTrue(adapter.map.column_layers[0,0])
         review.finish()
         self.assertFalse(review.available((0.,0.,.65)))
         self.assertFalse(review.available((0.,0.,.78)))
@@ -350,13 +373,18 @@ class PctAdapterTest(unittest.TestCase):
         self.assertTrue(review.begin([(0.,0.,.13)])['ready'])
         review.arm()
         adapter.integrate(np.asarray([(0.,0.,.13)],dtype='float32').tobytes())
+        self.assertFalse(review.finish()['ready'])
+        self.assertTrue(review.begin([(0.,0.,.13)])['ready'])
+        review.arm()
+        adapter.integrate(np.asarray([(0.,0.,1.)],dtype='float32').tobytes())
+        adapter.prepare(b'',4)
         self.assertTrue(review.finish()['ready'])
         self.assertFalse(review.begin([(0.,0.,.13)])['ready'])
 
     def test_safe_parking_slice_discards_other_slices_relief_blockers(self):
         adapter=OnlinePct(str(PCT))
-        adapter.integrate(np.asarray([(i*.1,j*.1,0.) for i in range(-12,13)
-                                     for j in range(-12,13)],dtype='float32').tobytes())
+        adapter.integrate(np.asarray([(i*.1,j*.1,z) for i in range(-12,13)
+                                     for j in range(-12,13) for z in (0.,1.5)],dtype='float32').tobytes())
         adapter.prepare(b'',1)
         m=adapter.map
         row=m.cell((1,5,0))
@@ -461,6 +489,7 @@ class PctAdapterTest(unittest.TestCase):
         hole=(.7,0.,0.)
         points=[(x*.1,y*.1,0.) for x in range(-20,31) for y in range(-20,21)
                 if (x,y)!=(7,0)]
+        points += [(x,y,1.5) for x,y,_ in points]
         adapter.integrate(np.asarray(points*3,dtype='float32').tobytes())
         adapter.prepare(b'',1)
         base=np.asarray((0.,0.,.32));target=(1.4,0.,0.)
@@ -479,6 +508,7 @@ class PctAdapterTest(unittest.TestCase):
         # arrival disc. Looking from here must not require moving here again.
         points=[(x*.1,y*.1,0.) for x in range(-20,31) for y in range(-20,21)
                 if (x,y)!=(7,0)]
+        points += [(x,y,1.5) for x,y,_ in points]
         adapter.integrate(np.asarray(points*3,dtype='float32').tobytes());adapter.prepare(b'',1)
         base=(0.,0.,.32);target=(1.4,0.,0.)
         def search(**kw):
@@ -501,6 +531,7 @@ class PctAdapterTest(unittest.TestCase):
         adapter=OnlinePct(str(PCT));adapter.configure({'robot_radius':.20})
         points=[(x*.1,y*.1,0.) for x in range(-20,31) for y in range(-20,21)
                 if (x,y)!=(1,0)]
+        points += [(x,y,1.5) for x,y,_ in points]
         adapter.integrate(np.asarray(points*3,dtype='float32').tobytes());adapter.prepare(b'',1)
         self.assertFalse(search(**current)['poses'])
 
@@ -1142,7 +1173,7 @@ class PctAdapterTest(unittest.TestCase):
         ranks=adapter._rank_stair_entrances((single,far,double,near),(0.,0.,0.))
         self.assertEqual(list(ranks),[near,far,double,single])
 
-    def test_stair_route_uses_high_cut_geometry_and_preserves_low_cut_clearance(self):
+    def test_measured_ceiling_keeps_the_lower_stair_approach_blocked(self):
         adapter=OnlinePct(str(PCT))
         adapter.configure(dict(origin_z=-.108, robot_radius=.15))
 
@@ -1158,27 +1189,25 @@ class PctAdapterTest(unittest.TestCase):
         integrate([(0.,j*.1,.8944) for j in cross_section]*3,-1)
         start,target=(-.7,0.,1.09637),(.7,0.,1.2332)
         reason,_,metadata=adapter.plan_surface(b'',1,start,target)
-        self.assertEqual(reason,'ok',metadata)
-        high=adapter.map.cell((3,0,0))
-        self.assertAlmostEqual(high['G'],.8906,places=5)
-        # The separated upper face enters the high cut immediately.
+        self.assertEqual(reason,'pct_route_disconnected',metadata)
+        self.assertIsNone(adapter.map.observed_cell((3,0,0)))
+        # The measured upper face enters its own cut. The lower approach
+        # still intersects the observed low ceiling across the corridor.
         upper=[(0.,j*.1,.9005) for j in cross_section]
         integrate(upper*2,1)
-        self.assertEqual(adapter.plan_surface(b'',2,start,target)[0],'ok')
+        self.assertEqual(adapter.plan_surface(b'',2,start,target)[0],'pct_route_disconnected')
+        high=adapter.map.cell((3,0,0))
         self.assertAlmostEqual(high['G'],.9005,places=5)
         self.assertFalse(high['g_mature'])
         integrate(upper,1)
         reason,route,metadata=adapter.plan_surface(b'',3,start,target)
-        self.assertEqual(reason,'ok',metadata)
-        search=metadata['anchor_search']
-        self.assertEqual(search['selected_start_layer'],search['selected_goal_layer'],search)
-        self.assertGreater(search['selected_goal_layer']*.5-.108,.9132)
+        self.assertEqual(reason,'pct_route_disconnected',metadata)
+        self.assertFalse(route)
         low=adapter.map.cell((2,0,0))
         self.assertAlmostEqual(low['G'],.8906,places=5)
         self.assertAlmostEqual(low['C'],.8944,places=5)
         self.assertEqual(low['passage_cost'],50.)
         self.assertAlmostEqual(adapter.map.cell((3,0,0))['G'],.9005,places=5)
-        self.assertGreater(route[-1][2],route[0][2]+.12)
 
     def test_stair_planner_reports_unknown_cells_from_endpoint_and_native_search(self):
         adapter=OnlinePct(str(PCT))
@@ -1203,7 +1232,8 @@ class PctAdapterTest(unittest.TestCase):
         """Equal-cost duplicate cuts; one is an island, the other spans the hall."""
         from legbot_exploration.fixed_layer_map import FixedLayerMap, MapSettings
         adapter=OnlinePct(str(PCT))
-        m=FixedLayerMap(MapSettings(robot_radius=0.,safety_margin=0.,maturity_min_points=1))
+        m=FixedLayerMap(MapSettings(robot_radius=0.,safety_margin=0.,maturity_min_points=1,
+                                    origin_z=.101))
         for k in (0,1):
             for x in range(-6,7):
                 island=(x<=-2 if island_at=='start' else x>=2 if island_at=='goal' else abs(x)>=2)
@@ -1212,6 +1242,7 @@ class PctAdapterTest(unittest.TestCase):
                 for y in range(-3,4):
                     row=m.cell((k,x,y),True)
                     row['G']=0. if k==island_layer else other_height
+                    row['C']=1.5
                     # Imported planner-only fixture: no physical column records.
                     row['g_surface_id']=0
                     row['g_mature']=row['measured']=row['feature_valid']=True
@@ -1221,21 +1252,23 @@ class PctAdapterTest(unittest.TestCase):
         m.first_layer=0;m.last_layer=1;m.lower=np.array([-6,-3]);m.upper=np.array([7,4])
         m.counts={}
         adapter.map=m
+        adapter.planner=adapter._make_planner()
+        adapter.version=1
         return adapter
 
-    def test_native_search_falls_back_after_preferred_upper_cut_fails(self):
-        adapter=self.duplicate_floor_fixture(island_layer=1,island_at='both')
+    def test_native_search_falls_back_after_first_covered_cut_fails(self):
+        adapter=self.duplicate_floor_fixture(island_layer=0,island_at='both')
         reason,route,metadata=adapter.plan(b'',1,(-.4,0,.32),(.4,0,.32))
         self.assertEqual(reason,'ok',metadata)
         search=metadata['anchor_search']
         self.assertEqual(metadata['start_check']['layer'],0)
         self.assertEqual(search['admitted_start_layer'],0)
-        self.assertEqual(search['selected_start_layer'],0)
+        self.assertEqual(search['selected_start_layer'],1)
         self.assertEqual([(a['start_layer'],a['goal_layer'],a['found']) for a in search['attempts']],
-                         [(1,1,False),(0,0,True)])
+                         [(0,0,False),(1,1,True)])
         self.assertTrue(route)
 
-    def test_native_search_prefers_upper_common_cut_over_admitted_lower_cut(self):
+    def test_native_search_uses_connected_common_cut_after_disconnected_lower_cut(self):
         for island_at in ('start','both'):
             with self.subTest(island_at=island_at):
                 adapter=self.duplicate_floor_fixture(island_layer=0,island_at=island_at)
@@ -1243,35 +1276,40 @@ class PctAdapterTest(unittest.TestCase):
                 self.assertEqual(reason,'ok',metadata)
                 search=metadata['anchor_search']
                 self.assertEqual((search['selected_start_layer'],search['selected_goal_layer']),(1,1))
-                self.assertEqual(len(search['attempts']),1)
+                self.assertEqual(len(search['attempts']),1 if island_at=='start' else 2)
                 self.assertTrue(route)
 
-    def test_native_search_tries_next_common_upper_cut_before_lower_cut(self):
-        adapter=self.duplicate_floor_fixture(island_layer=1,island_at='both')
+    def test_native_search_tries_third_covered_cut_if_first_two_fail(self):
+        adapter=self.duplicate_floor_fixture(island_layer=0,island_at='both')
         m=adapter.map
         for (k,bx,by),block in list(m.blocks.items()):
-            if k==0:
+            if k==1:
                 m.blocks[(2,bx,by)]=block.copy()
+        for (k,bx,by),block in list(m.blocks.items()):
+            if k==0:
+                m.blocks[(1,bx,by)]=block.copy()
         for layers in m.column_layers.values():
             layers.add(2)
+            if 0 not in layers:
+                layers.discard(1)
         m.last_layer=2
         reason,_,metadata=adapter.plan(b'',1,(-.4,0,.32),(.4,0,.32))
         self.assertEqual(reason,'ok',metadata)
         search=metadata['anchor_search']
         self.assertEqual([(a['start_layer'],a['goal_layer'],a['found']) for a in search['attempts']],
-                         [(1,1,False),(2,2,True)])
+                         [(0,0,False),(1,1,False),(2,2,True)])
 
-    def test_native_search_can_leave_and_return_to_preferred_upper_cut(self):
-        adapter=self.duplicate_floor_fixture(island_layer=1,island_at='both')
+    def test_native_search_can_leave_and_return_to_first_covered_cut(self):
+        adapter=self.duplicate_floor_fixture(island_layer=0,island_at='both')
         for y in range(-3,4):
-            adapter.map.cell((1,-2,y))['inflated_terrain_cost']=2.
-            adapter.map.cell((0,2,y))['inflated_terrain_cost']=2.
+            adapter.map.cell((0,-2,y))['inflated_terrain_cost']=2.
+            adapter.map.cell((1,2,y))['inflated_terrain_cost']=2.
         reason,_,metadata=adapter.plan(b'',1,(-.4,0,.32),(.4,0,.32))
         self.assertEqual(reason,'ok',metadata)
         search=metadata['anchor_search']
-        self.assertEqual((search['selected_start_layer'],search['selected_goal_layer']),(1,1))
+        self.assertEqual((search['selected_start_layer'],search['selected_goal_layer']),(0,0))
         native_cells=adapter.planner.planner.get_result_matrix()
-        self.assertIn(0,native_cells[:,0])
+        self.assertIn(1,native_cells[:,0])
 
     def test_native_search_keeps_a_successful_mixed_slice_anchor_pair(self):
         adapter=self.duplicate_floor_fixture(island_layer=0,island_at='goal')
@@ -1339,7 +1377,8 @@ class PctAdapterTest(unittest.TestCase):
     def test_native_rdp_output_is_returned_without_post_simplification_map_checks(self):
         adapter=OnlinePct(str(PCT),reference_height=.38)
         adapter.configure({'robot_radius':.2,'safety_margin':.05,'maturity_min_points':1})
-        floor=np.asarray([(i*.1,j*.1,0.) for i in range(-20,21) for j in range(-20,21)],dtype='float32')
+        floor=np.asarray([(i*.1,j*.1,z) for i in range(-20,21) for j in range(-20,21)
+                          for z in (0.,1.5)],dtype='float32')
         adapter.integrate(memoryview(floor));adapter.prepare(b'',1)
         start=np.asarray([-.8,0.,.38]);target=np.asarray([.8,0.,.38])
         expected=np.asarray(adapter.planner.plan(start-[0,0,.38],target-[0,0,.38],optimize=False)).copy()
@@ -1393,7 +1432,7 @@ class PctAdapterTest(unittest.TestCase):
 
     def test_static_surface_native_astar_then_new_obstacle(self):
         adapter=OnlinePct(str(PCT))
-        adapter.configure({'maturity_min_points':1})
+        adapter.configure({'maturity_min_points':1,'allow_open_ceiling':True})
         x,y=np.meshgrid(np.arange(-2,2.01,.1),np.arange(-2,2.01,.1))
         floor=np.column_stack((x.ravel(),y.ravel(),np.full(x.size,-.02)))
         points=np.vstack((floor+[0,0,-.003],floor+[0,0,.004]))
@@ -1412,8 +1451,9 @@ class PctAdapterTest(unittest.TestCase):
         from legbot_exploration.pct_inspection import SURFACE_DTYPE
         adapter=OnlinePct(str(PCT));adapter.configure({'robot_radius':0.,'safety_margin':0.,'maturity_min_points':1})
         plane=np.asarray([(x*.1,y*.1,0.) for x in range(-10,11) for y in range(-10,11)],dtype='float32')
-        adapter.integrate(memoryview(plane));adapter.prepare(b'',1)
-        cuts=[k for k,row in adapter.map.layers_at(0,0) if np.isfinite(row['G'])]
+        adapter.integrate(memoryview(np.vstack((plane,plane+[0.,0.,1.5])).astype('float32')))
+        adapter.prepare(b'',1)
+        cuts=[k for k,row in adapter.map.layers_at(0,0) if abs(row['G'])<1e-7]
         self.assertGreater(len(cuts),1)
         adapter.map.cell((cuts[-1],0,0))['hard']=True
         adapter.map.cell((cuts[-1],0,0))['unknown_hard']=True
@@ -1435,7 +1475,8 @@ class PctAdapterTest(unittest.TestCase):
         x,y=np.meshgrid(np.arange(-2,2.01,.1),np.arange(-2,2.01,.1))
         floor=np.column_stack((x.ravel(),y.ravel(),np.zeros(x.size)))
         ceiling=floor.copy();ceiling[:,2]=1.5
-        adapter.integrate(memoryview(np.vstack((floor,ceiling)).astype('float32')))
+        upper_ceiling=floor.copy();upper_ceiling[:,2]=3.
+        adapter.integrate(memoryview(np.vstack((floor,ceiling,upper_ceiling)).astype('float32')))
         adapter.prepare(b'',1)
         reason,route,metadata=adapter.plan(b'',1,(-.8,-.2,.38),(.8,.4,.38))
         self.assertEqual(reason,'ok',metadata)
@@ -1463,7 +1504,7 @@ class PctAdapterTest(unittest.TestCase):
                     self.assertIn(reason,('pct_unsafe_stair_reverse_stop',
                                          'pct_stair_reverse_rear_support_unverified'),meta)
 
-    def test_old_lower_ground_becomes_a_relief_scan_target_until_new_upper_returns(self):
+    def test_old_lower_ground_leaves_upper_cut_unknown_until_new_upper_returns(self):
         adapter=OnlinePct(str(PCT))
         adapter.configure({'robot_radius':.15})
         points=[(i*.1,j*.1,0. if (i,j)==(0,0) else 1.46)
@@ -1475,12 +1516,12 @@ class PctAdapterTest(unittest.TestCase):
         self.assertTrue(any(abs(x)<1e-7 and abs(y)<1e-7 and abs(z-1.46)<1e-6
                             for x,y,z,_ in blocked['unknown_blockers']),blocked)
         self.assertTrue(adapter.observation_task(b'',1,'blocker_pending',0,(0.,0.,1.78),0.,0.)['ready'])
-        self.assertTrue(adapter.map.cell((3,0,0))['solid'])
+        self.assertTrue(adapter.map.cell((3,0,0))['unknown'])
         adapter.integrate(np.asarray([(0.,0.,1.46)]*3,dtype='float32').tobytes())
         self.assertTrue(adapter.observation_task(b'',2,'arrival_area',0,target,0.,.15)['ready'])
         self.assertFalse(adapter.observation_task(b'',2,'blocker_pending',0,(0.,0.,1.78),0.,0.)['ready'])
 
-    def test_low_clearance_recheck_targets_the_blocking_surface_without_clearing_it(self):
+    def test_known_low_clearance_interval_does_not_queue_missing_ground_observation(self):
         adapter=OnlinePct(str(PCT))
         points=[(i*.1,j*.1,1.46) for i in range(-15,16) for j in range(-15,16)]
         points.append((0.,0.,1.60))
@@ -1488,19 +1529,21 @@ class PctAdapterTest(unittest.TestCase):
         adapter.prepare(b'',1)
         self.assertFalse(adapter.map.point_safe_check((0.,0.,1.78),floor=(1.46,.05))['ready'])
         targets=list(adapter.map.unknown_blockers(3,[(0,0)],1.46))
-        self.assertEqual(len(targets),1)
-        self.assertAlmostEqual(targets[0][2],1.60,places=6)
+        self.assertEqual(targets,[])
+        self.assertAlmostEqual(adapter.map.cell((3,0,0))['C'],1.60,places=6)
+        self.assertTrue(adapter.map.observed_cell((3,0,0))['solid'])
         self.assertFalse(adapter.map.point_safe_check((0.,0.,1.78),floor=(1.46,.05))['ready'])
 
     def test_sparse_blind_start_is_not_fabricated_as_safe(self):
         adapter=OnlinePct(str(PCT))
-        adapter.configure({'maturity_min_points':1})
+        adapter.configure({'maturity_min_points':1,'allow_open_ceiling':True})
         points=np.array([[x,y,0] for x in (2.5,2.6,2.7) for y in (-.1,0,.1)],dtype='float32')
         adapter.integrate(memoryview(points));adapter.prepare(b'',1)
         self.assertFalse(adapter.start_ready(b'',1,(0,0,.32)))
         targets=adapter.recovery_targets(b'',1,(0,0,.32))
         self.assertFalse(targets)  # A sparse strip is not a safe parking region.
-        full=np.array([[x*.1+4,y*.1,0] for x in range(-20,21) for y in range(-20,21)],dtype='float32')
+        full=np.array([[x*.1+4,y*.1,z] for x in range(-20,21) for y in range(-20,21)
+                       for z in (0.,1.5)],dtype='float32')
         adapter.integrate(memoryview(full));adapter.prepare(b'',2)
         targets=adapter.recovery_targets(b'',2,(0,0,.32))
         self.assertTrue(targets)
@@ -1512,4 +1555,10 @@ class PctAdapterTest(unittest.TestCase):
 
 
 if __name__=='__main__':
+    if '--shared-adapter' in sys.argv:
+        prefixes = ('test_native_', 'test_anchor_retry_', 'test_blocker_review_',
+                    'test_current_scan_', 'test_indoor_missing_', 'test_low_clearance_', 'test_sparse_blind_')
+        names = unittest.defaultTestLoader.getTestCaseNames(PctAdapterTest)
+        suite = unittest.TestSuite(PctAdapterTest(name) for name in names if name.startswith(prefixes))
+        sys.exit(0 if unittest.TextTestRunner().run(suite).wasSuccessful() else 1)
     unittest.main()

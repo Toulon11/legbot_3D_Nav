@@ -23,11 +23,12 @@ EMPTY_WORK = dict(checked_columns=0,changed_frontier_layers=0,topology_changed_l
                   affected_clusters=0,component_nodes_visited=0,cluster_rebuilds=0,
                   local_connectivity_checks=0,local_connectivity_preserved=0,
                   physical_columns_checked=0,physical_clusters_updated=0,physical_tasks_ms=0.)
+EMPTY_WORK.update(auxiliary_checked_sources=0,auxiliary_rejected_sources=0)
 
 
 def frontier_return(orientation):
     """A return from a distinct underside cannot resolve the tread above it."""
-    return orientation != -1
+    return orientation == 1
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ class FloorAttempt:
     failed_small: bool = False
     tested_poses: frozenset = frozenset()
     resume_poses: tuple = ()
+    local_search: bool = False
+    rejected_poses: frozenset = frozenset()
 
     @property
     def review(self):
@@ -71,7 +74,9 @@ class FloorViewSearch:
     direction_center: tuple | None = None
     direction_poses: tuple | None = None
     direction_results: dict = field(default_factory=dict)
+    parking_results: dict = field(default_factory=dict)
     tested_poses: set = field(default_factory=set)
+    occluded_poses: set = field(default_factory=set)
     resume_poses: tuple = ()
     pose_limit: int | None = None
 
@@ -108,6 +113,7 @@ class SliceFrontiers:
         self.next_id=namespace
         self.revision=0
         self.last_work=dict(EMPTY_WORK)
+        self.auxiliary_checked_sources=self.auxiliary_rejected_sources=0
         from .pct_frontier_components import FrontierComponents
         self.components=FrontierComponents(self, namespace)
 
@@ -116,118 +122,67 @@ class SliceFrontiers:
         return self._owner()
 
     def _summary(self, xy, cache):
-        if xy in cache:return cache[xy]
-        m=self.map;s=m.settings;potential=[];safe=[];observed=set();barriers=set()
-        k=self.layer
-        if m.ground_pending(xy,k):
-            result=([],(),(),())
-            cache[xy]=result
-            return result
-        row=m.cell((k,*xy)) if k in m.column_layers.get(xy,()) else None
-        if row is not None and np.isfinite(row['G']):
-            h=float(row['G'])
-            barriers.add(h)
-            if np.isfinite(row['C']):barriers.add(float(row['C']))
-            if (not row['solid'] and m.surface_observation.is_ground_source(xy,int(row['g_surface_id'])) and
-                    (not np.isfinite(row['C']) or row['C']-h>=s.minimum_clearance)):
-                cost=m.planning_cost((k,*xy))
-                source=(k,h,int(row['g_surface_id']),float(cost))
-                if 0<=cost<=20:safe.append(source)
-                potential.append(source)
-        # Keep physical surfaces even when no fixed cut selects them as G.
-        # They can seed a view task, but never acquire an invented safe cost.
-        # Measured hits provide independent occlusion/body evidence.
-        column=m.columns.get(xy)
-        if column:
-            records=list(m.surface_observation.observed(xy))
-            barriers.update(r.height for r in records)
-            observed.update((r.height,r.orientation) for r in records)
-            for at,r in enumerate(records):
-                if r.orientation!=1:continue
-                cut=m.surface_observation.first_ground_slice(r.height)
-                if k!=cut or (at+1<len(records) and records[at+1].height-r.height<s.minimum_clearance):
-                    continue
-                if not any(other['g_surface_id']==r.id for _,other in m.layers_at(*xy)):
-                    potential.append((k,r.height,r.id,50.))
-        result=(potential,tuple(sorted(observed)),tuple(safe),tuple(sorted(barriers)))
+        if xy in cache:
+            return cache[xy]
+        m=self.map;k=self.layer
+        row=m.frontier_cell(k,xy)
+        sources=[];safe=[]
+        known=row is not None
+        if known and not row['solid'] and 0<=row['terrain_cost']<=20:
+            # A real non-obstacle ground seeds the boundary even when parking
+            # here is blocked by the unknown neighbor's footprint inflation.
+            # Observation poses and A* still use the full public safety cost.
+            cost=m.frontier_cost(k,xy,row)
+            source=(k,float(row['G']),int(row['g_surface_id']),float(cost))
+            sources.append(source)
+            if 0<=cost<=20:
+                safe.append(source)
+        obstacle=known and (bool(row['solid']) or row['terrain_cost']>=50.)
+        result=(known,tuple(sources),tuple(safe),obstacle)
         cache[xy]=result
         return result
 
     def _boundaries(self, xy, cache):
-        s=self.map.settings
-        evidence=self.map.surface_observation
-        sources={}
+        """Unknown next to a non-obstacle source passing the same-G check."""
+        if self._summary(xy,cache)[0]:
+            return {}
+        sources=[]
         for dx,dy in DIRECTIONS:
             nx,ny=xy[0]+dx,xy[1]+dy
-            for k,h,sid,cost in self._summary((nx,ny),cache)[0]:
-                sources.setdefault(k,[]).append((nx,ny,h,sid,cost))
+            _,nearby,_,obstacle=self._summary((nx,ny),cache)
+            if obstacle:return {}
+            sources.extend((nx,ny,h,sid) for _,h,sid,_ in nearby)
+        return self._qualified_boundary(xy,sources)
+
+    def _qualified_boundary(self, xy, sources):
+        # Geometric knownness is authoritative, including shared G/C aliases.
+        # A neighbor's different tread height cannot turn this cell unknown.
+        if self.map.frontier_observed(self.layer,xy):return {}
+        qualified=[]
+        for entry in sources:
+            self.auxiliary_checked_sources+=1
+            if self.map.frontier_height_compatible(self.layer,xy,entry[:2],entry[2],entry[3]):
+                qualified.append(entry)
+            else:self.auxiliary_rejected_sources+=1
+        sources=qualified
         if not sources:
             return {}
-        _,observed,_,barriers=self._summary(xy,cache)
-        result={}
-        for k,entries in sources.items():
-            # Surface equivalence is a measurement tolerance, not step ability.
-            # Bound each group's complete height span to prevent chained merges.
-            # Distinct surfaces in one source column must never share a task.
-            groups=[]
-            for entry in sorted(entries,key=lambda e:(e[2],e[0],e[1],e[3])):
-                for group in reversed(groups):
-                    if entry[2]-group[0][2]>s.surface_noise_tolerance+1e-7:continue
-                    if any(e[:2]==entry[:2] and e[3]!=entry[3] for e in group):continue
-                    group.append(entry);break
-                else:groups.append([entry])
-            heights=[median([e[2] for e in group]) for group in groups]
-            resolved=set()
-            for h,orientation in observed:
-                if not frontier_return(orientation):continue
-                distances=[abs(h-height) for height in heights]
-                closest=min(distances)
-                matches=[at for at,d in enumerate(distances) if d<=closest+1e-7]
-                # Exact matching assigns a return to its unique closest group.
-                if closest<=s.surface_noise_tolerance+1e-7 and len(matches)==1:
-                    resolved.add(matches[0])
-            for at,group in enumerate(groups):
-                height=heights[at]
-                refs=tuple((x,y,sid) for x,y,_,sid,_ in group)
-                if at in resolved or any(height+s.step_max<h<=height+s.minimum_clearance for h in barriers):
-                    continue
-                if evidence.frontier_settled(xy,height,refs,layer=k):
-                    continue
-                # Stable source identity permits several heights in one cut/XY.
-                # IDs are column-local, so include the source XY in the key.
-                anchor=min((e[0],e[1],e[3]) for e in group)
-                result[(k,*xy,anchor)]=Boundary(height,tuple(sorted(entry[:4] for entry in group)),k)
-        return result
+        # Auxiliary estimates never change G. Display height comes only from
+        # the measured sources that survived this frontier qualification.
+        return {(self.layer,*xy,(0,0,0)):Boundary(
+            median(e[2] for e in sources),tuple(sorted(sources)),self.layer)}
 
     def source_states(self, key):
         """Read current costs from retained cut references, not stale copies."""
-        return tuple(source+(self.map.planning_cost((key[0],source[0],source[1])),)
+        return tuple(source+(self.map.frontier_cost(key[0],source[:2]),)
                      for source in self.nodes[key].sources)
 
     def neighbours(self, key):
-        _,x,y,_=key;h=self.nodes[key].height;s=self.map.settings
-        a={(e[0],e[1]):e[3] for e in self.nodes[key].sources}
-        own=self.by_column.get((x,y),())
-        for dx,dy in ((0,0),)+DIRECTIONS:
-            nearby=self.by_column.get((x+dx,y+dy),())
-            for other in nearby:
-                if other==key:continue
-                delta=abs(self.nodes[other].height-h)
-                # Distinct height tasks cannot bridge two floors at one XY.
-                limit=s.surface_noise_tolerance+1e-7 if not (dx or dy) else s.step_max+1e-5
-                if delta>limit:continue
-                b={(e[0],e[1]):e[3] for e in self.nodes[other].sources}
-                common=a.keys() & b.keys()
-                if any(a[xy]!=b[xy] for xy in common):continue
-                # Adjacent boundary groups can share a physical source.
-                if common:
-                    yield other;continue
-                # Match sheets by mutual nearest elevation. A generous step
-                # bound alone would join two parallel, closely spaced sheets.
-                if any(abs(self.nodes[n].height-h)<delta-1e-7 for n in nearby):continue
-                if any(abs(self.nodes[n].height-self.nodes[other].height)<delta-1e-7
-                       for n in own):continue
-                yield other
+        # Membership has one node per cut/XY. Within this cut clustering is
+        # purely 8-connected; view-height metadata cannot split an edge.
+        _,x,y,_=key
+        for dx,dy in DIRECTIONS:
+            yield from self.by_column.get((x+dx,y+dy),())
 
     def _drop_cluster(self, cid):
         cluster=self.clusters.pop(cid)
@@ -252,17 +207,29 @@ class SliceFrontiers:
     def update(self, changed_columns, boundary_kernel=None, force_columns=()):
         self.changed_clusters=set()
         self.stale_observers=set()
+        shared=getattr(self.map,'radar_frontier_layer',None)
+        if shared is not None and self.layer!=shared:
+            # Retire pre-existing compatibility geometry once on activation.
+            # Live queries resolve their cut references to the shared view.
+            surfaces={(k,*xy,h) for xy,states in self.safe_signatures.items() for k,h,_,_ in states}
+            heights={(*xy,h) for xy,states in self.safe_signatures.items() for _,h,_,_ in states}
+            work,changed,_,_=self._replace_boundaries({xy:{} for xy in list(self.by_column)})
+            self.safe_signatures.clear();self.frontier_inputs.clear()
+            self.known_count=self.safe_count=0
+            self.last_work=dict(EMPTY_WORK);self.last_work.update(work)
+            return changed,surfaces,heights
         if not changed_columns:
             self.last_work=dict(EMPTY_WORK)
             return set(), set(), set()
         began=time.monotonic()
         self.revision=self._catalog().revision+1
+        self.auxiliary_checked_sources=self.auxiliary_rejected_sources=0
         cache={};observer_changes=set();observer_heights=set()
         boundary_dirty=set(force_columns)
         # Raw hits and soft costs do not necessarily alter a boundary. Compare
         # only the fields read by boundary checks before expanding the 3x3.
         for xy in changed_columns:
-            potential,observed,safe,barriers=self._summary(xy,cache)
+            known,sources,safe,obstacle=self._summary(xy,cache)
             previous_safe=self.safe_signatures.get(xy,())
             before_geometry={entry[:3] for entry in previous_safe}
             after_geometry={entry[:3] for entry in safe}
@@ -273,10 +240,12 @@ class SliceFrontiers:
                 observer_heights.update((*xy,entry[0]) for entry in previous_safety^current_safety)
             if safe:self.safe_signatures[xy]=safe
             else:self.safe_signatures.pop(xy,None)
-            signature=(tuple(entry[:3] for entry in potential),observed,barriers,
-                       self.map.surface_observation.boundary_signature(xy))
-            previous_input=self.frontier_inputs.get(xy,((),(),(),()))
-            self.known_count+=len(potential)-len(previous_input[0])
+            auxiliary=self.map._column_frontier_signatures.get(xy,())
+            column=self.map.columns.get(xy)
+            occupied=column.obstacle_intervals if column is not None else ()
+            signature=(known,tuple(entry[:3] for entry in sources),auxiliary,obstacle,occupied)
+            previous_input=self.frontier_inputs.get(xy,(False,(),(),False,()))
+            self.known_count+=int(known)-int(previous_input[0])
             self.safe_count+=len(safe)-len(previous_safe)
             if previous_input!=signature:
                 boundary_dirty.add(xy)
@@ -292,6 +261,8 @@ class SliceFrontiers:
             summaries_ms=1000*(summaries_done-began),membership_ms=elapsed,
             clusters_ms=1000*(time.monotonic()-summaries_done)-elapsed,
             observer_invalidated=0, **work,update_ms=1000*(time.monotonic()-began))
+        self.last_work.update(auxiliary_checked_sources=self.auxiliary_checked_sources,
+                              auxiliary_rejected_sources=self.auxiliary_rejected_sources)
         return changed, observer_changes, observer_heights
 
     def _boundary_batch(self, columns, cache, kernel):
@@ -300,21 +271,14 @@ class SliceFrontiers:
         neighbourhood=columns | {(x+dx,y+dy) for x,y in columns for dx,dy in DIRECTIONS}
         summaries={}
         for xy in neighbourhood:
-            potential,observed,_,barriers=self._summary(xy,cache)
-            if potential or observed or barriers:
-                summaries[xy]=([(height,sid) for _,height,sid,_ in potential],observed,barriers)
-        settings=self.map.settings
-        evidence=self.map.surface_observation
-        found=kernel(columns,summaries,settings.surface_noise_tolerance,
-                     settings.step_max,settings.minimum_clearance)
+            known,sources,_,obstacle=self._summary(xy,cache)
+            if known:
+                summaries[xy]=([(height,sid) for _,height,sid,_ in sources],True,obstacle)
+        found=kernel(columns,summaries)
         replacements={xy:{} for xy in columns}
         for xy,groups in found.items():
             for height,sources in groups:
-                refs=tuple((x,y,sid) for x,y,_,sid in sources)
-                if evidence.frontier_settled(xy,height,refs,layer=self.layer):
-                    continue
-                anchor=min((x,y,sid) for x,y,_,sid in sources)
-                replacements[xy][(self.layer,*xy,anchor)]=Boundary(height,tuple(sources),self.layer)
+                replacements[xy].update(self._qualified_boundary(xy,sources))
         return replacements
 
     def _replace_boundaries(self, replacements):
@@ -413,6 +377,7 @@ class FrontierIndex:
         self.completed_tiles={}
         self.completion_revision=0
         self.floor_failures={}
+        self.floor_local_failures={}
         self.floor_blacklist={}
         self.floor_review_timeouts={}
         self.floor_failed_small={}
@@ -420,6 +385,7 @@ class FrontierIndex:
         self.floor_disconnected={}
         self.floor_retry_tiles=defaultdict(set)
         self.floor_retry_dependencies={}
+        self.floor_seen_safe_ground={}
         self.floor_reopened=0
 
     def reset_geometry(self):
@@ -434,14 +400,17 @@ class FrontierIndex:
         self.observer_cache=FrontierObservers(self)
         self.floor_query_members={}
         self.floor_query=None
+        self.floor_query_local=False
         self.floor_pending=None
         self.floor_view_searches={}
+        self.finished_floor_searches={}
         self.floor_view_slice=0
         self.query_scope=None
         self.query_visited={}
         self._physical_task_cache=({}, {}, {}, {})
         self._physical_column_edges={}
         self._physical_contacts={}
+        self.duplicate_groups={}
         self.known_count=self.safe_count=0
         self.revision=getattr(self,'revision',0)
         self.last_work=dict(EMPTY_WORK)
@@ -473,6 +442,8 @@ class FrontierIndex:
     def update(self, changed_columns, frontier_columns=None):
         """Serial diagnostic entry point for tests that directly alter cells."""
         columns = set(changed_columns) | set(frontier_columns or ())
+        for xy in changed_columns:
+            self.map._index_column_intervals(xy)
         results = [(index, index.update(columns)) for index in self.slices.values()] if columns else []
         self.commit(results)
 
@@ -560,7 +531,16 @@ class FrontierIndex:
         touched=defaultdict(list)
         for layer,x,y,height in changes:
             row=self.map.cell((layer,x,y))
-            if row is not None and not row['unknown'] and self.map.planning_cost((layer,x,y))<=20:
+            if (row is not None and not row['unknown'] and
+                    0<=self.map.planning_cost((layer,x,y))<=20 and
+                    self.map.surface_observation.is_ground_source((x,y),int(row['g_surface_id']))):
+                # A cut alias or a known cell returning below the cost limit
+                # does not add coverage. Only newly available physical ground
+                # can reopen nearby failures caused by missing observations.
+                seen=self.floor_seen_safe_ground.setdefault((x,y),[])
+                h=float(row['G'])
+                if any(abs(h-old)<=s.surface_noise_tolerance+1e-7 for old in seen):continue
+                seen.append(h)
                 for token in self.floor_retry_tiles.get((x//b,y//b),()):
                     touched[token].append((x,y,height))
         radius=self.radius+max(s.robot_radius+s.safety_margin,s.ground_lidar_min_range)+.15
@@ -570,7 +550,8 @@ class FrontierIndex:
             if not any(math.hypot(x-xy[0],y-xy[1])*s.resolution<=radius and
                        abs(height-boundary.height)<=s.step_max+1e-7 for x,y,height in points):
                 continue
-            for table in (self.floor_failures,self.floor_blacklist,self.floor_review_timeouts,self.floor_failed_small):
+            for table in (self.floor_failures,self.floor_local_failures,self.floor_blacklist,
+                          self.floor_review_timeouts,self.floor_failed_small):
                 records=table.get(xy)
                 if records is None:continue
                 matches=[record for record in records if self._same_boundary(boundary,record[1])]
@@ -590,9 +571,12 @@ class FrontierIndex:
         self.floor_reopened+=len(resumed)
         self.last_work['reopened_floor_clusters']=len(resumed)
 
-    def floor_work_available(self, floor):
+    def floor_work_available(self, floor, selection_layer=None):
+        if getattr(self.map,'radar_frontier_layer',None) is not None:
+            selection_layer=self.map.radar_frontier_layer
         for cluster in self.physical_tasks()[0].values():
             for key in cluster['members']:
+                if selection_layer is not None and key[0]!=selection_layer:continue
                 node=self.nodes[key]
                 if (abs(node.height-floor[0])<=floor[1] and
                         any(abs(source[2]-floor[0])<=floor[1] for source in node.sources) and
@@ -653,17 +637,21 @@ class FrontierIndex:
         local=self.floor_query_members.get(cid)
         if not local or cluster is None or self.floor_query is None:return None
         floor,belongs,fast,failures,max_attempts,bounded_review=self.floor_query
-        members={key:self.nodes[key] for key in cluster['members'] if belongs(key) and
+        candidates=local if self.floor_query_local else cluster['members']
+        members={key:self.nodes[key] for key in candidates if belongs(key) and
                  not self._disconnected_on_floor(floor,key) and
                  not self._floor_records(self.floor_blacklist,floor,key) and
                  self._failure_count(floor,key)==failures}
         small_limit=self.map.settings.floor_failed_small_cluster_max_cells
         small=bounded_review and failures>0 and small_limit and self._small_floor_members(
             cluster['members'],belongs,small_limit)
-        search=self.floor_view_searches.get(cid) if bounded_review else None
+        search=self.floor_view_searches.get(cid) if bounded_review or self.floor_query_local else None
+        if search is None:search=self.finished_floor_searches.get(cid)
         tested=frozenset(search.tested_poses|search.rejected) if search is not None else frozenset()
         resume=tuple(p for p in (search.direction_poses or ()) if p not in tested) if search is not None else ()
-        return FloorAttempt(cid,floor,members,local,fast,failures,max_attempts,bounded_review,bool(small),tested,resume)
+        return FloorAttempt(cid,floor,members,local,fast,failures,max_attempts,bounded_review,
+                            bool(small),tested,resume,self.floor_query_local,
+                            frozenset(search.rejected) if search is not None else frozenset())
 
     def reject_floor_view(self, cid, pose, timed_out, blockers, elapsed=0.):
         search=self.floor_view_searches.get(cid)
@@ -679,6 +667,7 @@ class FrontierIndex:
 
     def clear_floor_view_search(self, cid):
         self.floor_view_searches.pop(cid,None)
+        self.finished_floor_searches.pop(cid,None)
 
     def _same_boundary(self, first, second):
         a={source[:2]:source[3] for source in first.sources}
@@ -742,6 +731,29 @@ class FrontierIndex:
         # can change while the robot is travelling to the observation.
         remaining=self.remaining_floor_members(attempt.members)
         if not remaining:return 'progress' if sufficient_progress else 'cluster_changed'
+        if attempt.local_search and not sufficient_progress and failure_reason!='floor_low_progress':
+            cluster=self.task_cluster(attempt.cluster)
+            if cluster is not None:
+                candidates=cluster['members']
+            else:
+                # Component IDs may change during travel. Classify today's
+                # complete tasks, not just the old window's surviving cells.
+                candidates=set()
+                for cid in {self.task_id(key) for key in remaining}:
+                    current=self.task_cluster(cid)
+                    if current is not None:candidates.update(current['members'])
+                if not candidates:candidates=remaining
+            belongs=lambda key:abs(self.nodes[key].height-attempt.floor[0])<=attempt.floor[1]
+            if not self._small_floor_members(candidates,belongs,max(3,self.map.settings.fast_min_visible_cells)-1):
+                # A restricted window cannot settle a large floor task. Even
+                # all locally tested rays being occluded is only a local
+                # conclusion; the global first pass must get its own search.
+                for key in remaining:
+                    self.floor_local_failures.setdefault(key[1:3],{})[(attempt.floor,self.nodes[key])]=(
+                        1,completed_view,failure_reason,attempt.tested_poses,attempt.resume_poses,
+                        attempt.rejected_poses)
+                    self._watch_floor_failure(attempt.floor,key)
+                return 'first_no_progress'
         if count_failure and failure_reason!='floor_known_barrier':
             for key in remaining:self._watch_floor_failure(attempt.floor,key)
         if attempt.bounded_review and attempt.review and failure_reason in (
@@ -758,7 +770,8 @@ class FrontierIndex:
                 if not records:self.floor_failures.pop(xy,None)
         if sufficient_progress:return 'progress'
         failures=attempt.failures+1
-        exhausted=failures>=attempt.max_attempts or failure_reason=='floor_known_barrier'
+        exhausted=(failures>=attempt.max_attempts or failure_reason=='floor_known_barrier' or
+                   (failure_reason=='floor_no_observation' and not attempt.local_search))
         for key in remaining:
             xy=key[1:3]
             record=(attempt.floor,self.nodes[key])
@@ -815,21 +828,9 @@ class FrontierIndex:
                     break
             else:
                 groups.append(dict(height=boundary.height,boundaries=[boundary],matches=set(matches)))
-        resolved=0
-        evidence=self.map.surface_observation
-        for xy,groups in columns.items():
-            # A real return can resolve only one physical task in this column.
-            candidates=sorted((abs(height-g['height']),i,sid) for i,g in enumerate(groups)
-                              if all(not self.map.ground_pending(xy,b.layer) for b in g['boundaries'])
-                              for sid,height in g['matches'])
-            resolved_groups={i for i,g in enumerate(groups) if any(
-                evidence.frontier_settled(xy,b.height,[(x,y,sid) for x,y,_,sid in b.sources],layer=b.layer)
-                for b in g['boundaries'])}
-            matched_surfaces=set()
-            for _,i,sid in candidates:
-                if i not in resolved_groups and sid not in matched_surfaces:
-                    resolved_groups.add(i);matched_surfaces.add(sid)
-            resolved+=len(resolved_groups)
+        resolved=sum(all(self.map.frontier_observed(b.layer,xy)
+                         for b in group['boundaries'])
+                     for xy,groups in columns.items() for group in groups)
         return sum(map(len,columns.values())),resolved
 
     def physical_tasks(self):
@@ -839,7 +840,11 @@ class FrontierIndex:
     def _update_physical_tasks(self, changed_clusters, columns):
         began=time.monotonic()
         tasks,spatial,owners,aliases=self._physical_task_cache
+        forward=tuple((dx,dy) for dx,dy in DIRECTIONS if (dx,dy)>(0,0))
+        tolerance=self.map.settings.surface_noise_tolerance+1e-7
         columns=set(columns)
+        columns.update((x-dx,y-dy) for x,y in tuple(columns) for dx,dy in forward
+                       if (x-dx,y-dy) in self.by_column or (x-dx,y-dy) in self._physical_column_edges)
         touched=set(changed_clusters)
         for xy in columns:
             for first,last in self._physical_column_edges.get(xy,()):
@@ -852,6 +857,25 @@ class FrontierIndex:
             for _,members in self.physical_targets(self.by_column.get(xy,())):
                 ids=sorted({self.membership[key] for key in members})
                 current.update((ids[0],other) for other in ids[1:])
+            # Same-ground sparse cuts can express one continuous observed
+            # edge even when intermediate cuts have no frontier members.
+            # Index each cross-cut contact at just one end of the XY pair.
+            x,y=xy
+            for dx,dy in forward:
+                other_xy=x+dx,y+dy
+                for key in self.by_column.get(xy,()):
+                    first=self.nodes[key]
+                    a={p[:2]:p[3] for p in first.sources}
+                    for other in self.by_column.get(other_xy,()):
+                        if key[0]==other[0]:continue
+                        last=self.nodes[other]
+                        if abs(first.height-last.height)>tolerance:continue
+                        b={p[:2]:p[3] for p in last.sources}
+                        if any(a[p]!=b[p] for p in a.keys() & b.keys()):continue
+                        if any(max(abs(ax-bx),abs(ay-by))<=1 and
+                               abs(ah-bh)<=tolerance
+                               for ax,ay,ah,_ in first.sources for bx,by,bh,_ in last.sources):
+                            current.add(tuple(sorted((self.membership[key],self.membership[other]))))
             for first,last in previous-current:
                 for source,target in ((first,last),(last,first)):
                     neighbours=self._physical_contacts[source]
@@ -889,6 +913,7 @@ class FrontierIndex:
                     del spatial[tile]
             for cid in aliases.pop(task_id):
                 del owners[cid]
+                self.duplicate_groups.pop(cid,None)
 
         remaining={cid for cid in affected if cid in self.clusters}
         while remaining:
@@ -901,16 +926,15 @@ class FrontierIndex:
                     remaining.remove(other)
                     group.add(other)
                     pending.append(other)
-            if len(group)==1:
-                task=self.clusters[first]
-            else:
-                members=set().union(*(self.clusters[cid]['members'] for cid in group))
-                task=FrontierCluster(self,**self.describe_task(first,members))
-            tasks[first]=task
-            aliases[first]=group
-            owners.update((cid,first) for cid in group)
-            for tile in task['tiles']:
-                spatial.setdefault(tile,set()).add(first)
+            # Cross-cut contacts only identify alternative representations.
+            # Preserve every slice cluster's identity and original members.
+            duplicate_group=frozenset(group)
+            for cid in group:
+                task=self.clusters[cid]
+                tasks[cid]=task;aliases[cid]={cid};owners[cid]=cid
+                self.duplicate_groups[cid]=duplicate_group
+                for tile in task['tiles']:
+                    spatial.setdefault(tile,set()).add(cid)
         self.last_work['physical_columns_checked']=len(columns)
         self.last_work['physical_clusters_updated']=len(affected)
         self.last_work['physical_tasks_ms']=1000*(time.monotonic()-began)
@@ -932,14 +956,18 @@ class FrontierIndex:
     def query(self, base=None, minimum_distance=0., window_size=None, query_budget=0., continuation=None,
               floor=None, stairs=(), evaluate_observers=True, fast=False, prune_disconnected=False,
               floor_selection=None, attempt_scope=None, max_attempts=2, ascent_limits=None,
-              ordinary_floor=True, review_remaining=None):
+              ordinary_floor=True, review_remaining=None, selection_layer=None):
         began=time.monotonic()
+        if getattr(self.map,'radar_frontier_layer',None) is not None:
+            selection_layer=self.map.radar_frontier_layer
         s=self.map.settings
         output=[]
         managed_cross=attempt_scope is not None
         seek_ascent=managed_cross and continuation is None
         bounded_floor=evaluate_observers and (managed_cross or (floor is not None and continuation is None))
         ordinary_floor=ordinary_floor and bounded_floor and not managed_cross
+        local_first=ordinary_floor and window_size is not None
+        self.finished_floor_searches.clear()
         review_enabled=not ordinary_floor or s.floor_global_review_enabled
         small_limit=s.floor_failed_small_cluster_max_cells if ordinary_floor else 0
         bounded_review=ordinary_floor and review_enabled and review_remaining is not None
@@ -972,6 +1000,9 @@ class FrontierIndex:
         queues=[[] for _ in range(max_attempts)]
         deferred_clusters=set()
         deferred_members=set()
+        low_yield_members=set()
+        low_yield_clusters=set()
+        local_only_clusters=set()
         small_clusters=0
         small_members=set()
         disconnected_members=set()
@@ -985,61 +1016,37 @@ class FrontierIndex:
         # cluster or XY column can also contain an independent upper boundary.
         floor_members=None
         if floor is not None:
-            indices={}
-            tread_tolerance=min(s.surface_normal_thickness,s.surface_noise_tolerance)
-            for flight in stairs:
-                if not flight.confirmed:
-                    continue
-                for xy in flight.entrance_cells():
-                    indices.setdefault(xy,[]).append(flight)
-
             def belongs(key):
                 node=self.nodes[key]
-                if not on_floor(node.height) or not any(on_floor(src[2]) for src in node.sources):
-                    return False
-                x,y=key[1:3]
-                for flight in indices.get((x,y),()):
-                    # A measured first tread already explains elevated lip
-                    # frontiers. Keep the stricter rule for floor-level ones.
-                    if floor[0]+tread_tolerance < node.height <= flight.treads[0][2]+tread_tolerance:
-                        return False
-                    if flight.owns_boundary(x,y,node.sources,on_floor):
-                        return False
-                return True
+                return on_floor(node.height) and any(on_floor(src[2]) for src in node.sources)
             floor_members=belongs
         if seek_ascent:
             max_step,min_rise=ascent_limits
 
             def ascending_member(key):
                 node=self.nodes[key]
-                low,high=base[2]+min_rise,base[2]+max_step+1e-7
+                band=attempt_scope[1] if attempt_scope is not None else None
+                low=(band[0]+band[1]+1e-7 if band is not None else base[2]+min_rise)
+                high=math.inf
                 return (low-s.surface_noise_tolerance<=node.height<=high and
                         any(low<=source[2]<=high for source in node.sources))
 
             floor_members=ascending_member
         elif managed_cross:
             level_filter=floor_members
-            yaw,min_height,slack=continuation
-            direction=(math.cos(yaw),math.sin(yaw))
-            max_step,min_rise=ascent_limits if ascent_limits is not None else (math.inf,0.)
-
-            def forward_member(key):
+            _,min_height,_=continuation
+            def cross_member(key):
                 node=self.nodes[key]
-                dx=s.origin_x+key[1]*s.resolution-base[0]
-                dy=s.origin_y+key[2]*s.resolution-base[1]
-                ahead=dx*direction[0]+dy*direction[1]
-                if ahead < -slack:
-                    return False
-                if level_filter is not None:
-                    return level_filter(key) and abs(node.height-floor[0])<=floor[1]+s.surface_noise_tolerance
-                return (abs(dx*direction[1]-dy*direction[0])<=1.5
-                        and min_height-s.surface_noise_tolerance<=node.height<=base[2]+max_step+1e-7
-                        and any(min_height<=source[2]<=base[2]+max_step+1e-7 for source in node.sources))
-
-            floor_members=forward_member
+                if level_filter is not None:return level_filter(key)
+                return node.height>=min_height-s.surface_noise_tolerance and any(
+                    source[2]>=min_height for source in node.sources)
+            floor_members=cross_member
         for cid in sorted(ids):
             cluster=clusters[cid]
             members=cluster['members']
+            if selection_layer is not None:
+                members={key for key in members if key[0]==selection_layer}
+                if not members:continue
             if window is not None:
                 s=self.map.settings
                 # A large component may cross the window. Read its local
@@ -1050,13 +1057,23 @@ class FrontierIndex:
                     (lo<=self.components.tile(next(iter(self.components.fragments[fid])))[1:]).all() and
                     (hi>=self.components.tile(next(iter(self.components.fragments[fid])))[1:]).all()]
                 members={key for fid in local_fragments for key in self.components.fragments[fid] if
+                    (selection_layer is None or key[0]==selection_layer) and
                     window[0][0]-1e-8<=s.origin_x+key[1]*s.resolution<=window[1][0]+1e-8 and
                     window[0][1]-1e-8<=s.origin_y+key[2]*s.resolution<=window[1][1]+1e-8 and
                     window[0][2]-1e-8<=self.nodes[key].height<=window[1][2]+1e-8}
             if floor_members is not None:
                 members={key for key in members if floor_members(key)}
             if not members:continue
+            local_only=(local_first and not self._small_floor_members(
+                cluster['members'],floor_members,max(3,s.fast_min_visible_cells)-1))
+            if local_only:local_only_clusters.add(cid)
             if bounded_floor:
+                if local_first:
+                    local_failed={key for key in members if
+                        self._floor_records(self.floor_local_failures,task_scope,key)}
+                    if local_failed:
+                        deferred_members.update(local_failed);deferred_clusters.add(cid)
+                        members=members-local_failed
                 if prune_disconnected:
                     retired={key for key in members if self._disconnected_on_floor(task_scope,key)}
                     disconnected_members.update(retired)
@@ -1116,7 +1133,7 @@ class FrontierIndex:
                 if not task:continue
                 physical=self.physical_targets(task)
                 if base is None:
-                    rank=0.
+                    rank=-len(physical)
                 else:
                     xyz=np.asarray([point for point,_ in physical])
                     rank=float(np.linalg.norm(xyz-base,axis=1).min())-math.log1p(len(xyz)*s.resolution)
@@ -1125,17 +1142,39 @@ class FrontierIndex:
                         rank=observation_effort(float(np.linalg.norm(xyz[:,:2]-base[:2],axis=1).min()),len(xyz))
                 priority=int(failures>0 and cid in connection_reviews)
                 if managed_cross:
-                    if floor is None:
-                        priority=int(not any(self.nodes[k].height-base[2]>=min_rise for k in task))
+                    if seek_ascent:
+                        priority=max(0.,min(self.nodes[k].height for k in task)-base[2])
                     else:
-                        rank-=max(0.,float(np.max((xyz[:,:2]-base[:2]) @ direction)))
+                        priority=int(not any(self.nodes[k].height>base[2]+.005 for k in task))
                 queues[failures].append(((priority,rank),cid,task))
                 physical_entries[cid,failures]=physical
-        reviews={cid for queue in queues[1:] for _,cid,_ in queue}
+        reviews={min(self.duplicate_groups.get(cid,frozenset((cid,))))
+                 for queue in queues[1:] for _,cid,_ in queue}
         allowed_rounds=len(queues) if window is None or managed_cross else 1
         failures=next((i for i in range(allowed_rounds) if queues[i]),0)
         prepared=queues[failures]
+        # Offer one best slice representation per repeated boundary. A failed
+        # first choice leaves the other cuts intact for the bounded review.
+        def representation_rank(row):
+            rank,cid,members=row
+            tried=failures>0 and any(record[1].layer==key[0] for key in members
+                for record in self._floor_records(self.floor_failures,task_scope,key))
+            return tried,rank,cid
+        chosen=[];represented=set()
+        for row in sorted(prepared,key=representation_rank):
+            group=self.duplicate_groups.get(row[1],frozenset((row[1],)))
+            if group & represented:continue
+            represented.update(group);chosen.append(row)
+        prepared=chosen
         reviewing=failures>0
+        expanded_members=set()
+        expanded_clusters=set()
+        if ordinary_floor and window is None and not reviewing:
+            for _,cid,members in prepared:
+                expanded={key for key in members if
+                    self._floor_records(self.floor_local_failures,task_scope,key)}
+                if expanded:
+                    expanded_members.update(expanded);expanded_clusters.add(cid)
         directional=ordinary_floor and floor_selection is not None and (
             bounded_review if reviewing else s.floor_four_direction_search)
         entries={}
@@ -1146,11 +1185,11 @@ class FrontierIndex:
         resumed_slices=0
         if bounded_floor and self.floor_pending is not None:
             old_floor,old_failures,old_members,resumed_ms,resumed_slices=self.floor_pending
-            if old_floor==task_scope and old_failures==failures:
+            if old_floor==task_scope and old_failures==failures and self.floor_query_local==local_first:
                 remaining=self.remaining_floor_members(old_members)
                 resume=next((cid for _,cid,members in prepared if remaining & members),None)
             self.floor_pending=None
-        search_scope=(task_scope,window_size is None,failures, floor is not None)
+        search_scope=(task_scope,window_size is None,failures, floor is not None,selection_layer)
         rotate_local=floor_selection is not None and window is not None and not managed_cross and not reviewing
         if floor_selection is not None:
             active_searches={}
@@ -1170,6 +1209,7 @@ class FrontierIndex:
             elif not rotate_local and active_searches:
                 resume=max(active_searches,key=lambda cid:active_searches[cid].last_slice)
         self.floor_query=(task_scope,floor_members,fast,failures,max_attempts,bounded_review) if bounded_floor else None
+        self.floor_query_local=local_first
         self.floor_query_members={cid:members for _,cid,members in prepared} if bounded_floor else {}
         scoped_cells=0
         for _,cid,members in prepared:
@@ -1192,7 +1232,8 @@ class FrontierIndex:
             output[-1]['observers_complete']=False
             entries[cid]=output[-1]
         scope=(None if base is None else tuple(np.rint(np.asarray(base)/self.map.settings.resolution).astype(int)),
-               None if window_size is None else tuple(window_size),minimum_distance,continuation,task_scope,reviewing,fast)
+               None if window_size is None else tuple(window_size),minimum_distance,continuation,task_scope,
+               reviewing,fast,selection_layer)
         if evaluate_observers and (self.query_scope!=scope or not query_budget):
             self.query_visited.clear();self.query_scope=scope
         slice_budget=floor_selection[-1] if floor_selection is not None and reviewing else query_budget
@@ -1268,12 +1309,22 @@ class FrontierIndex:
                 completed.append(retry)
             observer_args=(members,base,minimum_distance,completed,component,window,deadline)
             observer_options={}
+            prior_rejected=set()
+            if ordinary_floor and window is None:
+                for key in members:
+                    for record in self._floor_records(self.floor_local_failures,task_scope,key):
+                        history=self.floor_local_failures[key[1:3]][record]
+                        # Route rejection belongs to the stance itself. A
+                        # failed local view may still see other members of
+                        # the full cluster, so do not discard every tried ray.
+                        if len(history)>5:prior_rejected.update(history[5])
+                if prior_rejected:observer_options['rejected']=prior_rejected
             if continuation is not None:observer_options['continuation']=continuation
             if ascent_limits is not None:observer_options['ascent_limits']=ascent_limits
             if floor is not None:observer_options['floor']=floor
             observer_options['physical']=physical_entries[cid,failures]
             if prune_disconnected:observer_options['connectivity']=connectivity
-            if fast:observer_options['minimum_gain']=min(s.fast_min_visible_cells,entries[cid]['cells'])
+            if fast:observer_options['minimum_gain']=1
             if observer_started is None:
                 observer_started=time.monotonic()
             if floor_selection is not None:
@@ -1303,7 +1354,7 @@ class FrontierIndex:
                 if deadline is not None:limit=min(deadline,limit)
                 observer_args=observer_args[:6]+(limit,)
                 observer_options.update(admission=(admission,arrival_geometry,tolerance,remaining>0.),
-                                        rejected=search.rejected)
+                                        rejected=search.rejected | prior_rejected)
             observations=self._observers(*observer_args,**observer_options)
             # Prefer a new view. Allow one more look if the first failed
             # sweep's visit mask removes the last available option.
@@ -1318,6 +1369,16 @@ class FrontierIndex:
             complete=not self.observer_cache.pending
             unreachable+=self.observer_cache.last_unreachable
             views=[self.observer_cache.last_views[tuple(p)] for p in observations]
+            # A cluster's geometric representative may be hidden even when
+            # another part is visible. Dispatch an actually visible member,
+            # and retain only poses that can observe that same target.
+            if views and 'target' in views[0]:
+                target=views[0]['target']
+                admitted=[(p,v) for p,v in zip(observations,views)
+                          if np.any(np.all(np.abs(v['visible_targets']-target)<=1e-7,axis=1))]
+                observations=[p for p,_ in admitted];views=[v for _,v in admitted]
+                if views:
+                    entries[cid].update(frontier=list(target),cell=self.map.indices(target).astype(int).tolist())
             gain=max((v['gain'] for v in views),default=0)*self.map.settings.resolution
             entries[cid].update(observations=observations,gain=gain,observers_evaluated=True,
                                 observers_complete=complete,observation_yaws=[v['yaw'] for v in views])
@@ -1338,11 +1399,16 @@ class FrontierIndex:
                     entries[cid]['floor_failure']=(
                         'floor_route_timeout' if search.route_timeout else
                         'floor_observer_timeout' if not complete else
-                        'floor_no_route' if search.rejected else 'floor_no_observation')
+                        'floor_known_barrier' if search.tested_poses and
+                            search.tested_poses<=search.occluded_poses else
+                        'floor_no_route' if search.rejected else
+                        'floor_missing_observation' if search.blockers else 'floor_no_observation')
                     entries[cid]['unknown_blockers']=search.blockers
                     if search.first_rejected is not None:
                         entries[cid]['first_rejected']=list(search.first_rejected)
-                    if not bounded_review or reviewing:self.clear_floor_view_search(cid)
+                    if not bounded_review or reviewing:
+                        self.clear_floor_view_search(cid)
+                        if local_first:self.finished_floor_searches[cid]=search
                     self.observer_cache.discard_search(members)
                     no_view_clusters.append(cid)
                     if search.blockers:break
@@ -1374,12 +1440,17 @@ class FrontierIndex:
         output=[row for row in output if row['id'] not in skipped]
         if evaluate_observers and not pending:self.query_visited.clear()
         return dict(frontier_cells=sum(c['cells'] for c in clusters.values()),frontier_layer_cells=len(self.nodes),
+            selection_layer=selection_layer,
             scope='local' if window is not None else 'global',
             window=list(map(float,window_size)) if window is not None else [],
             window_center=list(map(float,base)) if window is not None else [],
             deferred_floor_frontier_cells=deferred_count+disconnected_count+small_count,
             disconnected_floor_frontier_cells=disconnected_count,
             small_skipped_clusters=small_clusters,small_skipped_cells=small_count,
+            low_yield_deferred_clusters=len(low_yield_clusters),
+            low_yield_deferred_cells=len(self.physical_targets(low_yield_members)),
+            global_first_after_local_failure_clusters=len(expanded_clusters),
+            global_first_after_local_failure_cells=len(self.physical_targets(expanded_members)),
             fast_floor=fast,fast_skipped_clusters=len(deferred_clusters) if fast else 0,
             fast_skipped_cells=deferred_count if fast else 0,
             pending_review_clusters=len(reviews),reviewing=reviewing,no_view_clusters=no_view_clusters,

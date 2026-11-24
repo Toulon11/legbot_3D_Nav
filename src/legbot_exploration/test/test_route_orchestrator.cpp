@@ -13,6 +13,35 @@ namespace le = legbot_exploration;
 int main(int argc,char **argv) {
   assert(argc==2);
   {
+    // When the recorded gap is beyond immediate viewpoints, advance only
+    // toward it over admitted ground. Target elevation is not a footstep.
+    le::SharedLayerMap shared;
+    shared.pct=std::make_shared<le::PctBackend>(argv[1],.32,100000,200000,
+                                             "{\"maturity_min_points\":1,\"robot_radius\":0.15}");
+    std::vector<le::LayerPoint> plane;
+    for(int x=-30;x<=30;++x)for(int y=-30;y<=30;++y)
+      for(double z:{0.,1.5})plane.push_back({x*.1,y*.1,z});
+    shared.pct->append(plane);shared.pct->refresh(1);shared.current_version.store(1);
+    std::unordered_map<le::Cell,int,le::CellHash> grid;
+    std::vector<le::XY> obstacles;le::Settings settings;
+    const le::Point base{0.,0.,.32};
+    le::PlanningSnapshot snapshot{grid,obstacles,settings,base,.32,true,nullptr,&shared,1,nullptr};
+    le::PctRecoveryConstraints limits;limits.ascent=0.;limits.height_band=le::XY{0.,.16};
+    le::PctBlockerRecovery recovery;
+    const auto action=recovery.next(snapshot,1,{0.,0.,0.},{{{6.,0.,.13},1,1}},limits,true,
+                                   [](const le::Point &){return true;});
+    assert(action && action->kind==le::PctRecoveryAction::Kind::delegate && action->targeted);
+    assert(std::hypot(6.-action->position[0],action->position[1])<5.8);
+    assert(shared.pct->plan(1,base,action->position).reason=="ok");
+    le::PctBlockerRecovery upper_target;
+    assert(upper_target.next(snapshot,1,{0.,0.,0.},{{{6.,0.,1.3},1,1}},limits,true,
+                             [](const le::Point &){return true;}));
+    limits.permits_goal=[](const le::Point &){return false;};
+    le::PctBlockerRecovery forbidden_approach;
+    assert(!forbidden_approach.next(snapshot,1,{0.,0.,0.},{{{6.,0.,1.3},1,1}},limits,true,
+                                    [](const le::Point &){return true;}));
+  }
+  {
     le::RecoveryController recovery;
     le::RecoveryController::BlockerRecovery first,other;
     first.cross_layer=true;first.floor_attempt=2;
@@ -52,9 +81,10 @@ int main(int argc,char **argv) {
     // still find a routed observation stance without relaxing arrival safety.
     le::SharedLayerMap shared;
     shared.pct=std::make_shared<le::PctBackend>(argv[1],.32,100000,200000,
-                                             "{\"maturity_min_points\":1}");
+                                             "{\"maturity_min_points\":1,\"allow_open_ceiling\":true,\"origin_z\":0.00001}");
     std::vector<le::LayerPoint> plane;
-    for(int x=-30;x<=30;++x)for(int y=-30;y<=30;++y)plane.push_back({x*.1,y*.1,0.});
+    for(int x=-30;x<=30;++x)for(int y=-30;y<=30;++y)
+      for(double z:{0.,1.5})plane.push_back({x*.1,y*.1,z});
     shared.pct->append(plane);shared.pct->refresh(1);shared.current_version.store(1);
     const le::Point base{0.,0.,.32};
     const std::vector<le::PctUnknownBlocker> blockers{{{.5,0.,.13},1,1}};
@@ -82,21 +112,36 @@ int main(int argc,char **argv) {
     // outer arrival disc prevents navigating to this same pose anew.
     le::SharedLayerMap shared;
     shared.pct=std::make_shared<le::PctBackend>(argv[1],.32,100000,200000,
-                                             "{\"maturity_min_points\":1}");
+                                             "{\"maturity_min_points\":1,\"allow_open_ceiling\":true,\"origin_z\":0.00001}");
     std::vector<le::LayerPoint> plane;
     for(int x=-30;x<=30;++x)for(int y=-30;y<=30;++y)
-      if(x!=7 || y!=0)plane.push_back({x*.1,y*.1,0.});
+      if(x!=7 || y!=0)for(double z:{0.,1.5})plane.push_back({x*.1,y*.1,z});
     shared.pct->append(plane);shared.pct->refresh(1);shared.current_version.store(1);
     const le::Point base{0.,0.,.32};
     const std::vector<le::PctUnknownBlocker> blockers{{{1.4,0.,.13},1,1}};
     assert(shared.pct->observation_task(1,"begin_blocker_review",0,base,0.,0.,&blockers).ready);
     assert(shared.pct->observation_task(1,"arm_blocker_review",0,base).ready);
     assert(!shared.pct->arrival_area(1,base,.15,0.).ready);
+    assert(shared.pct->observation_task(1,"navigation_arrival",0,base,0.,.15).ready);
     std::unordered_map<le::Cell,int,le::CellHash> grid;
     std::vector<le::XY> obstacles;
     le::Settings settings;
     le::PlanningSnapshot snapshot{grid,obstacles,settings,base,.32,true,nullptr,&shared,1,nullptr};
+    le::PlanningSnapshot walk{grid,obstacles,settings,le::Point{-.8,0.,.32},.32,true,nullptr,&shared,1,nullptr};
+    le::PlanningGoal support;
+    support.layer_version=1;support.request_occupancy=false;support.request_layer=true;
+    support.observation_xyz=base;support.observation={0.,0.};support.xy_tolerance=.15;
+    support.candidate.source=le::CandidateSource::layer_frontier;support.candidate.frontier={0.,0.,0.};
+    auto observation=le::plan_map_candidates(support,walk);
+    assert(!observation.empty()&&!observation.front().usable());
+    support.require_observation=false;
+    auto navigation=le::plan_map_candidates(support,walk);
+    assert(!navigation.empty()&&navigation.front().usable());
+    assert(!shared.pct->observation_task(1,"navigation_arrival",0,le::Point{.5,0.,.32},0.,.15).ready);
     le::PctBlockerRecovery recovery;le::PctRecoveryConstraints limits;
+    // A stale previous route points 90 degrees away from the real failed
+    // footprint. It must not veto a safe view of that recorded blocker.
+    limits.ascent=M_PI/2.;
     const auto action=recovery.next(snapshot,1,{0.,0.,0.},blockers,limits,false,
                                      [](const le::Point &){return true;});
     assert(action && action->kind==le::PctRecoveryAction::Kind::scan && action->position==base);
@@ -106,10 +151,10 @@ int main(int argc,char **argv) {
     // observer routes must not consume safe endpoints of SCAN recovery.
     le::SharedLayerMap shared;
     shared.pct=std::make_shared<le::PctBackend>(argv[1],.32,100000,200000,
-                                             "{\"maturity_min_points\":1}");
+                                             "{\"maturity_min_points\":1,\"allow_open_ceiling\":true,\"origin_z\":0.00001}");
     std::vector<le::LayerPoint> ring;
     for(int x=-30;x<=30;++x)for(int y=-30;y<=30;++y)
-      if(std::hypot(x*.1,y*.1)>=.8)ring.push_back({x*.1,y*.1,.13});
+      if(std::hypot(x*.1,y*.1)>=.8)for(double z:{.13,1.63})ring.push_back({x*.1,y*.1,z});
     shared.pct->append(ring);shared.pct->refresh(1);shared.current_version.store(1);
     const le::Point base{0.,0.,.32},goal{-1.9,0.,.45};
     std::unordered_map<le::Cell,int,le::CellHash> grid;
@@ -133,15 +178,15 @@ int main(int argc,char **argv) {
   {
     le::CrossLayerTask task;
     assert(task.accept({0.,0.,0.},{{1.,0.,.13}}));
-    // Recovery can retreat one step inside the corridor; normal ascent
-    // targets must still obey monotonic progress and height.
+    // Recovery uses the same single-step ability in any direction.
+    // The shared planner validates actual support and route safety.
     const le::Point support{1.,0.,.13}, retreat{.6,0.,-.01};
     task.update(support);
     assert(!task.allows(retreat));
     assert(task.allows_recovery(support,retreat,.16));
     assert(!task.allows_recovery(support,retreat,.12));
     assert(!task.allows_recovery(support,{.6,0.,-.04},.16));
-    assert(!task.allows_recovery(support,{.6,2.,.13},.16));
+    assert(task.allows_recovery(support,{.6,2.,.13},.16));
     task.exploring_platform(.13);
     task.exploring_platform(.16);
     assert(task.platform_height() && *task.platform_height()==.13);
@@ -149,6 +194,16 @@ int main(int argc,char **argv) {
     assert(task.platform_height() && *task.platform_height()==.13);
     task.clear();
     assert(!task.platform_height());
+  }
+  {
+    le::CrossLayerTask task;
+    const le::Point approach{5.,4.4,1.46}, first{7.,-3.,1.60}, next{7.,-2.5,1.73};
+    assert(task.accept(approach,{first},1.46));
+    task.set_ascent_yaw(M_PI/2.);
+    task.update(first);
+    assert(task.allows(next));
+    assert(task.route_allowed(first,{next}));
+    assert(task.allows({7.,-3.5,1.73}));
   }
   {
     le::StairScanBudget budget;
@@ -166,7 +221,8 @@ int main(int argc,char **argv) {
     le::CrossLayerTask task;
     const le::Point base{0.,0.,0.};
     assert(!task.accept(base,{{1.,0.,.05}}));
-    assert(task.accept(base,{{1.,0.,.06}}));
+    assert(!task.accept(base,{{1.,0.,.06}}));
+    assert(task.accept(base,{{1.,0.,.09}}));
   }
   {
     le::CrossLayerTask task;
@@ -189,10 +245,10 @@ int main(int argc,char **argv) {
     task.observed();
     assert(!task.allows({.5,0.,0.}));
     assert(task.allows({1.,.3,.14}));
-    assert(!task.route_allowed(tread,{{.5,0.,.14},{2.,0.,.28}}));
+    assert(task.route_allowed(tread,{{.5,0.,.14},{2.,0.,.28}}));
     assert(task.accept(tread,{{1.,.3,.14}}));
-    assert(std::abs(task.forward_yaw())<1e-6);
-    assert(!task.route_allowed(tread,{{1.,-.3,.14}}));
+    assert(std::abs(task.forward_yaw()-M_PI/2.)<1e-6);
+    assert(task.route_allowed(tread,{{1.,-.3,.14}}));
     const double progress=task.progress();
     assert(task.accept(tread,{{2.,0.,.28}}));
     assert(task.progress()==progress);
@@ -200,7 +256,7 @@ int main(int argc,char **argv) {
     assert(task.begin_support_scan());
     task.observed();
     task.defer("no_forward_route");
-    assert(!task.can_resume(tread));
+    assert(task.can_resume(tread));
     assert(task.can_resume({2.,0.,.28}));
     task.resume();task.complete();
     assert(!task.engaged() && task.phase()=="completed");
@@ -211,7 +267,7 @@ int main(int argc,char **argv) {
     assert(task.accept(start,{{.5,0.,0.},tread,next}));
     assert(!task.begin_reposition(start));
     task.update(tread);
-    assert(!task.route_allowed(tread,{backed,next}));
+    assert(task.route_allowed(tread,{backed,next}));
     const double progress=task.progress();
     assert(task.begin_reposition(tread));
     assert(!task.engaged() && !task.begin_reposition(tread));
@@ -254,11 +310,27 @@ int main(int argc,char **argv) {
     assert(!through->xy_tolerance);
     path.advance();
     assert(path.dispatch(2,snapshot.base)->xy_tolerance==.15);
-    assert(path.dispatch(2,snapshot.base)->reference_points.empty());
+    const auto after_corner=path.dispatch(2,snapshot.base);
+    assert(after_corner->reference_points.size()==2);
+    assert(after_corner->reference_points.front()==route.xyz[2]);
+    assert(after_corner->reference_points.back()==route.xyz.back());
     route.xyz={{0.,0.,.32},{.3,0.,.47},{.6,0.,.62}};
     route.waypoints={{0.,0.},{.3,0.},{.6,0.}};route.route.points=route.waypoints;
     assert(path.load(ordinary,route,false,&snapshot));
-    assert(path.waypoints().size()==2 && path.dispatch(3,snapshot.base)->reference_points.empty());
+    assert(path.waypoints().size()==1);
+    const auto stairs=path.dispatch(3,snapshot.base);
+    assert(stairs->reference_points.size()==2 && stairs->xy_tolerance==.15);
+    assert(stairs->reference_points.front()==route.xyz[1] && stairs->reference_points.back()==route.xyz[2]);
+    // A gentle 60-degree bend remains in one continuous reference. The
+    // independent 78-degree case above still requires a controlled stop.
+    route.xyz={{0.,0.,.32},{1.,0.,.32},{1.5,.866,.32},{2.5,.866,.32}};
+    route.waypoints.clear();for(const auto &point:route.xyz)route.waypoints.push_back({point[0],point[1]});
+    route.route.points=route.waypoints;
+    assert(path.load(ordinary,route,false,&snapshot));
+    assert(path.waypoints().size()==1);
+    assert(path.dispatch(4,snapshot.base)->reference_points.size()==3);
+    for(std::size_t i=0;i<3;++i)
+      assert(path.dispatch(4,snapshot.base)->reference_points[i]==route.xyz[i+1]);
   }
   {
     le::PlanningGoal stair;stair.stair_segment=true;stair.xy_tolerance=.15;

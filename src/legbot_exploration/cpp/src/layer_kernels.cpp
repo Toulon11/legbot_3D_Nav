@@ -20,7 +20,8 @@ using Keys = std::set<XY>;
 enum Field {
   F_G, F_C, F_passage_cost, F_relief_cost, F_terrain_cost, F_inflated_terrain_cost, F_gx, F_gy, F_q, F_m,
   F_terrain_inflation_reference, F_measured, F_feature_valid, F_flat, F_solid, F_unknown, F_solid_hard,
-  F_unknown_hard, F_hard, F_g_surface_id, F_c_surface_id, F_g_mature, F_c_mature, F_pending_ceiling_z, field_count
+  F_unknown_hard, F_hard, F_g_surface_id, F_c_surface_id, F_g_mature, F_c_mature,
+  F_C_clear, F_interval_node, field_count
 };
 
 // Borrow only one slice's existing sparse buffers. No Python calls are made
@@ -48,7 +49,8 @@ struct Grid {
                                     "inflated_terrain_cost", "gx", "gy", "q", "m",
                                     "terrain_inflation_reference", "measured", "feature_valid", "flat",
                                     "solid", "unknown", "solid_hard", "unknown_hard", "hard",
-                                    "g_surface_id", "c_surface_id", "g_mature", "c_mature", "pending_ceiling_z" };
+                                    "g_surface_id", "c_surface_id", "g_mature", "c_mature",
+                                    "C_clear", "interval_node" };
         for (size_t i = 0; i < names.size(); ++i) {
           offsets[i] = fields[names[i]].cast<py::tuple>()[1].cast<int>();
         }
@@ -104,7 +106,7 @@ bool different(double a, double b)
 using Surface = std::tuple<double, std::int64_t, bool>;
 
 std::pair<Keys, Keys> update_geometry(
-  py::dict input, int block_size, const std::map<XY, std::tuple<Surface, Surface, double>> &evidence)
+  py::dict input, int block_size, const std::map<XY, std::pair<Surface, Surface>> &evidence)
 {
   Grid grid(input, block_size);
   Keys base_changed, ground_changed;
@@ -127,15 +129,13 @@ std::pair<Keys, Keys> update_geometry(
       throw std::invalid_argument("missing slice geometry block");
     }
     grid.flag(row, F_measured) = true;
-    const auto &[ground_surface,ceiling_surface,pending_ceiling] = surfaces;
+    const auto &[ground_surface,ceiling_surface] = surfaces;
     const bool ground = commit(row,ground_surface,F_G,F_g_surface_id,F_g_mature);
     const bool ceiling = commit(row,ceiling_surface,F_C,F_c_surface_id,F_c_mature);
-    const bool pending_changed=different(grid.f(row,F_pending_ceiling_z),pending_ceiling);
-    grid.f(row,F_pending_ceiling_z)=pending_ceiling;
     if (ground) {
       ground_changed.insert(xy);
     }
-    if (ground || ceiling || pending_changed) {
+    if (ground || ceiling) {
       base_changed.insert(xy);
     }
   }
@@ -191,16 +191,52 @@ struct Settings {
 
 };
 
-py::dict update_costs(py::dict input, int block_size, const Keys &base, const Keys &ground, py::dict options)
+py::dict update_costs(py::dict input, int block_size, const Keys &base, const Keys &ground, py::dict options,
+                     py::dict lower, py::dict upper, const Keys &neighbor_changes)
 {
   Grid g(input, block_size);
+  Grid below(lower, block_size), above(upper, block_size);
   Settings s(options);
   Keys changed, state_changed, terrain_changed, features = ground, relief = base, flat_changed;
   int relief_work = 0, inflation_work = 0, hard_work = 0;
   std::map<XY, std::array<int, 6>> counts;
   {
     py::gil_scoped_release release;
-    for (auto [x, y] : ground) {
+    Keys updated = ground;
+    updated.insert(neighbor_changes.begin(), neighbor_changes.end());
+    features.insert(updated.begin(), updated.end());
+    const auto height_at = [&](int x, int y, double reference) -> double {
+      auto* row = g.at(x, y);
+      const double current = row ? g.f(row, F_G) : NAN;
+      if (std::abs(current-reference) <= s.step + 1e-5) return current;
+      double best = current, distance = s.step + 1e-5;
+      for (const auto* slice : {&below, &above}) {
+        auto* p = slice->at(x, y);
+        if (!p) continue;
+        const double height = slice->f(p, F_G);
+        const double gap = std::abs(height - reference);
+        if (gap <= distance) {
+          best = height;
+          distance = gap;
+        }
+      }
+      return best;
+    };
+    const auto differences = [&](int x, int y, double z) {
+      std::array<double, 2> d{NAN, NAN};
+      if (!std::isfinite(z)) return d;
+      for (int axis = 0; axis < 2; ++axis) {
+        for (int sign : {-1, 1}) {
+          const double height = height_at(x + (axis == 0 ? sign : 0),
+                                          y + (axis == 1 ? sign : 0), z);
+          if (!std::isfinite(height)) continue;
+          const double v = (height - z) * sign;
+          if (!std::isfinite(d[axis]) || std::abs(v) > std::abs(d[axis])) d[axis] = v;
+        }
+      }
+      return d;
+    };
+    for (auto [x, y] : updated) {
       for (auto [dx, dy] : { XY{ 1, 0 }, XY{ -1, 0 }, XY{ 0, 1 }, XY{ 0, -1 } }) {
         features.emplace(x + dx, y + dy);
       }
@@ -213,20 +249,7 @@ py::dict update_costs(py::dict input, int block_size, const Keys &base, const Ke
       }
       const bool old_valid = g.flag(p, F_feature_valid), old_flat = g.flag(p, F_flat);
       const double old_q = g.f(p, F_q), old_m = g.f(p, F_m), z = g.f(p, F_G);
-      double d[2] = { NAN, NAN };
-      if (std::isfinite(z)) {
-        for (int axis = 0; axis < 2; ++axis) {
-          for (int sign : { -1, 1 }) {
-            char *n = g.at(x + (axis == 0 ? sign : 0), y + (axis == 1 ? sign : 0));
-            if (n && std::isfinite(g.f(n, F_G))) {
-              double v = (g.f(n, F_G) - z) * sign;
-              if (!std::isfinite(d[axis]) || std::abs(v) > std::abs(d[axis])) {
-                d[axis] = v;
-              }
-            }
-          }
-        }
-      }
+      const auto d = differences(x, y, z);
       const bool valid = std::isfinite(d[0]) && std::isfinite(d[1]);
       double q = d[0] * d[0] + d[1] * d[1];
       // Python max preserves a NaN in its first position.
@@ -250,6 +273,8 @@ py::dict update_costs(py::dict input, int block_size, const Keys &base, const Ke
       }
     }
     auto expanded = grow(flat_changed, s.kernel / 2);
+    relief.insert(expanded.begin(), expanded.end());
+    expanded = grow(neighbor_changes, s.kernel / 2 + 1);
     relief.insert(expanded.begin(), expanded.end());
     auto inflation_boundary = [&](int x, int y, double old, double value) {
       if (old == value || old < 0 || value < 0) {
@@ -288,12 +313,11 @@ py::dict update_costs(py::dict input, int block_size, const Keys &base, const Ke
       bool has_ground = std::isfinite(g.f(p, F_G));
       double passage = -1, terrain_relief = -1;
       if (has_ground) {
-        double clearance = g.f(p, F_C) - g.f(p, F_G);
-        passage = std::isfinite(g.f(p, F_C)) ? (clearance < s.minimum ? 50. : std::max(0.,
-                                                                                       20. *
-                                                                                       (s.desired -
-                                                                                        clearance))) : 0.;
-        if(passage<50. && g.f(p,F_pending_ceiling_z)-g.f(p,F_G)<s.minimum)passage=-1.;
+        const double upper=std::isfinite(g.f(p,F_C))?g.f(p,F_C):
+          g.flag(p,F_interval_node)?g.f(p,F_C_clear):g.f(p,F_C);
+        const double clearance=upper-g.f(p,F_G);
+        if(std::isfinite(upper))passage=clearance+1e-7<s.minimum?50.:std::max(0.,20.*(s.desired-clearance));
+        else if(!g.flag(p,F_interval_node))passage=0.;
       }
       if (g.flag(p, F_feature_valid)) {
         if (g.flag(p, F_flat)) {
@@ -303,7 +327,13 @@ py::dict update_costs(py::dict input, int block_size, const Keys &base, const Ke
           for (int dx = -s.kernel / 2; dx <= s.kernel / 2; ++dx) {
             for (int dy = -s.kernel / 2; dy <= s.kernel / 2; ++dy) {
               char *n = g.at(x + dx, y + dy);
-              count += n && g.flag(n, F_flat) && g.f(n, F_q) < stand_sq;
+              const double height = height_at(x+dx, y+dy, g.f(p,F_G));
+              if (n && height == g.f(n, F_G)) {
+                count += g.flag(n, F_flat) && g.f(n, F_q) < stand_sq;
+              } else {
+                const auto d = differences(x+dx, y+dy, height);
+                count += d[0]*d[0] + d[1]*d[1] < stand_sq;
+              }
             }
           }
           terrain_relief = count >= int(s.ratio * (s.kernel * s.kernel)) - 1 ? 20. * g.f(p,
@@ -448,121 +478,54 @@ py::dict update_costs(py::dict input, int block_size, const Keys &base, const Ke
   return result;
 }
 
-// A column summary carries measured geometry and the potential sources on
-// this cut. The same sparse inputs feed the Python reference in tests.
+// The native and Python paths share exactly one boundary rule: an unknown
+// cut/XY next to a known non-obstacle ground. Sources already carry terrain
+// qualification. Python applies the shared same-G auxiliary height filter to
+// these proposals before committing members; footprint/visibility checks
+// belong to later pose selection.
 using Source = std::tuple<int, int, double, std::int64_t>;
 using Potential = std::pair<double, std::int64_t>;
-using Return = std::pair<double, int>;
-using Column = std::tuple<std::vector<Potential>, std::vector<Return>, std::vector<double> >;
+using Column = std::tuple<std::vector<Potential>, bool, bool>;
 using Boundary = std::tuple<double, std::vector<Source> >;
 
 std::map<XY, std::vector<Boundary> > find_boundaries(
-  const Keys &columns, const std::map<XY, Column> &summaries,
-  double tolerance, double step, double clearance)
+  const Keys &columns, const std::map<XY, Column> &summaries)
 {
   std::map<XY, std::vector<Boundary> > result;
   py::gil_scoped_release release;
-  for (const auto &[x, y] : columns) {
+  for (const auto &[x,y] : columns) {
+    const auto own=summaries.find({x,y});
+    if (own!=summaries.end() && std::get<1>(own->second)) continue;
     std::vector<Source> sources;
-    for (int dx = -1; dx <= 1; ++dx) {
-      for (int dy = -1; dy <= 1; ++dy) {
-        if (dx == 0 && dy == 0) {
-          continue;
-        }
-        const auto column = summaries.find({ x + dx, y + dy });
-        if (column == summaries.end()) {
-          continue;
-        }
-        for (const auto &[height, id] : std::get<0>(column->second)) {
-          sources.emplace_back(x + dx, y + dy, height, id);
-        }
-      }
-    }
-    if (sources.empty()) {
-      continue;
-    }
-    std::sort(sources.begin(), sources.end(), [](const Source &a, const Source &b) {
-                return std::tie(std::get<2>(a), std::get<0>(a), std::get<1>(a), std::get<3>(a)) <
-                       std::tie(std::get<2>(b), std::get<0>(b), std::get<1>(b), std::get<3>(b));
-              });
-    std::vector<std::vector<Source> > groups;
-    for (const auto &source : sources) {
-      const auto &[sx, sy, height, id] = source;
-      auto compatible = std::find_if(groups.rbegin(), groups.rend(), [&](const auto &group) {
-                                       return height - std::get<2>(group.front()) <= tolerance + 1e-7 &&
-                                              std::none_of(group.begin(), group.end(),
-                                                           [&](const auto &member) {
-                                                             const auto &[mx, my, mh, mid] = member;
-                                                             return mx == sx && my == sy && mid != id;
-                                                           });
-                                     });
-      if (compatible == groups.rend()) {
-        groups.push_back({ source });
-      } else {
-        compatible->push_back(source);
-      }
-    }
-
     std::vector<double> heights;
-    for (const auto &group : groups) {
-      const auto mid = group.size() / 2;
-      const double upper = std::get<2>(group[mid]);
-      heights.push_back(group.size() % 2 == 0 ? (std::get<2>(group[mid - 1]) + upper) / 2 : upper);
-    }
-
-    std::vector<bool> resolved(groups.size(), false);
-    const auto own = summaries.find({ x, y });
-    if (own != summaries.end()) {
-      for (const auto &[height, orientation] : std::get<1>(own->second)) {
-        if (orientation == -1) {
-          continue;
-        }
-        double nearest = std::numeric_limits<double>::infinity();
-        for (double expected : heights) {
-          nearest = std::min(nearest, std::abs(height - expected));
-        }
-        if (nearest > tolerance + 1e-7) {
-          continue;
-        }
-        size_t match = groups.size();
-        for (size_t i = 0; i < heights.size(); ++i) {
-          if (std::abs(height - heights[i]) <= nearest + 1e-7) {
-            if (match != groups.size()) {
-              match = groups.size();
-              break;
-            }
-            match = i;
-          }
-        }
-        if (match != groups.size()) {
-          resolved[match] = true;
+    bool adjacent_obstacle=false;
+    for (int dx=-1; dx<=1; ++dx) {
+      for (int dy=-1; dy<=1; ++dy) {
+        if (!dx && !dy) continue;
+        const auto neighbor=summaries.find({x+dx,y+dy});
+        if (neighbor==summaries.end()) continue;
+        adjacent_obstacle |= std::get<2>(neighbor->second);
+        for (const auto &[height,id] : std::get<0>(neighbor->second)) {
+          sources.emplace_back(x+dx,y+dy,height,id);
+          heights.push_back(height);
         }
       }
     }
-
-    for (size_t i = 0; i < groups.size(); ++i) {
-      const double height = heights[i];
-      if (resolved[i]) {
-        continue;
-      }
-      if (own != summaries.end()) {
-        const auto &barriers = std::get<2>(own->second);
-        if (std::any_of(barriers.begin(), barriers.end(), [&](double z) {
-                          return height + step < z && z <= height + clearance;
-                        })) {
-          continue;
-        }
-      }
-      std::sort(groups[i].begin(), groups[i].end());
-      result[{ x, y }].emplace_back(height, std::move(groups[i]));
-    }
+    if (adjacent_obstacle || sources.empty()) continue;
+    std::sort(heights.begin(),heights.end());
+    const auto mid=heights.size()/2;
+    const double height=heights.size()%2 ? heights[mid] : (heights[mid-1]+heights[mid])/2.;
+    std::sort(sources.begin(),sources.end());
+    result[{x,y}].emplace_back(height,std::move(sources));
   }
   return result;
 }
 
+#include "interval_rays.hpp"
+
 PYBIND11_MODULE(_legbot_layer_kernels, m) {
+  m.def("trace_free_columns", &trace_free_columns);
   m.def("update_geometry", &update_geometry);
   m.def("update_costs", &update_costs);
-  m.def("find_boundaries", &find_boundaries, py::arg("columns"), py::arg("summaries"),
-        py::arg("tolerance"), py::arg("step"), py::arg("clearance"));
+  m.def("find_boundaries", &find_boundaries, py::arg("columns"), py::arg("summaries"));
 }

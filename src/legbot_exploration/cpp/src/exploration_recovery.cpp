@@ -48,10 +48,10 @@ std::optional<PctRecoveryAction> RecoveryController::next_action(
   auto action=task.delegation_started?std::nullopt:
       task.planner.next(snapshot,version,attitude,task.blockers,constraints,can_move,stance_clear,review,stop_tolerance);
   if(!action && task.planner.pending())return std::nullopt;
-  if(!action) {
+  if(!action && (!task.cross_layer || task.unsafe_start)) {
     auto goals=task.cross_layer?std::vector<Point>{}:task.goal.observations;
     for(auto &point:goals)point[2]+=snapshot.body_height;
-    if(task.unsafe_start || task.cross_layer) {
+    if(task.unsafe_start || task.cross_layer || task.goal.observations.empty()) {
       auto support_pose=snapshot.base;
       if(constraints.height_band)support_pose[2]=(*constraints.height_band)[0]+snapshot.body_height;
       auto alternatives=pct.recovery_targets(version,support_pose);
@@ -80,7 +80,6 @@ std::optional<std::uint64_t> ExplorationController::pct_recovery_evidence() {
 std::optional<std::uint64_t> ExplorationController::blocker_recovery_evidence(const BlockerRecovery &task) {
   LayerMapReadPhase lock(*shared_layer_);
   const auto version=shared_layer_->current_version.load();
-  if(!task.cross_layer)return shared_layer_->pct->recovery_evidence(version,*base_);
   Point low=*base_,high=*base_;
   const auto include=[&](const Point &point) {
     for(int i=0;i<2;++i) {low[i]=std::min(low[i],point[i]);high[i]=std::max(high[i],point[i]);}
@@ -95,10 +94,13 @@ std::optional<std::uint64_t> ExplorationController::blocker_recovery_evidence(co
 void ExplorationController::defer_cross_layer(const std::string &reason) {
   policy_.cross_task_.defer(reason);
   if(base_ && layer_map_fresh()) {
-    LayerMapReadPhase lock(*shared_layer_);
-    policy_.cross_deferred_signature_=pct_recovery_evidence();
+    LayerMapReadPhase lock(*shared_layer_,true);
+    policy_.cross_deferred_signature_.reset();
     policy_.cross_deferred_pose_=*base_;
-    policy_.cross_deferred_scan_blocked_=scan_start_inflated(*base_,policy_.cross_task_.ascent_yaw());
+    if(lock.ready()) {
+      policy_.cross_deferred_signature_=pct_recovery_evidence();
+      policy_.cross_deferred_scan_blocked_=scan_start_inflated(*base_,policy_.cross_task_.ascent_yaw());
+    }
   }
   policy_.cross_deferred_feet_stable_=stable_four_foot_support(wall_now());
   policy_.cross_deferred_evidence_time_=shared_layer_->last_integration_wall_seconds.load();
@@ -109,10 +111,12 @@ void ExplorationController::block_stair_reposition(const std::string &reason) {
   const auto *frontier=recovery_.stair_reposition_?&recovery_.stair_reposition_->forward_goal:
       selected_pct_?&*selected_pct_:nullptr;
   if(frontier && frontier->attempt && base_) {
-    LayerMapReadPhase lock(*shared_layer_);
-    const auto version=shared_layer_->current_version.load();
-    shared_layer_->pct->observation_task(version,"floor_execution_failed",frontier->id,*base_);
-    shared_layer_->pct->observation_task(version,"cancel",frontier->id,*base_);
+    LayerMapReadPhase lock(*shared_layer_,true);
+    if(lock.ready()) {
+      const auto version=shared_layer_->current_version.load();
+      shared_layer_->pct->observation_task(version,"floor_execution_failed",frontier->id,*base_);
+      shared_layer_->pct->observation_task(version,"cancel",frontier->id,*base_);
+    }
   }
   recovery_.stair_reposition_.reset();
   active_.reset();
@@ -254,7 +258,7 @@ void ExplorationController::handle_stair_reposition(double current) {
   if(safe && !inflated && task.stage!=StairReposition::Stage::review) {
     policy_.cross_task_.finish_reposition(cross_ground_pose());
     auto candidate=task.forward_goal;
-    for(const auto &view:policy_.pct_frontiers_.stair_targets) {
+    for(const auto &view:policy_.pct_frontiers_.upward_support_targets) {
       if(view.ground[2]<=cross_ground_pose()[2]+policy_.cross_task_.height_slack ||
          !policy_.cross_task_.allows(view.ground) ||
          std::find(candidate.observations.begin(),candidate.observations.end(),view.ground)!=
@@ -355,6 +359,21 @@ bool ExplorationController::begin_blocker_recovery(const PctFrontier &goal,
     recovery_.postpone(std::move(task));
     return true;
   }
+  if(task.cross_layer && base_) {
+    for(const auto &old:recovery_.pending_blocker_recoveries_) {
+      if(!old.retry_wait || old.blockers.empty() || old.blockers.size()!=task.blockers.size())continue;
+      const bool same=std::all_of(task.blockers.begin(),task.blockers.end(),[&](const auto &b) {
+        return std::any_of(old.blockers.begin(),old.blockers.end(),[&](const auto &previous) {
+          return std::hypot(b.point[0]-previous.point[0],b.point[1]-previous.point[1])<.01 &&
+              std::abs(b.point[2]-previous.point[2])<.05;
+        });
+      });
+      const auto &wait=*old.retry_wait;
+      if(same && std::hypot((*base_)[0]-wait.pose[0],(*base_)[1]-wait.pose[1])<.10 &&
+         std::abs(cross_ground_pose()[2]-wait.support_height)<=.02 &&
+         blocker_recovery_evidence(old)==wait.geometry)return false;
+    }
+  }
   recovery_.restore_attempts(base_, cross_layer || goal.observations.empty(), task);
   if(floor_attempt)
     shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
@@ -376,7 +395,6 @@ bool ExplorationController::resume_pending_blocker_recovery() {
       const bool moved=std::hypot((*base_)[0]-wait.pose[0],(*base_)[1]-wait.pose[1])>=.10 ||
           std::abs((*base_)[2]-wait.pose[2])>=.05;
       if(!moved && std::abs(cross_ground_pose()[2]-wait.support_height)<=.02 &&
-         stable_four_foot_support(wall_now())==wait.stable_contacts &&
          blocker_recovery_evidence(*task)==wait.geometry) {
         recovery_.postpone(std::move(*task));continue;
       }
@@ -391,32 +409,6 @@ bool ExplorationController::resume_pending_blocker_recovery() {
     return true;
   }
   return false;
-}
-
-void ExplorationController::try_pct_landing_shift(double current) {
-  if(!policy_.floor_height_ || !stable_four_foot_support(current) ||
-     !base_quiet_since_ || current-*base_quiet_since_<.30 || !base_yaw_ ||
-     current-yaw_wall_>options_.odom_timeout_ || output_.recovery_reverse_subscribers()==0) {
-    report("pct_blocker_recovery_waiting","stable_platform_pose");return;
-  }
-  static const std::unordered_map<Cell,int,CellHash> no_grid;
-  const double ground=cross_ground_pose()[2];
-  const auto action=plan_pct_landing_shift(planning_snapshot(no_grid,external_obstacles_),
-      shared_layer_->current_version.load(),{*policy_.floor_height_,options_.floor_height_tolerance_},
-      ground,policy_.cross_task_.ascent_yaw());
-  if(action) {
-    BlockerRecovery task;
-    task.cross_layer=task.platform_shift=true;
-    task.action=action;
-    task.motion_start=*base_;
-    task.motion_yaw=*base_yaw_;
-    task.motion_height_band=XY{ground,std::min(.16,shared_layer_->max_step_height)};
-    recovery_.blocker_recovery_=std::move(task);
-    if(prepare_route({action->position[0],action->position[1]},no_grid,external_obstacles_,
-                    "pct_landing_recovery_shift",0.,nullptr,std::nullopt,RecoveryRequest::shift,true))return;
-    recovery_.blocker_recovery_.reset();
-  }
-  recover_blocked_ascent();
 }
 
 void ExplorationController::finish_blocker_recovery(const char *reason) {
@@ -459,9 +451,9 @@ void ExplorationController::run_blocker_recovery(double current) {
      current-base_wall_>options_.odom_timeout_ || current-yaw_wall_>options_.odom_timeout_ || !layer_map_fresh()) {
     report("pct_blocker_recovery_waiting","map_pose_or_control");return;
   }
-  if(!base_quiet_since_ || current-*base_quiet_since_<.30) {
-    report("pct_blocker_recovery_waiting","stable_pose");return;
-  }
+  // Active motion is already serialized by run_pct_cycle and the executor's
+  // controlled-stop ownership. Requiring another whole-body gyro settling
+  // interval here deadlocks otherwise stationary multilevel support.
   LayerMapReadPhase lock(*shared_layer_);
   auto &pct=*shared_layer_->pct;
   const auto version=shared_layer_->current_version.load();
@@ -470,6 +462,8 @@ void ExplorationController::run_blocker_recovery(double current) {
   const bool feet_stable=stable_four_foot_support(current);
   if(task.cross_layer)refresh_stair_heading(policy_.cross_task_.ascent_yaw());
   const Point ground=cross_ground_pose();
+  if(task.cross_layer)
+    policy_.stair_scan_budget_.advance(ground,policy_.cross_task_.ascent_yaw(),.50,.16,.05);
   const auto nearby_evidence=[&](Point pose) {
     const Point upper{pose[0]+.60,pose[1]+.60,pose[2]};
     pose[0]-=.60;pose[1]-=.60;
@@ -480,11 +474,11 @@ void ExplorationController::run_blocker_recovery(double current) {
     const bool moved=std::hypot((*base_)[0]-wait.pose[0],(*base_)[1]-wait.pose[1])>=.10 ||
         std::abs((*base_)[2]-wait.pose[2])>=.05;
     const bool support_changed=std::abs(ground[2]-wait.support_height)>.02;
-    const bool contacts_changed=feet_stable!=wait.stable_contacts;
+    const bool contacts_changed=!task.cross_layer && feet_stable!=wait.stable_contacts;
     if(!moved && !support_changed && !contacts_changed && blocker_recovery_evidence(task)==wait.geometry) {
       report("pct_blocker_recovery_waiting","no_other_safe_delegate_goal");return;
     }
-    if(!task.cross_layer && task.goal.observations.empty() &&
+    if(!task.cross_layer && task.unsafe_start && task.goal.observations.empty() &&
        pct.start_ready(version,*base_)) {
       recovery_.blocker_recovery_.reset();
       report("pct_blocker_start_recovered");return;
@@ -534,9 +528,7 @@ void ExplorationController::run_blocker_recovery(double current) {
     report(state,recorded?"recorded_unknown_blocker":"review_next_tread");
   };
   if(task.action && task.stopped_pose) {
-    if(shared_layer_->last_integration_wall_seconds.load()<=task.result_at || base_wall_<=task.result_at ||
-       (task.cross_layer && task.action->kind!=Kind::delegate &&
-        (!feet_stable || foot_sample_wall_<=task.result_at))) {
+    if(shared_layer_->last_integration_wall_seconds.load()<=task.result_at || base_wall_<=task.result_at) {
       if(task.action->kind!=Kind::delegate && current-task.result_at>5.) {
         task.action.reset();task.stopped_pose.reset();
       } else report("pct_blocker_recovery_waiting","fresh_map_or_stable_feet");
@@ -561,7 +553,8 @@ void ExplorationController::run_blocker_recovery(double current) {
         task.replan=true;
       } else if(task.cross_layer) {
         policy_.cross_task_.finish_reposition(cross_ground_pose());
-        start_stair_segment_scan(policy_.cross_task_.ascent_yaw());
+        policy_.cross_task_.observed();
+        policy_.cross_priority_pending_=true;
       } else if(!task.goal.observations.empty()) {
         const auto &views=task.goal.observations;
         const auto selected=std::find_if(views.begin(),views.end(),[&](const auto &view) {
@@ -596,8 +589,13 @@ void ExplorationController::run_blocker_recovery(double current) {
       if(!stop_verified) {finish_blocker_recovery("pct_landing_shift_stop_unverified");return;}
       policy_.cross_task_.finish_reposition(cross_ground_pose());
       recovery_.blocker_recovery_.reset();
-      if(cross_layer_platform_ready())report("cross_layer_completed");
+      if(refresh_exploration_height())report("pct_height_band_changed","prefer_same_height_frontiers");
       return;
+    }
+    if(stop_verified && task.unsafe_start && task.goal.observations.empty() &&
+       pct.start_ready(version,*base_,task.motion_height_band)) {
+      recovery_.blocker_recovery_.reset();
+      report("pct_blocker_start_recovered","verified_short_support_escape");return;
     }
     if(stop_verified) {
       const auto yaw=task.planner.scan_heading(pct,version,*base_,base_attitude_,action.gap,
@@ -650,15 +648,15 @@ void ExplorationController::run_blocker_recovery(double current) {
       recovery_.blocker_recovery_.reset();return;
     }
   }
-  const bool can_move=(!task.cross_layer || feet_stable) &&
-      planner_occupancy_fresh(current) && raw_occupancy_wall_>0. &&
+  const bool can_move=planner_occupancy_fresh(current) && raw_occupancy_wall_>0. &&
       current-raw_occupancy_wall_<=options_.occupancy_timeout_ &&
       output_.recovery_reverse_subscribers()>0;
   const auto stance_clear=[&](const Point &p) {
     return !scan_start_inflated(p,constraints.ascent.value_or(*base_yaw_));
   };
-  const auto review=task.cross_layer && !task.delegation_started?
-      pct.stair_review_points(version,*base_,*constraints.ascent):std::vector<Point>{};
+  // Review only evidence recorded by the failed route/arrival check. Do not
+  // append unrelated stair/rail gaps just because ascent is active.
+  const std::vector<Point> review;
   const auto action = recovery_.next_action(snapshot, version, base_attitude_, constraints,
       can_move, stance_clear, review, options_.recovery_goal_xy_tolerance_);
   if(!action) {
@@ -678,6 +676,11 @@ void ExplorationController::run_blocker_recovery(double current) {
       task.retry_wait=BlockerRecovery::RetryWait{*base_,pct.recovery_evidence(version,*base_),
                                                  nearby_evidence(*base_),ground[2],feet_stable};
       report("pct_blocker_recovery_waiting","no_other_safe_delegate_goal");return;
+    }
+    if(!task.cross_layer && task.goal.observations.empty()) {
+      task.retry_wait=BlockerRecovery::RetryWait{*base_,blocker_recovery_evidence(task),
+          nearby_evidence(*base_),ground[2],feet_stable};
+      report("pct_blocker_recovery_waiting","no_verified_view_for_support_footprint");return;
     }
     finish_blocker_recovery("pct_blocker_no_verified_action");return;
   }
@@ -702,10 +705,12 @@ void ExplorationController::run_blocker_recovery(double current) {
 }
 
 void ExplorationController::recover_blocked_ascent(const PctFrontier &forward) {
+  if(resume_pending_blocker_recovery())return;
+  if(!policy_.pct_frontiers_.unknown_blockers.empty() &&
+     begin_blocker_recovery(forward,policy_.pct_frontiers_.unknown_blockers,true))return;
   if(pct_stair_search_pending_ || policy_.pct_frontiers_.query_pending) {
     report("cross_layer_waiting_for_forward_route","candidate_search_pending");return;
   }
-  if(resume_pending_blocker_recovery())return;
   if(begin_blocker_recovery(forward,policy_.pct_frontiers_.unknown_blockers,true))return;
   defer_cross_layer("no_forward_route");
   report("cross_layer_deferred",policy_.cross_task_.reason());

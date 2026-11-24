@@ -3,6 +3,29 @@
 当前生产控制采用[三维局部选点优先、全局后备](pct_local_window.md)。
 以下增量索引同时提供全局统计与局部查询；局部为空不会被当作全图探索完成。
 
+失败记录按物理边界保留。附近已有地面的代价跨阈值或新增同 G 切片不会重新开放失败簇；
+只有附近新增可用的实测地面覆盖，才增量重开可能因缺测而失败的任务。首次可用地面
+按同列实际高度去重，避免同一块地面反复变为可通行时重置首轮和复查计数。
+有限方向搜索完整结束且所有已检查站位均被已知表面遮挡时，直接按已知阻断结算，
+不再进入第二轮。前沿证据仍保存在地图中，调度结算不删除真实地图记录。
+
+## 统一的切片已知性与前沿入口
+
+构图和前沿采用[同列实测开区间规则](slice_intervals.md)。每层的前沿成员只有一个生成条件：
+本层 XY 经统一同列查询为未知，八邻域至少有一个通过同 G 层辅助高差检查的
+已知非障碍格，并且八邻域没有已知实体障碍。即使同时邻接自由格和已知障碍，也
+排除该候选。未知膨胀造成的停车不安全不等于已知实体障碍，不能据此抹去全部探索边缘。
+辅助信息限制在来源格同一地面对应的切片内，高差上限为 16 cm；
+没有辅助信息时保留未知前沿，具体规则见 slice_intervals.md。
+同列其他切片的已知 G/C 严格包住当前切片高度时，该 XY 已知，无需创建实体邻格。
+同一 XY 已有同高实测地面的工作格时，不因切换切片重新生成该地面的前沿，包含
+`C=+inf` 的开放地面。只结算这份地面，不把无穷上界扩展成其他独立楼层的已知自由空间。
+来源按地形代价 `[0,20]` 判断；停车足迹、未知膨胀、盲区和路径检查在观测位姿选择时执行。
+Python 与 C++ 边界内核使用同一份“已知标志＋实体障碍标志＋合格来源”输入，并共用辅助高差过滤，
+不再用回波接近高度、
+台阶边界推断或补扫预期分别消除前沿。簇失败与复查只改变任务调度状态。
+
+
 ## 配置
 
 ```yaml
@@ -20,7 +43,8 @@ observation_goal_xy_tolerance: 0.15
 按楼层调度时，未完成的选点、已结算后继续下一个簇、局部转全局查询，共用控制器原选点入口续算。
 每批返回并释放地图锁后，默认等待 `pct_query_resume_delay_seconds=0.10` 秒再接续；允许范围 0.05～1.0 秒。
 执行、补扫、脱困、暂停或地图不可用时，不由快速定时器重复调度。非楼层旧模式保留原定时流程。
-普通累计 2 秒、复查累计 4 秒、每簇最多两次尝试均不改变。
+当前普通簇启用四方向搜索，累计搜索兜底为 1.5 秒；第二轮默认关闭。
+兼容的非四方向接口保留 2 秒／4 秒上限，不能混作当前首轮配置。
 
 平层任务按 `(1 + 距离)/sqrt(min(待观测物理格数,64))` 估算每次访问的成本，优先附近且覆盖更多的任务。
 候选位姿也按距离/地形成本与实际可见格数排序；所有大小的簇仍参与，不添加转向成本。
@@ -50,15 +74,17 @@ observation_goal_xy_tolerance: 0.15
 不允许通过一串相近高度无限串接，也不允许同一来源列的不同表面编号进入同一个组。
 固定切片没有选为 G、但真实成熟且有足够上方空间的表面，也保留待观测边界；这不会创建新的规划格或安全代价。
 
-消除前沿使用 `surface_noise_tolerance`。朝向尚未确定的有效回波也可消除前沿，
-楼板底面回波不会消除上方踏面任务。切片内每条回波只匹配容差内最近的一组，
-等距时保留任务。不同切片中同一物理前沿共用一次探索任务。
+普通前沿已知/未知只使用同列有效实测区间（详见 slice_intervals.md）。
+所有回波均参与 G/C；开放上界共享限制为 G 上方 5 米。区间已覆盖的格禁止生成普通前沿，
+邻接踏面 G 不同不能覆盖这个已知判定。具体补扫的目标 G 和帧号验收独立保留。
+不同切片中同一物理前沿共用一次探索任务。
 
-已完整观测的台阶边界不把相邻踏面无限延伸成未知高度任务。当前格与预期高度差超过
-表面容差且不超过台阶能力时，检查本格及八邻域：九格均须有对应高、低踏面实测回波，
-形成可由一条边界分开的两侧，每侧至少三格。重叠表面、独立底面或任何缺测均保留前沿。
-满足这些证据时，只移除延伸到另一踏面的前沿，不改写 G/C、代价或安全检查。
-Python 参考更新与原生批量更新的结果均通过同一个边界检查函数。
+同列障碍回波相邻高度差小于最小净空长度时，累计合并为不可通行闭区间；沿用已有
+地面噪声归组。查询高度落入区间则为已知障碍、代价至少 50，即使本帧未命中或没有
+实体切片格也不生成未知前沿。区间独立保存，不覆盖 G/C，不把回波间隙填成光学实体。
+
+台阶交界只使用统一已知区间、实测占据和同 G 辅助高差检查，不另用整梯段或九格
+边线识别作为生成前沿的必经条件。未知证据保留，辅助高度不写入地图 G。
 
 ## 各切片独立更新
 
@@ -89,7 +115,7 @@ G/C 未变化的列也继续参与前沿证据检查，确保后续回波能够�
 
 `pct_slice_update_workers` 默认 `0`，按每批约 8192 个切片格的工作量切换到最多 4 个线程。
 设为 `1` 可串行回放。G/C 写入、地形代价和逐格前沿计算使用释放 GIL 的 C++ 批处理。
-点云融合、簇连接、跨切片任务合并和统一提交仍包含 Python 工作。
+点云融合、簇连接、跨切片备选关系维护和统一提交仍包含 Python 工作。
 
 观察位置从附近约 2 米范围内的原地图分块查询，要求在线安全代价在 [0,20]。
 地图提交时不搜索观察位置；控制器查询时按需建立“簇的空间块分组 × 切片”的候选几何缓存，
@@ -133,11 +159,11 @@ PlanningGoal.xy_tolerance 经 PathProcessor 只附加在最终路点，SCAN 两�
 不会仅因八秒冷却结束再次下发同一个位置；同表面相近视角默认排除半径为1.0米。
 全局其他区域更新不应清除该记录。未启用按楼层调度时，执行失败的目标仍按失败冷却处理。
 
-普通楼层探索启用 `pct_floor_exploration` 时，失败不使用定时冷却，而按当前楼层的
-物理前沿成员记录两次尝试：所有大小的簇均可参与；首次找不到站位、确认不连通、
-选点或路线预算耗尽、执行失败、有效补扫消减不足时，降为待复查。
-本层局部和全局的首次任务处理完后，才在全局复查一次；二次失败放弃该簇的当前层成员。
-选点仍使用累计局部 2 秒、全局复查 4 秒的计算预算。一旦得到本轮最多三个合格观察站位，
+普通楼层探索启用 `pct_floor_exploration` 时，失败按物理前沿成员记账。
+所有大小的簇均可参加首轮；完整全局搜索找不到观测站位的任务退役，
+缺测、超时、执行失败及实际观测进展不足保留对应失败原因。
+本层局部和全局首次任务结束后，仅在显式启用第二轮时全局复查；当前实验关闭二轮。
+当前四方向首轮累计搜索上限 1.5 秒；找到一个合格观察站位就交给路线检查。
 这些路线均失败或本轮规划预算耗尽，就结算本次失败，不持续生成下一批站位占用同一轮尝试。
 遇到可补扫的未知阻断时，先交给已有定向脱困；该轮仍失败后再统一结算。
 簇重编号、分裂、切片别名或普通地图版本更新不清空成员的失败记录，其他楼层不受影响。
@@ -181,6 +207,16 @@ The prediction assumes the planned body is level, transforms frontier XYZ into t
 sensor frame, and checks azimuth, elevation, range and known surface occlusion.
 It is a visibility estimate, independent of the ordinary point/path safety check.
 Gain is the visible local frontier count, rather than the entire component size.
+
+Observation admission traces only the stance-to-target XY projection for occlusion.
+Every touched cell, including diagonal corner contacts, is checked for a measured
+obstacle in the stance's ground space. Shared same-column intervals and occupied
+bands participate, including walls with no standable G. Independent floors and
+confirmed short risers ending at measured upper treads are not same-floor walls.
+A 3-D optical ray passing above an obstacle cannot admit that view. Range, FOV,
+blind-area and parking checks remain; movement keeps its own collision checks.
+Changes to obstacle queries invalidate cached views. Targets are actual visible
+members; one hidden member does not exclude another clear part of the cluster.
 
 Position arrival starts a normal exploration observation task. At the actual
 stopping pose the controller recomputes the view and requests checked yaw actions.
@@ -233,3 +269,46 @@ visited by their rays, including empty columns. New or changed mature evidence
 invalidates the mask. Status exposes query_pending, checked-cluster count,
 observer geometry time and visibility time. Budgets yield between complete
 candidate checks, so an individual check can exceed the configured slice.
+
+## 墙体跨切片过滤与低收益暂缓
+
+前沿资格和观测站位到目标的格线检查共用按实际支撑高度查询的墙体占据判定。
+实测占据区间与支撑高度以上、单步能力到最小净空之间的空间相交时，不能因
+当前高切片缺少 G/C 就重新生成该墙的未知前沿或隔墙观察。该区间来自真实回波，
+不把房间的自由 G/C 区间当作实心障碍。低楼层天花板位于新平台地面以下时，
+不会阻止新平台前沿。墙体区间变化也进入前沿增量签名，及时结算高切片旧成员。
+
+当前实验配置保持 `pct_fast_exploration: true`，关闭 `pct_floor_global_review_enabled`。
+所有大小的簇都参加首轮，至少一格可见就可以选点和观察。不能因成员少于 3 或预计
+收益小于 3 直接跳到复查。真正观察后才按实际解决格数结算：解决全部单格成员算成功；
+有新帧但实际进展不足记为 `floor_low_progress`，直接进入复查队列，关闭二轮时不重复观察。
+局部缺测/选点失败的大簇仍有全局首轮机会；全局有界搜索完成但找不到无障碍视角的任务
+退出本轮调度。超时、缺测与断连独立记账，不能伪装成已确认墙体遮挡。地图证据继续保留。
+只有相关新增实测安全地面可触发缺测失败重试，静态命中和切片别名不重开首轮。
+旧的 `pct_low_yield_deferred_clusters/cells` 字段为兼容诊断保留，不再表示首轮尺寸过滤。
+
+## 局部失败与全局首轮分开
+
+普通平层簇的局部失败只进入 `floor_local_failures`，不消耗大簇的全局首轮。
+全局查询从完整同层簇及其全局候选站位重新搜索，仍报告 `attempt=1`、
+`reviewing=false`。首轮最多四方向与单簇搜索时限继续生效，不开启第二轮复查。
+全局首轮也失败后，才进入原有暂缓/复查记录；关闭第二轮时不再重复调度。
+
+小簇按完整同层簇的唯一 XY 数量判断。局部窗口只看到大簇的一小段时，可以
+暂缓这一段局部选点，不能因此把整个大簇的全局首轮跳过。真正少于三个成员
+的小簇也参加首轮，实际观察进展不足才进入复查。局部尝试只结算本窗口实际参与的成员，并在
+异步行走和观测期间保留自身的局部/全局来源，避免后来的查询改变结算范围。
+
+局部受限站位全部被遮挡，只证明局部选点失败；大簇仍须接受全局首轮检查。
+全局已确认障碍的退役规则、公共停车/盲区/视线/路线安全检查继续保留。
+全局搜索复用局部已被路线检查拒绝的站位记录；仅因局部视野不足而试过的
+站位，仍可针对完整簇重新计算可见收益，不能全部当成坏站位排除。
+相关新增实测安全地面可以增量重开两类失败，静态重复命中不重开。
+
+控制状态中的 `pct_global_first_after_local_failure_clusters/cells` 表示当前全局
+首轮候选中带有局部失败历史的簇/物理成员数，便于核对收尾前是否提供了
+扩大范围的搜索机会。这些数是单次查询的候选量，不是累计成功次数。
+
+观测站位由物理地面而非簇所在切片限定：主切片的簇可以从其他切片中同高的实测支撑上观测。候选按 XYZ 去重，缓存保留实际来源切片的代价和依赖。它不会把室外 C=∞ 外推成高切片已知；公共停车、盲区、视线和路线检查继续执行。
+
+起点因新观测或位置偏差进入膨胀区时，即使已无待扫目标，也允许先查询 0.25～0.60 m 的短移恢复。必须已有实测支撑，实际高差不超过16 cm；不新增足迹冲突，距离原障碍不得减小，提前刹车位置及终点均须安全。执行停止回执与实测位置确认后，恢复普通探索或返航。失败的 SCAN 委托释放动作状态，不能永久屏蔽短移恢复。

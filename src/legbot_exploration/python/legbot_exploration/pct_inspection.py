@@ -5,7 +5,8 @@ import time
 SURFACE_DTYPE = np.dtype([(name, '<f4') for name in
     ('x', 'y', 'z', 'rgb', 'cost', 'ceiling_z', 'clearance')]+[
     ('source', '<u4'), ('flags', '<u4'), ('slice_index', '<u4')]+[
-    (name, '<f4') for name in ('passage_cost', 'relief_cost', 'terrain_cost', 'inflated_terrain_cost')])
+    (name, '<f4') for name in ('passage_cost', 'relief_cost', 'terrain_cost', 'inflated_terrain_cost',
+                             'node_z', 'C_clear')])
 POINT_DTYPE = np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4'), ('rgb', '<u4')])
 
 
@@ -27,13 +28,20 @@ def inspect(backend, base, options):
             row=block[i,j];chunk=np.empty(len(i),dtype=SURFACE_DTYPE)
             cost=np.where(~row['unknown']&~row['solid']&~row['hard']&
                           (row['inflated_terrain_cost']>=0),row['inflated_terrain_cost'],50.)
+            if k-1 in m.layers or k+1 in m.layers:
+                cut=s.origin_z+k*s.slice_dh
+                seam=np.minimum(abs(row['G']-cut),abs(row['G']-cut+s.slice_dh))
+                for at in np.flatnonzero((row['unknown_hard'] | row['solid_hard']) &
+                                         (row['terrain_cost']>=0) & (row['terrain_cost']<=20) &
+                                         (seam<=2*s.step_max+1e-7)):
+                    cost[at]=m.planning_cost((k,bx*s.block_size+int(i[at]),by*s.block_size+int(j[at])))
             rgb=np.where(row['solid'],0xff3030,np.where(row['unknown'],0x4070d0,
                 np.where(cost>20,0x808080,0x20c860))).astype('<u4')
             chunk['x']=s.origin_x+(bx*s.block_size+i)*s.resolution
             chunk['y']=s.origin_y+(by*s.block_size+j)*s.resolution
             chunk['z'],chunk['rgb'],chunk['cost']=row['G'],rgb.view('<f4'),cost
             chunk['ceiling_z']=row['C']
-            chunk['clearance']=row['C']-row['G']
+            chunk['clearance']=np.where(np.isfinite(row['C']),row['C'],row['C_clear'])-row['G']
             chunk['source']=1
             chunk['flags']=sum(row[name].astype('<u4')<<bit for bit,name in enumerate(
                 ('solid','unknown','solid_hard','unknown_hard')))
@@ -41,7 +49,7 @@ def inspect(backend, base, options):
             chunk['flags']|=row['g_mature'].astype('<u4')<<5
             chunk['flags']|=row['c_mature'].astype('<u4')<<6
             chunk['slice_index']=k-m.first_layer
-            for name in ('passage_cost','relief_cost','terrain_cost','inflated_terrain_cost'):
+            for name in ('passage_cost','relief_cost','terrain_cost','inflated_terrain_cost','node_z','C_clear'):
                 chunk[name]=row[name]
             chunks.append(chunk)
         records=np.concatenate(chunks) if chunks else np.empty(0,dtype=SURFACE_DTYPE)

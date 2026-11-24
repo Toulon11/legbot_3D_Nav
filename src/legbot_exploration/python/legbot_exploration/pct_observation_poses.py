@@ -29,6 +29,7 @@ class ObservationPoseSearch:
         if current and (motions is not False or stances is not None or minimum_gain<1):
             raise ValueError('current observation only admits the actual stationary pose')
         m,s=self.map,self.map.settings
+        range_margin=(0. if current else tolerance)+s.resolution/math.sqrt(2.)
         base=np.asarray(base,dtype=float)
         targets=np.asarray(targets,dtype=float).reshape(-1,3)
         result=dict(poses=[],views={},unknown_blockers=[],rays={},timing_ms={})
@@ -99,14 +100,15 @@ class ObservationPoseSearch:
                     mount=Rotation.from_euler('y',s.ground_lidar_pitch)
                     sensor=stand+body.apply([s.ground_lidar_x,0.,s.ground_lidar_z])
                     sensor_pose=(*map(float,sensor),*((body*mount).as_matrix().ravel()))
-                visible=timed('fov_ms',self.model.visible,ground,heading,targets,False,sensor_pose=sensor_pose)
+                visible=timed('fov_ms',self.model.visible,ground,heading,targets,False,
+                              sensor_pose=sensor_pose,range_margin=range_margin)
                 if diagnostics:
                     result['view_counts']['max_in_field']=max(result['view_counts']['max_in_field'],int(visible.sum()))
                 if visible.sum()<minimum_gain or (best is not None and visible.sum()<=best['gain']):
                     continue
                 in_view=True
                 mask=timed('occlusion_ms',self.model.visible,ground,heading,targets,
-                           ray_dependencies=result['rays'],sensor_pose=sensor_pose)
+                           ray_dependencies=result['rays'],sensor_pose=sensor_pose,range_margin=range_margin)
                 if diagnostics:
                     result['view_counts']['max_visible']=max(result['view_counts']['max_visible'],int(mask.sum()))
                 gain=int(mask.sum())
@@ -117,7 +119,11 @@ class ObservationPoseSearch:
                     rejected_area=check
                     result['unknown_blockers'].extend(check.get('unknown_blockers',()))
                     continue
-                best=dict(yaw=float(heading),gain=gain,mask=mask)
+                covered=targets[mask]
+                target=(covered[np.argmin(np.linalg.norm(covered-targets.mean(axis=0),axis=1))]
+                        if len(covered) else ground)
+                best=dict(yaw=float(heading),gain=gain,mask=mask,target=target.tolist(),
+                          visible_targets=covered)
             if best is None:
                 if rejected_area is not None:reject(rejected_area['reason'],stand,rejected_area)
                 else:reject('lidar_occluded' if in_view else 'no_admissible_lidar_view',stand)
@@ -167,17 +173,19 @@ class ObservationPoseSearch:
                     stances.append((stand,action,True))
             return stances
         choices={}
+        valid_blocks={}
         for target in targets:
             lo,hi=m.indices(target[:2]-2.)//s.block_size,m.indices(target[:2]+2.)//s.block_size
             for layer in range(m.first_layer,m.last_layer+1):
                 for bx in range(lo[0],hi[0]+1):
                     for by in range(lo[1],hi[1]+1):
-                        block=m.blocks.get((layer,bx,by))
+                        key=(layer,bx,by)
+                        block=m.blocks.get(key)
                         if block is None:continue
-                        valid=block['measured'] & ~block['unknown'] & ~block['solid'] & ~block['hard'] & \
-                              (block['inflated_terrain_cost']>=0) & (block['inflated_terrain_cost']<=20)
-                        if floor is not None:valid &= abs(block['G']-floor[0])<=floor[1]
-                        for i,j in zip(*np.nonzero(valid)):
+                        if key not in valid_blocks:
+                            valid_blocks[key]=np.nonzero(m.traversable_block(key,block,floor))
+                        valid=valid_blocks[key]
+                        for i,j in zip(*valid):
                             cell=(bx*s.block_size+int(i),by*s.block_size+int(j))
                             if not m.surface_observation.is_ground_source(cell,int(block['g_surface_id'][i,j])):continue
                             ground=(s.origin_x+(bx*s.block_size+i)*s.resolution,
@@ -186,8 +194,23 @@ class ObservationPoseSearch:
                             score=math.dist(ground[:2],base[:2])+.2*math.dist(ground[:2],target[:2])
                             if preferred is not None:score+=2.*math.dist(ground,preferred)
                             choices[ground]=min(score,choices.get(ground,math.inf))
-        return [(np.asarray((x,y,z+self.reference_height)),0,True)
-                for x,y,z in sorted(choices,key=lambda p:(choices[p],p))[:128]]
+        # A nearest-first cap can spend every slot inside the target's blind
+        # region. Retain measured stations at several distances and bearings
+        # before the common FOV, stopping, occlusion and route checks run.
+        center=np.median(targets[:,:2],axis=0)
+        buckets={}
+        for point in sorted(choices,key=lambda p:(choices[p],p)):
+            dx,dy=np.asarray(point[:2])-center
+            sector=int(math.floor((math.atan2(dy,dx)+math.pi)/(math.pi/2)))%4
+            ring=int(math.hypot(dx,dy)/.4)
+            buckets.setdefault((sector,ring),[]).append(point)
+        ordered=[]
+        for at in range(128):
+            batch=[points[at] for points in buckets.values() if len(points)>at]
+            if not batch:break
+            ordered.extend(sorted(batch,key=lambda p:(choices[p],p)))
+            if len(ordered)>=128:break
+        return [(np.asarray((x,y,z+self.reference_height)),0,True) for x,y,z in ordered[:128]]
 
     def _arrival_geometry(self, xyz, xy_tolerance):
         m,s=self.map,self.map.settings
@@ -196,13 +219,13 @@ class ObservationPoseSearch:
         reach=observation_radius+s.resolution
         xy=np.asarray(xyz[:2])
         lo,hi=m.indices(xy-reach)//s.block_size,m.indices(xy+reach)//s.block_size
-        revision=(m.first_layer,m.last_layer,tuple(
+        center=math.floor((xyz[2]-self.reference_height-s.origin_z)/s.slice_dh)+1
+        bands=math.ceil(2*s.step_max/s.slice_dh)+1
+        revision=(center,tuple(
             m.planning_block_versions.get((k,bx,by),0)
-            for k in range(m.first_layer,m.last_layer+1)
+            for k in range(center-bands,center+bands+1)
             for bx in range(lo[0],hi[0]+1) for by in range(lo[1],hi[1]+1)
-        ) if m.first_layer is not None else (),tuple(
-            m.surface_observation.block_versions.get((bx,by),0)
-            for bx in range(lo[0],hi[0]+1) for by in range(lo[1],hi[1]+1)))
+        ) if m.first_layer is not None else ())
         return stop_radius,observation_radius,revision
 
     def _arrival_area(self, xyz, xy_tolerance, heading=0., sensor_origin=None):
@@ -223,7 +246,7 @@ class ObservationPoseSearch:
         heading_key = (heading, sensor_origin)
         if heading_key in headings:
             result, rays = headings[heading_key]
-            if all(self.model.column_blockers(cell) == bands for cell, bands in rays.items()):
+            if all(self.model.ray_evidence(cell) == bands for cell, bands in rays.items()):
                 return result
         if coverage is None:
             area = {(x, y) for x, y, _ in mapping.footprint_cells(xyz, observation_radius)}
@@ -237,7 +260,7 @@ class ObservationPoseSearch:
         best = None
         rays = dict(bands)
         for layer, unseen in coverage[0]:
-            reference = float(mapping.cell((layer, *mapping.indices(xyz)))['G'])
+            reference = float(mapping.observed_cell((layer, *mapping.indices(xyz)))['G'])
             # With no surface crossing the open ray's height interval, yaw
             # cannot hide missing ground. Reuse that rejection for every yaw.
             can_occlude = (math.dist(sensor[:2], xyz[:2]) > observation_radius or
@@ -295,6 +318,12 @@ class ObservationPoseSearch:
                                   if abs(height - reference) <= mapping.settings.step_max + 1e-5]
                     if compatible:
                         pending.append((*cell, min(compatible, key=lambda height: abs(height - reference))))
+            # This outer disk checks sensor-blind evidence, not whether a
+            # robot can walk from the stance to every cell in that disk.
+            # A gap or a >step-height boundary cannot turn a separately
+            # observed G/C interval back into an unobserved cell. The actual
+            # parking footprint and route retain their full safety checks.
+            visited.update(cell for cell in area if mapping.frontier_observed(layer,cell))
             coverage.append((layer, area - visited))
         return coverage, area
 
@@ -309,10 +338,10 @@ class ObservationPoseSearch:
         best=None
         for layer in check['safe_layers']:
             blockers=[]
-            height=float(m.cell((layer,*m.indices(xyz)))['G'])
+            height=float(m.observed_cell((layer,*m.indices(xyz)))['G'])
             missing,known,unsafe={},[],0
             for x,y in stopping:
-                row=m.cell((layer,x,y))
+                row=m.footprint_support(layer,x,y,height)
                 if (row is None or row['unknown'] or not row['measured'] or
                         not m.surface_observation.is_ground_source((x,y),int(row['g_surface_id'])) or
                         not m.surface_observation.ground_observed((x,y),float(row['G']),layer)):

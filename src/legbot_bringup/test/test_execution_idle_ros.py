@@ -21,9 +21,15 @@ def main():
     from sensor_msgs.msg import JointState, PointCloud2
     from std_msgs.msg import Bool, Int32, String
     from rclpy.qos import QoSProfile, DurabilityPolicy
+    from controller_manager_msgs.srv import ListControllers
+    from controller_manager_msgs.msg import ControllerState
 
     rclpy.init()
     node = rclpy.create_node('execution_idle_test')
+    def controllers(_request, response):
+        response.controller = [ControllerState(name='rl_quadruped_controller', state='active')]
+        return response
+    node.create_service(ListControllers, '/controller_manager/list_controllers', controllers)
     modes, ready, enables, states = [], [], [], []
     latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
     subscriptions = [

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from collections import OrderedDict
 from functools import partial
 import time
+import math
 import weakref
 import numpy as np
 from lib import a_star
@@ -17,6 +18,9 @@ class BlockPlanner:
         self.planner = a_star.Astar()
         if not hasattr(self.planner, 'init_surface_accessor'):
             raise RuntimeError('PCT surface accessor extension missing; rebuild pct_planner')
+        self._intervals=hasattr(mapping,'_interval_nodes')
+        if self._intervals and not hasattr(self.planner,'init_interval_accessor'):
+            raise RuntimeError('PCT interval accessor extension missing; rebuild pct_planner')
         self.search_nodes = 0
         self.search_diagnostics = {}
         self._failures=OrderedDict()
@@ -24,18 +28,60 @@ class BlockPlanner:
         # A pybind std::function must not own a bound method that owns this
         # same native planner, which would form an uncollectable cycle.
         self._reader = lambda layer, row, col, floor=None, ref=weakref.ref(self): (
-            ref()._read(layer,row,col,floor))
+            ref()._read_interval(layer,row,col,floor) if ref()._intervals else ref()._read(layer,row,col,floor))
+
+    def _read_interval(self, layer, row, column, floor=None):
+        m=self.map
+        key=(layer+m.first_layer,row+int(m.lower[0]),column+int(m.lower[1]))
+        b=m.settings.block_size
+        self._read_blocks.add((key[0],key[1]//b,key[2]//b))
+        observed=m.observed_cell(key)
+        owner=layer
+        if observed is not None and np.isfinite(observed['G']):
+            physical=m._interval_nodes.get(key[1:],{})
+            source=next((k for k,node in physical.items()
+                         if node.ground_id==int(observed['g_surface_id'])),key[0])
+            owner=source-m.first_layer
+        result=self._read(owner,row,column,floor)
+        if result[0]>=50:return (*result,math.nan,math.nan,owner)
+        return (*result,float(observed['C']),float(observed['node_z']),owner)
 
     def _read(self, layer, row, column, floor=None):
         m = self.map
         key = (layer+m.first_layer, row+int(m.lower[0]), column+int(m.lower[1]))
         b=m.settings.block_size
         self._read_blocks.add((key[0],key[1]//b,key[2]//b))
-        cell = m.cell(key)
+        if self._intervals:
+            s=m.settings
+            radius=max(s.inflation_kernel_size//2,
+                       math.ceil((s.robot_radius+s.safety_margin)/s.resolution)+1)
+            bands=math.ceil(2*s.step_max/s.slice_dh)+1
+            self._read_blocks.update((k,bx,by)
+                for k in range(key[0]-bands,key[0]+bands+1)
+                for bx in range((key[1]-radius)//b,(key[1]+radius)//b+1)
+                for by in range((key[2]-radius)//b,(key[2]+radius)//b+1))
+        cell = m.observed_cell(key)
+        if cell is not None and cell['solid'] and m.obstacle_at(key) is not None:
+            # Known blocked interval, not a support state. Native search may
+            # still reach a separately measured adjacent-cut tread within
+            # the step limit; this cost never reports missing evidence.
+            return (50.,-100.,0.,0)
         if (cell is None or not np.isfinite(cell['G']) or
                 (floor is not None and abs(cell['G']-floor[0])>floor[1]+1e-7)):
             return (1e6, -100., 0., 0)
         cost = m.planning_cost(key)
+        if (cell['passage_cost']>=50 and m.tread_above_riser(*key,cell,float(cell['G'])) is not None):
+            # This cut ends at the riser. Let native A* check the higher
+            # measured tread as a separate neighboring state.
+            k,x,y=key
+            self._read_blocks.add((k+1,x//b,y//b))
+            return (1e6, -100., 0., 0)
+        if (cell['unknown_hard'] or cell['solid_hard']) and m.seam_candidate(key[0],float(cell['G'])):
+            reach = math.ceil((m.settings.robot_radius+m.settings.safety_margin)/m.settings.resolution+.5)
+            k,x,y = key
+            self._read_blocks.update((cut,bx,by) for cut in (k-1,k,k+1)
+                                     for bx in range((x-reach)//b,(x+reach)//b+1)
+                                     for by in range((y-reach)//b,(y+reach)//b+1))
         ground, surface_id = float(cell['G']), int(cell['g_surface_id'])
         gateway = 0.
         if cost > 8 and not cell['solid'] and not cell['unknown'] and cell['inflated_terrain_cost'] >= 0:
@@ -130,14 +176,17 @@ class BlockPlanner:
         blockers = {}
         radius = m.settings.robot_radius+m.settings.safety_margin
         self.planner.set_blocked_edge_radius(int(np.ceil(3*radius/m.settings.resolution)) if collect_blockers else 0)
+        self.planner.set_surface_step_limit(m.settings.step_max)
         for first, last in pairs:
             began = time.monotonic()
             remaining=deadline-began
             if remaining <= 0:
                 self.search_diagnostics['timed_out']=True
                 return None
-            self.planner.init_surface_accessor(20., m.last_layer-m.first_layer+1,
+            initialize=self.planner.init_interval_accessor if self._intervals else self.planner.init_surface_accessor
+            initialize(20., m.last_layer-m.first_layer+1,
                 int(shape[0]), int(shape[1]), m.settings.resolution, 1., reader)
+            if self._intervals:self.planner.set_passage_clearance(m.settings.minimum_clearance)
             remaining=deadline-time.monotonic()
             if remaining <= 0:
                 self.search_diagnostics['timed_out']=True
@@ -162,7 +211,7 @@ class BlockPlanner:
             if collect_blockers:
                 for k, x, y, parent_k, parent_x, parent_y in self.planner.get_blocked_edges().values():
                     key = (k+m.first_layer, x+int(m.lower[0]), y+int(m.lower[1]))
-                    parent = m.cell((parent_k+m.first_layer, parent_x+int(m.lower[0]), parent_y+int(m.lower[1])))
+                    parent = m.observed_cell((parent_k+m.first_layer, parent_x+int(m.lower[0]), parent_y+int(m.lower[1])))
                     if parent is not None and np.isfinite(parent['G']):
                         blockers.setdefault(key, float(parent['G']))
         else:
@@ -183,12 +232,12 @@ class BlockPlanner:
             return None
         if same:
             key = (last, *map(int, m.indices(target)))
-            return np.asarray([m.position(key)+[m.cell(key)['G']+.5]])
+            return np.asarray([m.position(key)+[m.observed_cell(key)['G']+.5]])
         cells = np.rint(self.planner.get_result_matrix()).astype(np.int64)
         points = []
         for k, x, y in cells:
             key = (int(k+m.first_layer), int(x+m.lower[0]), int(y+m.lower[1]))
-            points.append(m.position(key)+[float(m.cell(key)['G'])+.5])
+            points.append(m.position(key)+[float(m.observed_cell(key)['G'])+.5])
         if not points:
             return None
         points = np.asarray(points)

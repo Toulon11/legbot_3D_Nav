@@ -44,7 +44,8 @@ void ExplorationController::start() {
 
 void ExplorationController::set_paused(bool paused) {
   paused_ = paused;
-  if (paused_) cancel_recovery_action();
+  if(paused_ && observation_task_)end_observation(false,"paused");
+  else if(paused_)cancel_recovery_action();
   report(paused_ ? "paused" : "waiting_for_data");
 }
 
@@ -94,14 +95,35 @@ void ExplorationController::on_foot_forces(const control_msgs::msg::DynamicJoint
 }
 
 void ExplorationController::tick_observation() {
-  if(active_ || path_processor_.active() || paused_ || options_.observation_only_ || !ready_)return;
+  if(pending_scan_failure_ && active_ && active_->stamp && pending_scan_failure_->first==*active_->stamp) {
+    const auto pending=*pending_scan_failure_;pending_scan_failure_.reset();
+    handle_scan_failure(pending.first,pending.second);
+  }
+  if(observation_task_ && observation_task_->pending_end) {
+    const auto [success,reason,settled]=*observation_task_->pending_end;
+    end_observation(success,reason,settled);return;
+  }
+  if(paused_ || options_.observation_only_ || !ready_)return;
   const double current=wall_now();
   if(!observation_task_)return;
   const auto &task=*observation_task_;
-  const bool bounded_scan=task.floor_stair_probe || task.mandatory_stair_scan;
-  const bool frame_gated=task.stair_segment_scan || task.targeted_blocker_scan || bounded_scan;
+  if((task.initialized || task.floor_attempt) && task.frontier.id &&
+     shared_layer_->pct->committed_floor_task_resolved(task.frontier.id)) {
+    end_observation(true,"frontier_resolved_in_observation");return;
+  }
+  if(task.arm_pending) {handle_observation(current);return;}
+  if(active_ || path_processor_.active()) {
+    // Watch pose health and task deadlines without querying the map or
+    // re-running selection while a turn is executing.
+    if(!base_ || !base_yaw_ || current-base_wall_>options_.odom_timeout_ ||
+       current-yaw_wall_>options_.odom_timeout_ || task.pose_wait_since ||
+       current-task.began>options_.observation_timeout_+options_.observation_pose_wait_timeout_)
+      handle_observation(current);
+    return;
+  }
+  const bool frame_gated=task.targeted_blocker_scan;
   if(task.directional() && !frame_gated)return;
-  if(!task.waiting_since || (bounded_scan && current-task.waiting_since>=options_.observation_wait_) ||
+  if(!task.waiting_since ||
      (frame_gated?
      shared_layer_->last_integration_wall_seconds.load()>task.waiting_since:
      current-task.waiting_since>=options_.observation_flat_wait_))
@@ -111,10 +133,9 @@ void ExplorationController::tick_observation() {
 void ExplorationController::report(const std::string &state, const std::string &detail) {
   // Only unfinished selection is resumed quickly. Executing, observing and
   // unavailable-data states keep their existing event/normal-timer handling.
-  const bool resume=options_.floor_exploration_ && (state=="pct_local_search_pending" || state=="pct_floor_frontier_settled" ||
+  const bool resume=state=="waiting_for_map_update" || (options_.floor_exploration_ && (state=="pct_local_search_pending" || state=="pct_floor_frontier_settled" ||
       state=="pct_floor_local_empty" || state=="pct_floor_complete" || state=="pct_floor_handoff_with_deferred_frontiers" ||
-      (state=="pct_local_stair_probe_waiting" && detail=="stair_index_pending") ||
-      (state=="cross_layer_waiting_for_forward_route" && policy_.pct_frontiers_.query_pending));
+      (state=="cross_layer_waiting_for_forward_route" && policy_.pct_frontiers_.query_pending)));
   if(resume)selection_resume_at_=wall_now()+options_.pct_query_resume_delay_;
   else selection_resume_at_.reset();
   // This is task lifetime, not a gait command. Mapping/planning/recovery
@@ -161,6 +182,10 @@ void ExplorationController::report(const std::string &state, const std::string &
   stream << ",\"unresolved_unknown_cells\":" << unresolved_unknown_cells_;
   stream << ",\"route_source\":\"" << path_processor_.source() << "\"";
   stream << ",\"control_mode\":\"" << mode_name(control_mode_) << "\"";
+  stream << ",\"mission\":{\"return_enabled\":" << (options_.mission_return_home_?"true":"false")
+         << ",\"exploration_finished\":" << (mission_exploration_finished_?"true":"false")
+         << ",\"returning\":" << (mission_returning_?"true":"false")
+         << ",\"returned_home\":" << (mission_finished_?"true":"false") << '}';
   stream << ",\"pct_selection_timing_ms\":{";
   bool first_timing=true;
   for(const auto &[phase,elapsed]:selection_timings_) {
@@ -179,38 +204,28 @@ void ExplorationController::report(const std::string &state, const std::string &
          <<",\"filtered_observers\":"<<policy_.cross_filtered_observers_<<'}';
   if(options_.frontier_source_=="pct")stream<<",\"height_review\":"<<height_review_status_;
   if(options_.floor_exploration_ && options_.frontier_source_=="pct") {
-    stream<<",\"pct_floor\":{\"number\":"<<policy_.floor_number_
+    stream<<",\"pct_floor\":{\"reference_kind\":\"measured_height_band\",\"number\":"<<policy_.floor_number_
           <<",\"height\":"<<(policy_.floor_height_?std::to_string(*policy_.floor_height_):"null")
           <<",\"phase\":"<<json_string(!policy_.floor_height_?"acquiring":
-               policy_.cross_task_.phase()=="exploring_platform"?"exploring_platform":
-               policy_.cross_task_.deferred()?"ascent_deferred":(policy_.cross_task_.engaged() || recovery_.stair_reposition_)?"ascending":
-               (policy_.floor_complete_ || skipping_start_floor())?"waiting_for_stairs":"exploring")
+               policy_.cross_task_.deferred()?"ascent_deferred":
+               policy_.cross_task_.phase()=="exploring_platform"?"exploring":
+               (policy_.cross_task_.engaged() || recovery_.stair_reposition_)?"ascending":
+               (policy_.floor_complete_ || skipping_start_floor())?"waiting_for_ascent":"exploring")
+          <<",\"ordinary_started_sim\":"<<(policy_.floor_exploration_started_sim_?std::to_string(*policy_.floor_exploration_started_sim_):"null")
+          <<",\"ordinary_started_wall\":"<<(policy_.floor_exploration_started_wall_?std::to_string(*policy_.floor_exploration_started_wall_):"null")
+          <<",\"ordinary_ended_sim\":"<<(policy_.floor_exploration_ended_sim_?std::to_string(*policy_.floor_exploration_ended_sim_):"null")
+          <<",\"ordinary_ended_wall\":"<<(policy_.floor_exploration_ended_wall_?std::to_string(*policy_.floor_exploration_ended_wall_):"null")
           <<",\"start_floor_skipped\":"<<(skipping_start_floor()?"true":"false")
-          <<",\"local_stair_probe_active\":"<<(policy_.local_stair_probe_active_?"true":"false")
           <<",\"contacting_feet\":"<<contacting_feet_
           <<",\"foot_sample\":"<<json_string(foot_sample_state_)
           <<",\"support_stable\":"<<(foot_support_stable_?"true":"false")
           <<",\"foot_height_span\":"<<foot_height_span_
           <<",\"confirmation_reason\":"<<json_string(policy_.floor_confirmation_reason_)
           <<",\"stable_foot_height\":"<<(stable_foot_height_?std::to_string(*stable_foot_height_):"null")
-          <<",\"stair_tracks\":"<<policy_.pct_frontiers_.stair_flights
-          <<",\"stair_unknown_blockers\":"<<policy_.pct_frontiers_.unknown_blockers.size()
-          <<",\"stair_targets\":"<<policy_.pct_frontiers_.stair_targets.size()
-          <<",\"stair_step_targets\":"<<policy_.pct_frontiers_.stair_step_targets.size()
-          <<",\"stair_step_unsafe\":"<<policy_.pct_frontiers_.stair_step_unsafe
-          <<",\"stair_climb_result\":"<<json_string(policy_.stair_climb_result_)
-          <<",\"stair_step_result\":"<<json_string(policy_.stair_step_result_)
-          <<",\"stair_landing_targets\":"<<policy_.pct_frontiers_.stair_landing_targets.size()
-          <<",\"stair_index_ms\":"<<policy_.pct_frontiers_.stair_index_ms
-          <<",\"pending_stair_candidates\":"<<policy_.pct_frontiers_.pending_stair_candidates
-          <<",\"stair_platform_visible\":"<<(policy_.pct_frontiers_.stair_platform_visible?"true":"false")
-          <<",\"saved_stair_entrances\":[";
-    for(std::size_t i=0;i<policy_.pct_frontiers_.saved_stair_entrances.size();++i) {
-      const auto &entry=policy_.pct_frontiers_.saved_stair_entrances[i];
-      if(i)stream<<',';
-      stream<<'['<<entry.ground[0]<<','<<entry.ground[1]<<','<<entry.ground[2]<<','<<entry.yaw<<']';
-    }
-    stream<<"],\"unknown_blockers\":[";
+          <<",\"ascent_unknown_blockers\":"<<policy_.pct_frontiers_.unknown_blockers.size()
+          <<",\"upward_support_targets\":"<<policy_.pct_frontiers_.upward_support_targets.size()
+          <<",\"upward_result\":"<<json_string(policy_.upward_result_)
+          <<",\"unknown_blockers\":[";
     const auto &blockers=policy_.pct_frontiers_.unknown_blockers;
     for(std::size_t i=0;i<std::min<std::size_t>(12,blockers.size());++i) {
       const auto &b=blockers[i];
@@ -226,6 +241,15 @@ void ExplorationController::report(const std::string &state, const std::string &
   stream << ",\"observation_task_active\":" << (observation_task_?"true":"false")
          << ",\"observation_evidence\":" << observation_metadata_;
   if(observation_task_)stream << ",\"observation_desired_yaw\":" << observation_task_->center;
+  if(observation_task_) {
+    const auto &task=*observation_task_;const double current=wall_now();
+    stream<<",\"observation_timing\":{\"phase\":"<<json_string(task.phase)
+          <<",\"elapsed_s\":"<<std::max(0.,current-task.began)
+          <<",\"pose_wait_s\":"<<task.pose_wait_seconds+
+              (task.pose_wait_since?std::max(0.,current-*task.pose_wait_since):0.)
+          <<",\"pose_age_s\":"<<(base_?std::to_string(std::max(0.,current-base_wall_)):"null")
+          <<",\"yaw_age_s\":"<<(base_yaw_?std::to_string(std::max(0.,current-yaw_wall_)):"null")<<'}';
+  }
   stream << ",\"route_stages\":" << path_processor_.waypoints().size();
   stream << ",\"route_stage_index\":" << path_processor_.index();
   stream << ",\"route_skipped_nearby\":" << route_skipped_nearby_;
@@ -259,6 +283,7 @@ void ExplorationController::report(const std::string &state, const std::string &
            << ",\"pct_unreachable_observers\":" << policy_.pct_frontiers_.unreachable_observers
            << ",\"pct_query_ms\":" << policy_.pct_frontiers_.query_ms
            << ",\"pct_query_pending\":" << (policy_.pct_frontiers_.query_pending?"true":"false")
+           << ",\"pct_support_query_pending\":" << (policy_.pct_frontiers_.support_query_pending?"true":"false")
            << ",\"pct_query_checked_clusters\":" << policy_.pct_frontiers_.query_checked_clusters
            << ",\"pct_observer_prepare_ms\":" << policy_.pct_frontiers_.observer_prepare_ms
            << ",\"pct_observer_geometry_ms\":" << policy_.pct_frontiers_.observer_geometry_ms
@@ -281,6 +306,10 @@ void ExplorationController::report(const std::string &state, const std::string &
            << ",\"pct_fast_skipped_cells\":" << policy_.pct_frontiers_.fast_skipped_cells
            << ",\"pct_failed_small_clusters\":" << policy_.pct_frontiers_.small_skipped_clusters
            << ",\"pct_failed_small_cells\":" << policy_.pct_frontiers_.small_skipped_cells
+           << ",\"pct_low_yield_deferred_clusters\":" << policy_.pct_frontiers_.low_yield_deferred_clusters
+           << ",\"pct_low_yield_deferred_cells\":" << policy_.pct_frontiers_.low_yield_deferred_cells
+           << ",\"pct_global_first_after_local_failure_clusters\":" << policy_.pct_frontiers_.global_first_after_local_failure_clusters
+           << ",\"pct_global_first_after_local_failure_cells\":" << policy_.pct_frontiers_.global_first_after_local_failure_cells
            << ",\"pct_floor_longest_selection_wait_ms\":" << policy_.floor_longest_selection_wait_ms_
            << ",\"pct_deferred_floor_frontier_cells\":" << policy_.pct_frontiers_.deferred_floor_frontier_cells
            << ",\"pct_local_window\":{\"horizontal_half_width\":" << cfg_.local_search_radius
@@ -632,14 +661,14 @@ void ExplorationController::on_input(const geometry_msgs::msg::PoseStamped &msg)
   // 只有时间戳与本轮消息匹配时才采用这份数据。
   if (active_ && xy_distance(xy, active_->xy) < 0.05 && stamp_ns(msg.header.stamp) == active_->input_stamp) return;
   // 只有表达式为真，才执行下面缩进或花括号内的代码。
-  cancel_recovery_action();
+  if(observation_task_)end_observation(false,"manual_override");
+  else cancel_recovery_action();
   if(policy_.cross_task_.engaged() || policy_.cross_task_.deferred() || recovery_.stair_reposition_)
     defer_cross_layer("manual_override");
   recovery_.reset();
   control_mode_ = ExplorationMode::flat;
   // An external manual goal supersedes the exploration route.
   active_.reset();
-  observation_task_.reset();
   reset_planned_route();
   paused_ = true;
   report("paused_for_manual_goal");
@@ -743,24 +772,8 @@ void ExplorationController::finish_if_complete() {
     if(recovery_.stair_reposition_ && path_processor_.is_last() &&
        recovery_.stair_reposition_->stage==StairReposition::Stage::forward)recovery_.stair_reposition_.reset();
     RCLCPP_INFO(logger_, "Frontier goal reached: %.2f, %.2f", active_->xy[0], active_->xy[1]);
-    if(policy_.cross_task_.engaged() && selected_pct_ && !selected_local_stair_probe_ &&
-       !path_processor_.is_last() && !path_processor_.recovery()) {
-      auto remaining=path_processor_;
-      remaining.advance();
-      const auto frontier=*selected_pct_;
-      const bool platform=selected_platform_frontier_;
-      const int attempt=selected_floor_attempt_;
-      active_.reset();
-      reset_planned_route();
-      start_stair_segment_scan(policy_.cross_task_.ascent_yaw(),true);
-      observation_task_->continuation=std::move(remaining);
-      observation_task_->frontier=frontier;
-      observation_task_->platform_frontier=platform;
-      observation_task_->floor_attempt=attempt;
-      report("cross_layer_waypoint_scan");
-      return;
-    }
     finish_active_goal();
+    route_stage_reached_wall_=wall_now();
     // 清空临时状态，准备下一轮处理。
     active_.reset();
     advance_route();
@@ -881,6 +894,11 @@ void ExplorationController::publish_goal_diagnostic(const Active &goal, const ch
 
 void ExplorationController::handle_scan_failure(std::int64_t stamp, const std::string &reason) {
   if (!active_ || !active_->stamp || *active_->stamp != stamp) return;
+  std::optional<LayerMapReadPhase> read;
+  if(shared_layer_ && shared_layer_->pct) {
+    read.emplace(*shared_layer_,true);
+    if(!read->ready()) {pending_scan_failure_=std::make_pair(stamp,reason);return;}
+  }
   auto result = path_processor_.resolve_execution(stamp, false, reason);
   if (!result) return;
   publish_goal_diagnostic(*active_, "failed", reason);
@@ -894,6 +912,7 @@ void ExplorationController::handle_scan_failure(std::int64_t stamp, const std::s
     reset_planned_route();
     recovery_.blocker_recovery_->action.reset();
     if(delegated) {
+      recovery_.blocker_recovery_->delegation_started=false;
       recovery_.blocker_recovery_->stopped_pose.reset();
       recovery_.blocker_recovery_->result_at=wall_now();
       report("pct_blocker_scan_delegate_failed",reason);
@@ -925,36 +944,36 @@ void ExplorationController::handle_scan_failure(std::int64_t stamp, const std::s
     }
   }
   const bool exploring_platform=options_.floor_exploration_ && policy_.cross_task_.phase()=="exploring_platform";
-  if(!exploring_platform && try_queue_stair_reposition(reason))return;
+  if(reason=="planning_wait_timeout" || reason=="initialization_budget_exhausted") {
+    // A missing SCAN trajectory is a computational failure, not evidence
+    // that this frontier is a wall or that its floor attempts are exhausted.
+    if(selected_pct_)policy_.pct_cooldowns_.push_back(
+        {selected_pct_->frontier,wall_now()+options_.cooldown_});
+    if((policy_.cross_task_.engaged() || policy_.cross_task_.deferred()) && selected_pct_observation_) {
+      auto ground=*selected_pct_observation_;ground[2]-=options_.layer_body_height_;
+      policy_.failed_stair_observers_[ground]=wall_now()+options_.cooldown_;
+    }
+    if(base_ && selected_pct_) {
+      LayerMapReadPhase lock(*shared_layer_);
+      shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
+          "cancel",selected_pct_->id,*base_);
+    }
+    active_.reset();reset_planned_route();
+    report(policy_.cross_task_.engaged()?"cross_layer_recovery":"scan_plan_failed",reason);
+    return;
+  }
+  if((policy_.cross_task_.engaged() || policy_.cross_task_.deferred()) && selected_pct_observation_ && !active_->turn && !active_->recovery) {
+    auto ground=*selected_pct_observation_;
+    ground[2]-=options_.layer_body_height_;
+    policy_.failed_stair_observers_[ground]=wall_now()+options_.cooldown_;
+  }
+  if(!options_.floor_exploration_ && !exploring_platform && try_queue_stair_reposition(reason))return;
   const bool turning = active_->turn;
   const bool recovering = active_->recovery;
   const XY failed_target = route_selection_target_.value_or(active_->xy);
   const auto failed_pct=selected_pct_;
   const auto failed_observation=selected_pct_observation_;
-  if(selected_local_stair_probe_ && reason=="execution_stop_timeout" && !turning && !recovering &&
-     base_ && base_yaw_ && wall_now()-base_wall_<=options_.odom_timeout_ &&
-     wall_now()-yaw_wall_<=options_.odom_timeout_ && layer_map_fresh()) {
-    LayerMapReadPhase lock(*shared_layer_);
-    const auto checked=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
-        "recover_stair_stop",0,*base_,*base_yaw_);
-    RCLCPP_INFO(logger_,"Stair stop timeout actual-stance check: %s",checked.metadata.c_str());
-    if(checked.ready) {
-      active_.reset();
-      reset_planned_route();
-      report("stair_stop_safe_replan","execution_stop_timeout");
-      return;
-    }
-  }
   bool floor_attempt_settled=false;
-  if(selected_local_stair_probe_ && failed_pct && !failed_pct->observations.empty()) {
-    auto point=failed_pct->observations.front();
-    point[2]+=options_.layer_body_height_;
-    LayerMapReadPhase lock(*shared_layer_);
-    const auto rejected=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
-        "reject_stair_stance",0,point,failed_pct->observation_yaws.front());
-    RCLCPP_INFO(logger_,"Stair recognition execution rejected (%s): %s",
-                reason.c_str(),rejected.metadata.c_str());
-  }
   if(selected_floor_attempt_ && failed_pct && base_) {
     LayerMapReadPhase lock(*shared_layer_);
     const auto version=shared_layer_->current_version.load();
@@ -971,12 +990,6 @@ void ExplorationController::handle_scan_failure(std::int64_t stamp, const std::s
     if(floor_attempt_settled) {
       report("pct_floor_frontier_settled",reason);
       return;
-    }
-    if(failed_observation) {
-      auto ground=*failed_observation;
-      ground[2]-=options_.layer_body_height_;
-      policy_.failed_stair_observers_.insert(ground);
-      policy_.failed_stair_version_=policy_.pct_frontiers_.geometry_version;
     }
     if(exploring_platform) {
       report("cross_layer_platform_waiting",reason);
@@ -1061,7 +1074,8 @@ Point ExplorationController::cross_ground_pose() const {
   const bool feet_current=stable_foot_height_ && wall_now()-foot_sample_wall_<=.25;
   if(feet_current)point[2]=*stable_foot_height_;
   if(shared_layer_ && shared_layer_->pct && layer_map_fresh()) {
-    LayerMapReadPhase lock(*shared_layer_);
+    LayerMapReadPhase lock(*shared_layer_,true);
+    if(!lock.ready())return point;
     auto support_pose=*base_;
     support_pose[2]=point[2]+options_.layer_body_height_;
     const auto support=shared_layer_->pct->point_check(shared_layer_->current_version.load(),support_pose,
@@ -1078,7 +1092,8 @@ bool ExplorationController::stable_four_foot_support(double current) const {
 
 double ExplorationController::refresh_stair_heading(double fallback) {
   if(!base_ || !shared_layer_ || !shared_layer_->pct || !layer_map_fresh())return fallback;
-  LayerMapReadPhase lock(*shared_layer_);
+  LayerMapReadPhase lock(*shared_layer_,true);
+  if(!lock.ready())return fallback;
   const auto view=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
       "stair_heading",0,*base_,fallback);
   if(!view.ready)return fallback;
@@ -1092,34 +1107,21 @@ double ExplorationController::refresh_stair_heading(double fallback) {
 void ExplorationController::finish_active_goal() {
   // 尚无对应数据或目标时，进入此分支。
   if (!active_ || !base_) return;
+  if(mission_returning_)return;
   if (selected_pct_) {
     if (path_processor_.is_last() && selected_pct_observation_ && shared_layer_ && shared_layer_->pct) {
-      if(selected_local_stair_probe_ && !selected_pct_->observation_yaws.empty()) {
-        if(selected_stair_approach_)return;
-        if(selected_local_stair_return_) {
-          LayerMapReadPhase lock(*shared_layer_);
-          const auto result=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
-              "finish_local_stair_return",0,*base_,0.,options_.observation_goal_xy_tolerance_);
-          if(result.ready)policy_.local_stair_probe_active_=false;
-          return;
-        }
-        start_floor_stair_scan(selected_pct_->observation_yaws.front(),wall_now());return;
-      }
-      // Every completed climb waypoint owns a full sweep before continuing.
-      if(selected_stair_segment_ && policy_.cross_task_.engaged())
-        policy_.stair_scan_budget_.advance(cross_ground_pose(),policy_.cross_task_.ascent_yaw(),
-            cross_layer_minimum_travel(),policy_.cross_task_.minimum_rise,policy_.cross_task_.height_slack);
-      if(policy_.cross_task_.engaged() && !selected_floor_attempt_) {
-        start_stair_segment_scan(policy_.cross_task_.ascent_yaw(),true);
-        observation_task_->platform_frontier=selected_platform_frontier_;
+      if(policy_.cross_task_.engaged() && selected_pct_->id==0) {
+        // A verified measured-support target is movement, not another view
+        // task. Continue immediately; only a real blocker can request a scan.
+        policy_.cross_task_.update(cross_ground_pose());
+        policy_.cross_task_.observed();
         return;
       }
       // Arrival only starts an observation task. Actual pose, yaw and
       // subsequently integrated local evidence determine completion.
       ObservationTask task;task.frontier=*selected_pct_;task.began=wall_now();
       task.planned_pose=selected_pct_observation_;
-      task.mandatory_stair_scan=policy_.cross_task_.engaged();
-      task.cross_layer=policy_.cross_task_.engaged() && !selected_platform_frontier_;
+      task.cross_layer=false;
       task.platform_frontier=selected_platform_frontier_;
       task.fast_floor=selected_fast_floor_;
       task.floor_attempt=selected_floor_attempt_;
@@ -1167,10 +1169,19 @@ void ExplorationController::publish_marker(const std::optional<XY> &goal) {
 }
 
 void ExplorationController::publish_pct_frontiers() {
+  if(shared_layer_ && layer_map_fresh()) {
+    LayerMapReadPhase lock(*shared_layer_,true);
+    if(!lock.ready()) {pct_markers_dirty_=true;return;}
+    pct_marker_version_=shared_layer_->current_version.load();
+    if(!shared_layer_->pct->refresh_frontier_displays(pct_marker_version_,policy_.pct_frontiers_.clusters))
+      RCLCPP_WARN(logger_,"Frontier display refresh failed: %s",shared_layer_->pct->last_error().c_str());
+    pct_marker_wall_=wall_now();
+  }
   visualization_msgs::msg::MarkerArray array;
   std::set<std::pair<std::string,int>> current;
   int marker_id = 0;
   for (const auto &cluster:policy_.pct_frontiers_.clusters) {
+    if(cluster.display.empty())continue;
     visualization_msgs::msg::Marker marker;
     marker.header.frame_id=options_.frame_id_;marker.header.stamp=clock_->now();
     marker.ns="pct_surface_frontiers";marker.id=marker_id++;
@@ -1224,59 +1235,60 @@ void ExplorationController::publish_pct_frontiers() {
   output_.pct_frontier(array);
 }
 
-void ExplorationController::start_stair_segment_scan(double heading,bool mandatory) {
-  heading=refresh_stair_heading(heading);
-  // When no measured direction is available, scan from the current stance
-  // instead of demanding a large turn to an old approach bearing.
-  if(base_yaw_ && std::abs(std::remainder(heading-*base_yaw_,2*M_PI))>.71)
-    heading=*base_yaw_;
-  auto region=cross_ground_pose();
-  region[0]+=.5*std::cos(heading);
-  region[1]+=.5*std::sin(heading);
-  if(!mandatory && !policy_.stair_scan_budget_.reserve(region,cross_ground_pose()))return;
-  ObservationTask task;
-  task.began=wall_now();
-  task.initialized=task.support_scan=task.cross_layer=task.stair_segment_scan=true;
-  task.mandatory_stair_scan=mandatory;
-  task.center=heading;
-  const double sweep=std::min(options_.observation_sweep_,.30);
-  task.headings={heading,heading-sweep,heading+sweep,heading};
-  observation_task_=std::move(task);
-  policy_.cross_task_.begin_support_scan();
-}
-
-void ExplorationController::start_floor_stair_scan(double heading,double current) {
-  // The recognition task owns its two attempts across observation poses.
-  // The ascent scan budget only applies after the climb starts.
-  ObservationTask task;
-  task.began=current;
-  task.initialized=task.support_scan=task.floor_stair_probe=true;
-  task.stair_heading=task.center=heading;
-  task.headings={heading};
-  observation_task_=std::move(task);
-  report("pct_floor_stair_probe");
-}
-
 void ExplorationController::arm_observation_view() {
   auto &task=*observation_task_;
-  // The first and last headings only align the body. Arm evidence at the sides.
-  if(task.mandatory_stair_scan && (task.next==1 || task.next==task.headings.size()))return;
-  LayerMapReadPhase lock(*shared_layer_);
-  const auto version=shared_layer_->current_version.load();
-  const bool stair_view=task.stair_segment_scan || task.mandatory_stair_scan;
-  if(task.mandatory_stair_scan && !task.stair_segment_scan)
-    shared_layer_->pct->observation_task(version,"arm",task.frontier.id,*base_,*base_yaw_);
-  shared_layer_->pct->observation_task(version,
-      task.targeted_blocker_scan?"arm_blocker_review":
-      task.floor_stair_probe?"arm_floor_stair_probe":stair_view?"arm_stair_view":"arm",
-      task.frontier.id,*base_,stair_view?task.center:*base_yaw_,
-      task.mandatory_stair_scan?task.headings[task.next-1]-task.center:0.);
+  LayerMapReadPhase lock(*shared_layer_,true);
+  if(!lock.ready()) {task.arm_pending=true;return;}
+  task.arm_pending=false;
+  shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
+      task.targeted_blocker_scan?"arm_blocker_review":"arm",
+      task.frontier.id,*base_,*base_yaw_);
   task.waiting_since=wall_now();
-  task.stair_view_last_frame=task.waiting_since;
+}
+
+void ExplorationController::observation_phase(const char *phase,double current) {
+  if(!observation_task_)return;
+  auto &task=*observation_task_;
+  if(task.phase==phase)return;
+  if(!task.phase.empty())task.phase_seconds[task.phase]+=std::max(0.,current-task.phase_since);
+  task.phase=phase;task.phase_since=current;
 }
 
 void ExplorationController::end_observation(bool success,const std::string &reason,bool floor_attempt_settled) {
   if(!observation_task_)return;
+  LayerMapReadPhase read(*shared_layer_,true);
+  if(!read.ready()) {
+    auto &task=*observation_task_;
+    if(active_ && task.action_owner && active_->turn &&
+       active_->goal_id==task.action_owner->first && active_->attempt_id==task.action_owner->second) {
+      cancel_recovery_action();
+      if(active_->stamp)if(auto result=path_processor_.resolve_execution(*active_->stamp,false,reason,base_))
+        publish_execution_result(*result);
+      active_.reset();pending_scan_ack_.reset();
+    }
+    if(!task.pending_end)task.pending_end=std::make_tuple(success,reason,floor_attempt_settled);
+    observation_phase("map_wait",wall_now());report("observation_waiting_for_map");return;
+  }
+  observation_task_->pending_end.reset();
+  const double ended=wall_now();
+  auto &ending=*observation_task_;
+  if(!ending.phase.empty())ending.phase_seconds[ending.phase]+=std::max(0.,ended-ending.phase_since);
+  if(ending.pose_wait_since) {
+    ending.pose_wait_seconds+=std::max(0.,ended-*ending.pose_wait_since);
+    ending.pose_wait_since.reset();
+  }
+  // Retire the owned action BEFORE clearing its execution stage. A late
+  // result is then an inert receipt, never a permanently active orphan.
+  const bool owns_action=active_ && ending.action_owner && active_->turn &&
+      active_->goal_id==ending.action_owner->first && active_->attempt_id==ending.action_owner->second;
+  if(owns_action) {
+    cancel_recovery_action();
+    if(active_->stamp) {
+      if(auto result=path_processor_.resolve_execution(*active_->stamp,false,reason,base_))
+        publish_execution_result(*result);
+    }
+    active_.reset();pending_scan_ack_.reset();
+  }
   const auto frontier=observation_task_->frontier;
   RCLCPP_INFO(logger_,"Observation task %s: %s",success?"completed":"unresolved",reason.c_str());
   const bool support_scan=observation_task_->support_scan;
@@ -1289,15 +1301,7 @@ void ExplorationController::end_observation(bool success,const std::string &reas
   auto continuation=std::move(observation_task_->continuation);
   const int continuation_attempt=observation_task_->floor_attempt;
   std::string settlement;
-  if(success && observation_task_->floor_stair_probe && base_ && base_yaw_) {
-    LayerMapReadPhase lock(*shared_layer_);
-    settlement=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
-        "finish_floor_stair_probe",0,*base_,*base_yaw_).metadata;
-  } else if(!success && observation_task_->floor_stair_probe && base_) {
-    LayerMapReadPhase lock(*shared_layer_);
-    settlement=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
-        "cancel_local_stair_probe_scan",0,*base_).metadata;
-  } else if(success && !support_scan && base_ && base_yaw_) {
+  if(success && !support_scan && base_ && base_yaw_) {
     LayerMapReadPhase lock(*shared_layer_);
     const auto result=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),"finish",
         frontier.id,*base_,*base_yaw_,observation_task_->coverage);
@@ -1306,7 +1310,7 @@ void ExplorationController::end_observation(bool success,const std::string &reas
     settlement=result.metadata;
     if(observation_task_->floor_attempt && result.floor_attempt=="inconclusive")
       policy_.pct_floor_wait_for_frame_after_=shared_layer_->last_integration_wall_seconds.load();
-  } else if(!success && !support_scan && !floor_attempt_settled) {
+  } else if(!success && !support_scan && !floor_attempt_settled && reason!="paused" && reason!="manual_override") {
     if(observation_task_->floor_attempt && base_ && reason!="pose_timeout" && reason!="frontier_resolved") {
       LayerMapReadPhase lock(*shared_layer_);
       const auto result=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
@@ -1321,8 +1325,18 @@ void ExplorationController::end_observation(bool success,const std::string &reas
        <<",\"cluster_id\":"<<frontier.id<<",\"evidence\":"<<observation_metadata_
        <<",\"duration_s\":"<<wall_now()-observation_task_->began
        <<",\"views_completed\":"<<observation_task_->views_completed;
-  if(observation_task_->mandatory_stair_scan)
-    event<<",\"stair_views_with_returns\":"<<observation_task_->stair_views_with_returns;
+  event<<",\"pose_wait_s\":"<<ending.pose_wait_seconds
+       <<",\"pose_age_s\":"<<(base_?std::to_string(std::max(0.,ended-base_wall_)):"null")
+       <<",\"yaw_age_s\":"<<(base_yaw_?std::to_string(std::max(0.,ended-yaw_wall_)):"null")
+       <<",\"phase_seconds\":{";
+  bool first_phase=true;
+  for(const auto &[phase,seconds]:ending.phase_seconds) {
+    if(!first_phase)event<<',';
+    first_phase=false;event<<std::quoted(phase)<<':'<<seconds;
+  }
+  event<<'}';
+  if(ending.action_owner)event<<",\"action_goal_id\":"<<ending.action_owner->first
+      <<",\"action_attempt_id\":"<<ending.action_owner->second;
   if(observation_task_->floor_attempt)event<<",\"floor_frontier_attempt\":"<<observation_task_->floor_attempt;
   event<<",\"selection_map_version\":"<<frontier.revision
        <<",\"observation_map_version\":"<<shared_layer_->current_version.load();
@@ -1343,11 +1357,11 @@ void ExplorationController::end_observation(bool success,const std::string &reas
     shared_layer_->pct->observation_task(shared_layer_->current_version.load(),operation,frontier.id,*base_);
   }
   observation_task_.reset();
-  reset_planned_route();
+  // No observer is allowed to erase a route already owned by a newer task.
+  if(!active_)reset_planned_route();
   if (support_scan) recovery_.complete_scan(success);
   if(policy_.cross_task_.engaged()) {
     if(!platform_frontier)policy_.cross_task_.observed();
-    if(!options_.floor_exploration_ && !recovery_.blocker_recovery_)cross_layer_platform_ready();
   }
   if(continuation && success && base_) {
     const auto next_z=continuation->current_z();
@@ -1367,7 +1381,6 @@ void ExplorationController::end_observation(bool success,const std::string &reas
     selected_pct_observation_=path_processor_.xyz().empty()?std::nullopt:
         std::optional<Point>{path_processor_.xyz().back()};
     selected_platform_frontier_=platform_frontier;
-    selected_stair_segment_=!platform_frontier;
     selected_floor_attempt_=continuation_attempt;
     route_selection_target_=XY{frontier.frontier[0],frontier.frontier[1]};
   }
@@ -1381,12 +1394,6 @@ bool ExplorationController::dispatch_observation_turn(double angle) {
   static const std::vector<XY> empty_obstacles;
   LayerMapReadPhase lock(*shared_layer_);
   if(observation_task_ && observation_task_->support_scan && observation_task_->cross_layer && std::abs(angle)>.71)return false;
-  // A platform observation already passed the same-height route and arrival checks.
-  // Its turn still uses the circular footprint check in the turn planner.
-  if(observation_task_ && !observation_task_->platform_frontier && policy_.cross_task_.engaged() && std::abs(angle)>.70 &&
-     !shared_layer_->pct->point_check(shared_layer_->current_version.load(),*base_,true).ready) {
-    RCLCPP_WARN(logger_,"Cross-layer large turn requires a confirmed platform");return false;
-  }
   PlanningGoal goal;goal.goal_id=++goal_id_;goal.attempt_id=++planning_attempt_id_;
   goal.mode=policy_.cross_task_.engaged()?ExplorationMode::cross_layer:ExplorationMode::flat;
   goal.layer_version=shared_layer_->current_version.load();
@@ -1400,6 +1407,7 @@ bool ExplorationController::dispatch_observation_turn(double angle) {
     for(const auto &result:plans.candidates)RCLCPP_WARN(logger_,"Observation turn rejected: %s, %s",result.reason.c_str(),result.backend_metadata.c_str());
     return false;
   }
+  observation_task_->action_owner=std::make_pair(goal.goal_id,goal.attempt_id);
   observation_task_->turning=true;
   // Map work may temporarily age the last odometry message. Keep a valid
   // checked action queued until fresh odometry arrives, like a position route.
@@ -1410,34 +1418,45 @@ PctObservation ExplorationController::stair_observation_progress() {
   LayerMapReadPhase lock(*shared_layer_);
   const auto &task=*observation_task_;
   return shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
-      task.floor_stair_probe?"floor_stair_probe_progress":"stair_step_progress",0,*base_,
-      task.floor_stair_probe?base_yaw_.value_or(0.):policy_.cross_task_.ascent_yaw());
+      "stair_step_progress",0,*base_,policy_.cross_task_.ascent_yaw());
 }
 
 bool ExplorationController::handle_observation(double current) {
   if(!observation_task_)return false;
   if(paused_ || options_.observation_only_ || !ready_) {report("observation_paused");return true;}
+  // Repeated short pose outages must not extend one task indefinitely.
+  if(current-observation_task_->began>options_.observation_timeout_+options_.observation_pose_wait_timeout_) {
+    end_observation(false,"observation_timeout");return true;
+  }
   if(!base_ || !base_yaw_ || current-base_wall_>options_.odom_timeout_ || current-yaw_wall_>options_.odom_timeout_) {
-    if(current-observation_task_->began>options_.observation_timeout_)end_observation(false,"pose_timeout");
+    auto &task=*observation_task_;
+    if(!task.pose_wait_since)task.pose_wait_since=current;
+    observation_phase("pose_wait",current);
+    if(current-*task.pose_wait_since>=options_.observation_pose_wait_timeout_)end_observation(false,"pose_timeout");
     else report("observation_waiting_for_pose");return true;
   }
-  if(current-observation_task_->began>options_.observation_timeout_) {
-    cancel_recovery_action();active_.reset();end_observation(false,"observation_timeout");return true;
+  if(observation_task_->pose_wait_since) {
+    observation_task_->pose_wait_seconds+=std::max(0.,current-*observation_task_->pose_wait_since);
+    observation_task_->pose_wait_since.reset();
   }
-  if(active_) {report("observation_turning");return true;}
-  if(path_processor_.active()) {try_dispatch_route();return true;}
+  if(current-observation_task_->began-observation_task_->pose_wait_seconds>options_.observation_timeout_) {
+    end_observation(false,"observation_timeout");return true;
+  }
+  if(active_) {observation_phase("turn",current);report("observation_turning");return true;}
+  if(path_processor_.active()) {observation_phase("motion_queue",current);try_dispatch_route();return true;}
+  LayerMapReadPhase read(*shared_layer_,true);
+  if(!read.ready()) {observation_phase("map_wait",current);report("observation_waiting_for_map");return true;}
+  if(observation_task_->arm_pending) {arm_observation_view();return true;}
+  observation_phase(observation_task_->waiting_since>0?"evidence_wait":"view_check",current);
   auto &task=*observation_task_;
   const bool stair_frontier=task.cross_layer && !task.platform_frontier && !task.support_scan;
   // Already observed and reachable is sufficient: avoid a redundant turn
   // or dwell when the next stance is available before starting this sweep.
-  if(task.next==0 && !task.waiting_since && !task.targeted_blocker_scan && !task.mandatory_stair_scan &&
-     (task.floor_stair_probe || task.stair_segment_scan || stair_frontier)) {
+  if(task.next==0 && !task.waiting_since && !task.targeted_blocker_scan && stair_frontier) {
     const auto progress=stair_observation_progress();
     observation_metadata_=progress.metadata;
     if(progress.ready) {
-      end_observation(true,task.floor_stair_probe?
-          "floor_stair_probe_observed":stair_frontier?
-          "stair_frontier_continuation_ready":"stair_segment_scan_observed");return true;
+      end_observation(true,"stair_frontier_continuation_ready");return true;
     }
   }
   if(!task.initialized) {
@@ -1450,100 +1469,61 @@ bool ExplorationController::handle_observation(double current) {
          directional?std::min(options_.observation_sweep_,.35):options_.observation_sweep_);}
     observation_metadata_=view.metadata;
     RCLCPP_INFO(logger_,"Observation view: %s",view.metadata.c_str());
-    if(!view.ready && !task.mandatory_stair_scan) {
+    if(!view.ready) {
       end_observation(false,view.reason,!view.floor_attempt.empty() && view.floor_attempt!="untracked");
       return true;
     }
     task.center=view.ready?view.yaw:policy_.cross_task_.ascent_yaw();
     task.coverage=0.;task.initialized=true;
-    if(directional || task.mandatory_stair_scan) {
-      const double sweep=std::min(options_.observation_sweep_,.35);
-      task.headings={task.center,task.center-sweep,task.center+sweep,task.center};
-    } else {
-      task.headings={task.center};
-      if(view.side_yaw)task.headings.push_back(*view.side_yaw);
-    }
+    task.headings={task.center};
+    // Climbing observes the selected target only. No fixed left/right sweep.
+    if(!directional && !policy_.cross_task_.engaged() && view.side_yaw)
+      task.headings.push_back(*view.side_yaw);
   }
   if(task.waiting_since>0) {
     const double dwell=task.directional()?options_.observation_wait_:options_.observation_flat_wait_;
-    if(task.mandatory_stair_scan) {
-      bool observed=false;
-      const double frame=shared_layer_->last_integration_wall_seconds.load();
-      if(frame>task.stair_view_last_frame) {
-        task.stair_view_last_frame=frame;
-        LayerMapReadPhase lock(*shared_layer_);
-        const auto progress=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
-            "stair_view_progress",0,*base_);
-        observed=progress.ready;
+    if(stair_frontier && !task.targeted_blocker_scan) {
+      if(shared_layer_->last_integration_wall_seconds.load()>task.waiting_since) {
+        const auto progress=stair_observation_progress();
         observation_metadata_=progress.metadata;
+        if(progress.ready) {
+          ++task.views_completed;
+          end_observation(true,"stair_frontier_continuation_ready");return true;
+        }
       }
-      if(!observed && current-task.waiting_since<options_.observation_wait_) {
-        report("observation_waiting_for_local_frames");return true;
-      }
-      if(observed)++task.stair_views_with_returns;
+      if(current-task.waiting_since<dwell) {report("observation_waiting_for_local_frames");return true;}
       task.waiting_since=0.;
       ++task.views_completed;
-    } else {
-      if(task.floor_stair_probe) {
-        const bool frame=shared_layer_->last_integration_wall_seconds.load()>task.waiting_since;
-        if(frame) {
-          const auto progress=stair_observation_progress();
-          observation_metadata_=progress.metadata;
-          if(progress.ready) {
-            ++task.views_completed;
-            end_observation(true,"floor_stair_probe_observed");
-            return true;
-          }
-        }
-        if(current-task.waiting_since>=dwell)
-          end_observation(false,"floor_stair_probe_stance_unavailable");
-        else report("observation_waiting_for_local_frames");
-        return true;
+      if(task.next>=task.headings.size()) {
+        end_observation(true,"sweep_executed");return true;
       }
-      if((task.stair_segment_scan || stair_frontier) && !task.targeted_blocker_scan) {
-        if(shared_layer_->last_integration_wall_seconds.load()>task.waiting_since) {
-          const auto progress=stair_observation_progress();
-          observation_metadata_=progress.metadata;
-          if(progress.ready) {
-            ++task.views_completed;
-            end_observation(true,stair_frontier?"stair_frontier_continuation_ready":
-                "stair_segment_scan_observed");return true;
-          }
-        }
-        if(current-task.waiting_since<dwell) {report("observation_waiting_for_local_frames");return true;}
-        task.waiting_since=0.;
-        ++task.views_completed;
-        if(task.next>=task.headings.size()) {
-          end_observation(stair_frontier,stair_frontier?"sweep_executed":
-              "stair_segment_scan_stance_unavailable");return true;
-        }
-      } else {
-        if(task.targeted_blocker_scan) {
-          PctObservation progress;
-          {LayerMapReadPhase lock(*shared_layer_);
-           progress=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
-               "blocker_review_progress",0,*base_);}
-          observation_metadata_=progress.metadata;
-          if(progress.ready) {
-            ++task.views_completed;
-            end_observation(true,"stair_support_sweep_executed");return true;
-          }
-          if(current-task.waiting_since>=dwell) {
-            end_observation(false,"blocker_no_target_return");return true;
-          }
-          report("observation_waiting_for_target_returns");return true;
-        }
-        if(current-task.waiting_since<dwell) {
-          report("observation_waiting_for_local_frames");return true;
-        }
+    } else {
+      if(task.targeted_blocker_scan) {
         PctObservation progress;
         {LayerMapReadPhase lock(*shared_layer_);
          progress=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
-             "progress",task.frontier.id,*base_);}
+             "blocker_review_progress",0,*base_);}
         observation_metadata_=progress.metadata;
-        task.waiting_since=0.;
-        ++task.views_completed;
+        if(progress.ready) {
+          ++task.views_completed;
+          end_observation(true,"stair_support_sweep_executed");return true;
+        }
+        if(current-task.waiting_since>=dwell) {
+          end_observation(false,progress.fresh?"blocker_navigation_evidence_pending":"blocker_no_target_return");return true;
+        }
+        report(progress.fresh?"observation_waiting_for_navigation_evidence":
+                             "observation_waiting_for_target_returns",progress.reason);return true;
       }
+      if(current-task.waiting_since<dwell) {
+        report("observation_waiting_for_local_frames");return true;
+      }
+      PctObservation progress;
+      {LayerMapReadPhase lock(*shared_layer_);
+       progress=shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
+           "progress",task.frontier.id,*base_);}
+      observation_metadata_=progress.metadata;
+      task.waiting_since=0.;
+      ++task.views_completed;
     }
   }
   if(task.next>=task.headings.size()) {
@@ -1551,9 +1531,6 @@ bool ExplorationController::handle_observation(double current) {
        options_.observation_full_sweep_ && task.next==task.headings.size()) {
       ++task.next;task.coverage=M_PI;
       if(!dispatch_observation_turn(2*M_PI))end_observation(false,"full_sweep_space_rejected");
-    } else if(task.mandatory_stair_scan && task.stair_segment_scan) {
-      end_observation(true,task.stair_views_with_returns?"stair_segment_scan_observed":
-          "stair_segment_sweep_no_related_returns");
     } else end_observation(true,task.support_scan?
         (task.cross_layer?"stair_support_sweep_executed":"blocker_sweep_executed"):"sweep_executed");
     return true;
@@ -1586,6 +1563,8 @@ void ExplorationController::tick_pct(double current) {
     selection_yielded_at_=wall_now();
     selection_resume_at_=selection_yielded_at_+options_.pct_query_resume_delay_;
   }
+  if(shared_layer_ && wall_now()-pct_marker_wall_>=1. &&
+     shared_layer_->current_version.load()!=pct_marker_version_)pct_markers_dirty_=true;
   if(pct_markers_dirty_) {
     pct_markers_dirty_=false;
     publish_pct_frontiers();
@@ -1594,6 +1573,9 @@ void ExplorationController::tick_pct(double current) {
 
 void ExplorationController::tick_pending_selection() {
   if(!selection_resume_at_ || wall_now()<*selection_resume_at_)return;
+  if(map_read_retry_ && !paused_ && ready_ && !options_.observation_only_) {
+    map_read_retry_=false;selection_resume_at_.reset();++selection_resume_count_;tick_pct(wall_now());return;
+  }
   if(active_ || path_processor_.active() || observation_task_ || recovery_.blocker_recovery_ ||
      recovery_.stair_reposition_ || paused_ || !ready_ || options_.observation_only_) {
     selection_resume_at_.reset();return;

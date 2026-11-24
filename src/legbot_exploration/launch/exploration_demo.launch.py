@@ -15,6 +15,8 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Opaq
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 # 导入 launch.substitutions 提供的类型或函数。
 from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def include(package, filename, arguments=None):
@@ -58,6 +60,29 @@ def setup(context):
         'publish_ground_truth': 'true',
         'enable_ground_lidar': LaunchConfiguration('enable_ground_lidar').perform(context),
     })]
+
+    if LaunchConfiguration('record_metrics').perform(context)=='true':
+        parameters=dict(use_sim_time=True,world=world,localization_source=source,
+            coverage_source=('pct_surfaces' if LaunchConfiguration('layer_map_in_process').perform(context)=='true'
+                             else 'occupancy_grid'),
+            floor_definitions_json=ParameterValue(LaunchConfiguration('metrics_floors').perform(context),value_type=str),
+            target_floor=LaunchConfiguration('metrics_target_floor').perform(context),
+            single_floor=LaunchConfiguration('metrics_single_floor').perform(context),
+            reference_file=LaunchConfiguration('metrics_reference_file').perform(context),
+            max_sim_seconds=float(LaunchConfiguration('metrics_max_sim_seconds').perform(context)),
+            capture_wall_seconds=float(LaunchConfiguration('metrics_capture_wall_seconds').perform(context)),
+            partial_run=LaunchConfiguration('metrics_partial_run').perform(context)=='true',
+            start_floor_skip_option=ParameterValue(LaunchConfiguration('skip_start_floor_exploration').perform(context),value_type=str),
+            method_label=LaunchConfiguration('metrics_method').perform(context))
+        result=LaunchConfiguration('result_directory').perform(context)
+        if result:parameters['result_directory']=result
+        spawn=LaunchConfiguration('metrics_spawn_ground').perform(context)
+        if spawn:
+            import json
+            parameters['spawn_ground']=list(map(float,json.loads(spawn)))
+        actions.append(Node(package='legbot_exploration',executable='record_exploration_metrics',
+            name='exploration_benchmark',output='screen',parameters=[
+                os.path.join(bringup,'config','robot_geometry.yaml'),parameters]))
 
     # 第二阶段：只选一种定位和已配准点云来源；Gazebo 真值已由 simulation 启动。
     if source == 'fastlio':
@@ -121,6 +146,7 @@ def setup(context):
                 'layer_map_in_process': LaunchConfiguration(
                     'layer_map_in_process').perform(context),
                 'enable_ground_lidar': LaunchConfiguration('enable_ground_lidar').perform(context),
+                'mission_return_home': LaunchConfiguration('mission_return_home'),
                 'skip_start_floor_exploration': LaunchConfiguration('skip_start_floor_exploration').perform(context),
             })]))
     # 返回本函数计算得到的结果。
@@ -131,6 +157,19 @@ def setup(context):
 def generate_launch_description():
     # 返回本启动文件的参数及启动动作。
     return LaunchDescription([
+        DeclareLaunchArgument('mission_return_home',default_value='false',choices=['true','false']),
+        DeclareLaunchArgument('record_metrics',default_value='true',choices=['true','false']),
+        DeclareLaunchArgument('result_directory',default_value='',
+                              description='Empty: src/legbot_exploration/result; one unique file prefix per test.'),
+        DeclareLaunchArgument('metrics_floors',default_value='[]'),
+        DeclareLaunchArgument('metrics_target_floor',default_value=''),
+        DeclareLaunchArgument('metrics_single_floor',default_value=''),
+        DeclareLaunchArgument('metrics_reference_file',default_value=''),
+        DeclareLaunchArgument('metrics_spawn_ground',default_value='[-27.0,6.0,0.0]'),
+        DeclareLaunchArgument('metrics_max_sim_seconds',default_value='0.0'),
+        DeclareLaunchArgument('metrics_capture_wall_seconds',default_value='0.0'),
+        DeclareLaunchArgument('metrics_partial_run',default_value='false',choices=['true','false']),
+        DeclareLaunchArgument('metrics_method',default_value='legbot_online_pct'),
         # 声明一个可由 ros2 launch 命令覆盖的启动参数。
         DeclareLaunchArgument(
             'localization_source', default_value='gazebo',

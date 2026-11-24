@@ -7,6 +7,12 @@ bool ExplorationController::try_dispatch_route() {
   if(active_ || !path_processor_.active())return false;
   if(!base_ || wall_now()-base_wall_>options_.odom_timeout_ || options_.observation_only_ || paused_ ||
      !ready_ || output_.waypoint_subscribers()==0)return false;
+  // Mapping commits cache task completion. A segment handoff must not
+  // synchronously commit geometry or wait on the Python interpreter.
+  if(selected_floor_attempt_ && selected_pct_ && shared_layer_ && shared_layer_->pct &&
+     shared_layer_->pct->committed_floor_task_resolved(selected_pct_->id)) {
+    reset_planned_route();report("pct_frontier_resolved_in_transit");return true;
+  }
   publish_target(path_processor_.current(),path_processor_.recovery()?"recovery_route":
                  path_processor_.source()+"_route");
   return active_.has_value();
@@ -73,6 +79,12 @@ void ExplorationController::publish_target(const XY &xy, const std::string &deta
     }
     output_.waypoint(request);
   }
+  if(route_stage_reached_wall_) {
+    RCLCPP_INFO(logger_,"Route handoff goal=%llu stage=%zu handoff_ms=%.3f",
+        static_cast<unsigned long long>(active_->goal_id),active_->stage_index,
+        1000.*(wall_now()-*route_stage_reached_wall_));
+    route_stage_reached_wall_.reset();
+  }
   publish_goal_diagnostic(*active_, "sent", "");
   report("goal_sent", detail);
 }
@@ -137,14 +149,11 @@ void ExplorationController::publish_candidate_path(const PlannerResult &result) 
 }
 
 void ExplorationController::reset_planned_route() {
+  route_stage_reached_wall_.reset();
   path_processor_.clear();
   route_selection_target_.reset();
   selected_pct_.reset();
   selected_pct_observation_.reset();
-  selected_local_stair_probe_=false;
-  selected_local_stair_return_=false;
-  selected_stair_approach_=false;
-  selected_stair_segment_=false;
   selected_platform_frontier_=false;
   selected_fast_floor_=false;
   selected_floor_attempt_=0;
@@ -286,6 +295,8 @@ bool ExplorationController::prepare_route(const XY &target,
   const bool fast_floor=pct_candidate && pct_candidate->id &&
       (detail=="pct_frontier_fast" || (detail=="pct_frontier_review" && policy_.pct_frontiers_.fast_floor));
   const int floor_attempt=pct_candidate && !recovery?pct_candidate->attempt:0;
+  const bool ordinary_floor=floor_attempt &&
+      (detail=="pct_frontier" || detail=="pct_frontier_fast" || detail=="pct_frontier_review");
   const bool floor_search=floor_attempt && !recovery_.blocker_recovery_;
   const bool bounded_review=floor_attempt>1 && policy_.floor_review_started_ &&
       !policy_.cross_task_.engaged() && detail!="pct_floor_ascent_frontier";
@@ -302,22 +313,21 @@ bool ExplorationController::prepare_route(const XY &target,
     progress=pct_candidate->id?&pct_observation_progress_[pct_candidate->id]:&stair_route_progress_[key];
     const auto revision=pct_candidate->id?pct_candidate->revision:
         policy_.pct_frontiers_.geometry_version;
-    if(progress->revision!=revision || progress->observations!=pct_candidate->observations ||
+    if((pct_candidate->id && progress->revision!=revision) || progress->observations!=pct_candidate->observations ||
        progress->global!=policy_.pct_global_fallback_)
       *progress={revision,pct_candidate->observations,0,policy_.pct_global_fallback_};
+    progress->revision=revision;
     first_viewpoint=progress->next;
   }
   bool search_timed_out=false;
-  const bool stair_approach=detail=="pct_stair_approach";
-  const bool local_probe=stair_approach || detail=="pct_local_stair_probe" || detail=="pct_local_stair_return";
-  const bool stair_climb=detail=="pct_stair_climb" || detail=="pct_stair_step";
+  const bool stair_climb=detail=="pct_upward_support";
   const bool ascent_frontier=detail=="pct_floor_ascent_frontier";
-  const bool cross_layer_target=pct_candidate &&
-      (policy_.cross_task_.engaged() || stair_climb || detail=="pct_stair_landing");
+  const bool cross_layer_target=pct_candidate && !ordinary_floor &&
+      ((policy_.cross_task_.engaged() && policy_.cross_task_.phase()!="exploring_platform") || stair_climb);
   const bool stair_segment=options_.floor_exploration_ && (cross_layer_target || ascent_frontier) && !platform_floor;
-  const auto departure_height=stair_climb?policy_.floor_height_:std::nullopt;
-  const double minimum_travel=stair_approach?options_.observation_goal_xy_tolerance_:
-      (cross_layer_target || local_probe || ascent_frontier)?cross_layer_minimum_travel():options_.observation_min_distance_;
+  const auto departure_height=(stair_climb || ascent_frontier)?policy_.floor_height_:std::nullopt;
+  const double minimum_travel=(cross_layer_target || ascent_frontier)?
+      cross_layer_minimum_travel():options_.observation_min_distance_;
   const XY current_xy{(*base_)[0],(*base_)[1]};
   for (std::size_t i = first_viewpoint; i < viewpoints.size() && attempted_viewpoints<(floor_attempt?3u:12u); ++i) {
     if(pct_candidate && pct_round_deadline_>0. && wall_now()>=pct_round_deadline_) {
@@ -342,7 +352,7 @@ bool ExplorationController::prepare_route(const XY &target,
     goal.layer_version = shared_layer_?shared_layer_->current_version.load():layer_version_;
     goal.target = target;
     goal.observation = viewpoints[i];
-    goal.mode=stair_short_action?ExplorationMode::recovery:
+    goal.mode=stair_short_action?ExplorationMode::recovery:ordinary_floor?ExplorationMode::flat:
         stair_climb?ExplorationMode::cross_layer:control_mode_;
     if(platform_floor) goal.pct_floor=platform_floor;
     if(bounded_review)goal.pct_planning_deadline=pct_round_deadline_;
@@ -351,6 +361,7 @@ bool ExplorationController::prepare_route(const XY &target,
     goal.recovery_request=recovery?request:RecoveryRequest::position;
     goal.collect_unknown_blockers=unknown_blockers!=nullptr;
     goal.stair_segment=stair_segment;
+    goal.require_observation=!stair_climb;
     goal.recovery_yaw=base_yaw_.value_or(0.0);
     if(recovery && (request==RecoveryRequest::position || request==RecoveryRequest::delegate))
       goal.xy_tolerance=options_.recovery_goal_xy_tolerance_;
@@ -408,6 +419,7 @@ bool ExplorationController::prepare_route(const XY &target,
           << ",\"observation_z\":" << (goal.observation_xyz?(*goal.observation_xyz)[2]:(*base_)[2])
           << ",\"candidate_map_version\":" << goal.candidate.map_version
           << ",\"selection_policy\":" << json_string(detail)
+          << ",\"observation_required\":" << (goal.require_observation?"true":"false")
           << ",\"floor_frontier_attempt\":" << floor_attempt
           << ",\"frontier_cluster_id\":" << (pct_candidate?pct_candidate->id:0)
           << ",\"selection_scope\":\"" << (pct_candidate?policy_.pct_frontiers_.scope:"recovery_or_occupancy") << "\""
@@ -499,24 +511,15 @@ bool ExplorationController::prepare_route(const XY &target,
     }
     std::vector<Point> ground_route;
     auto ascent_start=cross_ground_pose();
-    if((stair_climb || stair_segment || local_probe) && chosen->start_ground_z)
+    if((stair_climb || stair_segment) && chosen->start_ground_z)
       ascent_start[2]=*chosen->start_ground_z;
     if(ascent_frontier) {
       if(!chosen->start_ground_z || chosen->xyz.empty()) {
         reject_view(i);failure="stair_start_support_unavailable";continue;
       }
-      const double rise=chosen->xyz.back()[2]-options_.layer_body_height_-ascent_start[2];
-      if(rise<policy_.cross_task_.minimum_rise || rise>std::min(.16,shared_layer_->max_step_height)+1e-7) {
-        reject_view(i);failure="ascent_frontier_outside_step_range";continue;
-      }
-      std::vector<Point> observed_route=chosen->xyz;
-      for(auto &point:observed_route)point[2]-=options_.layer_body_height_;
-      if(const auto *reason=policy_.check_ascent(ascent_start,observed_route,std::nullopt,true)) {
-        reject_view(i);failure=reason;continue;
-      }
     }
     if(options_.cross_layer_enabled_ && pct_candidate && chosen->kind==PlannerKind::layer &&
-       !platform_floor && (!options_.floor_exploration_ || stair_climb || policy_.cross_task_.engaged())) {
+       !platform_floor && (!options_.floor_exploration_ || stair_climb || ascent_frontier || policy_.cross_task_.engaged())) {
       ground_route=chosen->xyz;
       for(auto &p:ground_route)p[2]-=options_.layer_body_height_;
       if (const auto *reason = policy_.check_ascent(ascent_start, ground_route, departure_height, stair_climb)) {
@@ -565,7 +568,7 @@ bool ExplorationController::prepare_route(const XY &target,
       }
     }
     const RouteSelection selection{pct_candidate, detail, progress, planning_started, recovery,
-        local_probe, stair_approach, stair_segment, stair_climb, fast_floor, floor_attempt,
+        stair_segment, stair_climb, fast_floor, floor_attempt,
         platform_floor, departure_height};
     if (!accept_route(*chosen, selection, ascent_start, ground_route)) {
       reject_view(i);
@@ -600,10 +603,6 @@ bool ExplorationController::accept_route(
   if(selected_pct_ && (selected_pct_->id==0 || selection.stair_segment) && goal.observation_yaw)
     selected_pct_->observation_yaws={*goal.observation_yaw};
   selected_pct_observation_=selection.frontier?goal.observation_xyz:std::nullopt;
-  selected_local_stair_probe_=selection.local_probe;
-  selected_local_stair_return_=selection.detail=="pct_local_stair_return";
-  selected_stair_approach_=selection.stair_approach;
-  selected_stair_segment_=selection.stair_segment;
   selected_platform_frontier_=selection.platform_floor && selection.frontier && selection.frontier->id;
   selected_fast_floor_=selection.fast_floor;
   selected_floor_attempt_=selection.floor_attempt;
@@ -624,23 +623,18 @@ bool ExplorationController::accept_route(
         1000.*(wall_now()-selection.started));
   }
   if(!selection.recovery)control_mode_ = goal.mode;
-  const bool crossing=policy_.cross_task_.engaged() || policy_.cross_task_.deferred() ||
-      policy_.cross_task_.phase()=="repositioning";
   if(selection.platform_floor && !selection.recovery)policy_.cross_task_.exploring_platform((*selection.platform_floor)[0]);
-  if (policy_.adopt_ascent(ascent_start, ground_route, selection.departure_height,
-                           selection.stair_climb ? goal.observation_yaw : std::nullopt)) {
-    if(options_.floor_exploration_ && !crossing && !policy_.floor_ascent_)
-      shared_layer_->pct->observation_task(goal.layer_version,"begin_frontier_crossing",0,ascent_start);
+  const bool ordinary_floor=selection.floor_attempt &&
+      (selection.detail=="pct_frontier" || selection.detail=="pct_frontier_fast" ||
+       selection.detail=="pct_frontier_review");
+  if(ordinary_floor && policy_.cross_task_.engaged()) {
+    policy_.cross_task_.exploring_platform(policy_.floor_height_.value_or(ascent_start[2]));
+    policy_.cross_priority_pending_=false;
+    control_mode_=ExplorationMode::flat;
+  } else if (policy_.adopt_ascent(ascent_start, ground_route, selection.departure_height,
+                           selection.stair_climb ? goal.observation_yaw : std::nullopt,
+                           selection.detail=="pct_floor_ascent_frontier")) {
     control_mode_ = ExplorationMode::cross_layer;
-    policy_.floor_ascent_.reset();
-  } else if((selection.detail=="pct_local_stair_probe" || selection.detail=="pct_floor_ascent_frontier") &&
-            chosen.start_ground_z && !chosen.xyz.empty()) {
-    if(!crossing)
-      shared_layer_->pct->observation_task(goal.layer_version,"begin_frontier_crossing",0,ascent_start);
-    const auto &end=chosen.xyz.back();
-    const double bearing=std::atan2(end[1]-ascent_start[1],end[0]-ascent_start[0]);
-    const double yaw=selection.local_probe?goal.observation_yaw.value_or(bearing):bearing;
-    policy_.floor_ascent_=ExplorationPolicy::FloorAscent{ascent_start,yaw};
   }
   PlannedRoute sent_route;
   sent_route.points = path_processor_.waypoints();

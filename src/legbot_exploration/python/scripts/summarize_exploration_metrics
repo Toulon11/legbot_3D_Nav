@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Explicitly aggregate patent-metric trial files into one comparison.json."""
+import argparse
+import json
+from pathlib import Path
+from collections import defaultdict
+
+from legbot_exploration.benchmark_metrics import distribution, default_result_root
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('directory',nargs='?',default=str(default_result_root()))
+    args=parser.parse_args();root=Path(args.directory);groups=defaultdict(list);trial_count=0
+    for path in sorted(root.glob('*.json')):
+        try:value=json.loads(path.read_text())
+        except (OSError,ValueError):continue
+        if not isinstance(value,dict) or value.get('schema_version') not in (3,4):continue
+        meta=value.get('metadata',{})
+        if not meta.get('run_id') or 'metrics' not in value:continue
+        trial_count+=1
+        # Physical scene, coverage reference, and mission criterion must agree.
+        key=tuple(meta.get(k) for k in ('method','world_sha256','localization_source',
+            'reference_sha256','target_floor','start_floor_skip_option','source_sha256','single_floor'))
+        groups[key].append(value)
+    results=[]
+    for key,runs in groups.items():
+        valid=[r for r in runs if r.get('finalized') and r.get('started') and not r.get('partial_run')]
+        defined=[r for r in valid if r.get('mission_success') is not None]
+        attempts=sum(r['metrics']['upward_attempt_count'] for r in valid)
+        successes=sum(r['metrics']['upward_success_count'] for r in valid)
+        plan_attempts=sum(r['metrics']['planning_attempt_count'] for r in valid)
+        plan_successes=sum(r['metrics']['planning_success_count'] for r in valid)
+        results.append(dict(method=key[0],world_sha256=key[1],localization=key[2],target_floor=key[4],
+            reference_sha256=key[3],start_floor_skip_option=key[5],source_sha256=key[6],single_floor=key[7],
+            runs_found=len(runs),completed_full_trials=len(valid),
+            incomplete_runs=sum(not r.get('finalized') for r in runs),partial_runs=sum(bool(r.get('partial_run')) for r in runs),
+            mission_successes=sum(bool(r['mission_success']) for r in defined),mission_trials=len(defined),
+            mission_success_rate=None if not defined else sum(bool(r['mission_success']) for r in defined)/len(defined),
+            upward_attempt_count=attempts,upward_success_count=successes,
+            upward_success_percent=None if not attempts else 100.*successes/attempts,
+            planning_attempt_count=plan_attempts,planning_success_count=plan_successes,
+            planning_success_percent=None if not plan_attempts else 100.*plan_successes/plan_attempts,
+            # Distributions of per-run values are not pooled request-level percentiles.
+            per_run_metrics={name:distribution(r['metrics'][name] for r in valid if r['metrics'].get(name) is not None)
+                for name in ['reference_area_m2','observed_area_m2','coverage_percent','planning_mean_ms',
+                    'planning_p95_ms','upward_mean_sim_seconds','exploration_sim_seconds','exploration_wall_seconds']}))
+    root.mkdir(parents=True,exist_ok=True)
+    (root/'comparison.json').write_text(json.dumps(results,ensure_ascii=False,indent=2,allow_nan=False))
+    print(json.dumps(dict(trial_files=trial_count,groups=len(results),directory=str(root)),ensure_ascii=False))
+
+
+if __name__=='__main__':main()

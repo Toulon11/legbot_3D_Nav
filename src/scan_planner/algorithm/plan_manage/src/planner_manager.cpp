@@ -1,5 +1,6 @@
 // #include <fstream>
 #include <plan_manage/planner_manager.h>
+#include <plan_manage/bounded_sampling.h>
 #include <thread>
 
 namespace scan_planner
@@ -56,6 +57,9 @@ namespace scan_planner
     nh.param("manager/feasibility_tolerance", pp_.feasibility_tolerance_, 0.0);
     nh.param("manager/control_points_distance", pp_.ctrl_pt_dist, -1.0);
     nh.param("manager/planning_horizon", pp_.planning_horizon_, 5.0);
+    nh.param("manager/initialization_timeout", initialization_timeout_, .1);
+    if(!std::isfinite(initialization_timeout_) || initialization_timeout_<=0.)
+      initialization_timeout_=.1;
     nh.param("fsm/global_reference_mode", global_reference_mode_, std::string("piecewise_linear"));
 
     local_data_.traj_id_ = 0;
@@ -88,6 +92,7 @@ namespace scan_planner
          << endl;
 
     const double target_distance = (start_pt - local_target_pt).norm();
+    clearInitializationStatus();
     const bool short_segment = target_distance < 0.2;
     // Arrival belongs to the FSM/executor and its per-goal tolerance. A short
     // but unreached segment still needs an optimized, collision-checked path.
@@ -107,17 +112,24 @@ namespace scan_planner
     /*** STEP 1: INIT ***/
     double ts = (start_pt - local_target_pt).norm() > 0.1 ? pp_.ctrl_pt_dist / pp_.max_vel_ * 1.2 : pp_.ctrl_pt_dist / pp_.max_vel_ * 5; // pp_.ctrl_pt_dist / pp_.max_vel_ is too tense, and will surely exceed the acc/vel limits
     vector<Eigen::Vector3d> point_set, start_end_derivatives;
-    static bool flag_first_call = true, flag_force_polynomial = false;
+    const InitializationBudget init_budget(initialization_timeout_);
+    bool flag_force_polynomial = !have_goal_trajectory_ ||
+        trajectory_goal_stamp_ns_ != current_goal_stamp_ns_;
+    unsigned generation_attempts = 0;
     bool flag_regenerate = false;
     do
     {
+      if (++generation_attempts > 2 || init_budget.expired()) {
+        initialization_budget_exhausted_=true;
+        ROS_WARN("Local trajectory initialization timed out or exhausted fallback.");
+        continuous_failures_count_++; return false;
+      }
       point_set.clear();
       start_end_derivatives.clear();
       flag_regenerate = false;
 
-      if (short_segment || flag_first_call || flag_polyInit || flag_force_polynomial) // Short segments must not inherit a depleted previous spline.
+      if (short_segment || flag_polyInit || flag_force_polynomial)
       {
-        flag_first_call = false;
         flag_force_polynomial = false;
 
         PolynomialTraj gl_traj;
@@ -164,10 +176,12 @@ namespace scan_planner
         do
         {
           ts /= 1.5;
-          if (++sample_attempts > 24 || !std::isfinite(time) || !std::isfinite(ts) ||
+          if (++sample_attempts > init_budget.max_attempts || init_budget.expired() || !std::isfinite(time) || !std::isfinite(ts) ||
               ts < 1e-6 || time / ts > 20000)
           {
             ROS_WARN("Local polynomial sampling exceeded initialization bounds.");
+            initialization_budget_exhausted_=init_budget.expired() || sample_attempts>init_budget.max_attempts ||
+                (std::isfinite(time) && std::isfinite(ts) && (ts<1e-6 || time/ts>init_budget.max_samples));
             continuous_failures_count_++;
             return false;
           }
@@ -177,6 +191,11 @@ namespace scan_planner
           for (t = 0; t < time; t += ts)
           {
             Eigen::Vector3d pt = gl_traj.evaluate(t);
+            if (init_budget.expired() || !pt.allFinite()) {
+              initialization_budget_exhausted_=init_budget.expired();
+              ROS_WARN("Invalid or timed out polynomial initialization.");
+              continuous_failures_count_++; return false;
+            }
             if ((last_pt - pt).norm() > pp_.ctrl_pt_dist * 1.5)
             {
               flag_too_far = true;
@@ -195,81 +214,68 @@ namespace scan_planner
       else // Initial path generated from previous trajectory.
       {
 
-        double t;
-        double t_cur = (legbot::Time::now() - local_data_.start_time_).toSec();
-
-        vector<double> pseudo_arc_length;
-        vector<Eigen::Vector3d> segment_point;
-        pseudo_arc_length.push_back(0.0);
-        for (t = t_cur; t < local_data_.duration_ + 1e-3; t += ts)
-        {
-          segment_point.push_back(local_data_.position_traj_.evaluateDeBoorT(t));
-          if (t > t_cur)
-          {
-            pseudo_arc_length.push_back((segment_point.back() - segment_point[segment_point.size() - 2]).norm() + pseudo_arc_length.back());
+        const double t_cur = (legbot::Time::now() - local_data_.start_time_).toSec();
+        std::vector<Eigen::Vector3d> segment_point;
+        bool reusable = std::isfinite(t_cur) && t_cur >= 0. &&
+            std::isfinite(local_data_.duration_) && t_cur < local_data_.duration_-1e-6 &&
+            std::isfinite(ts) && ts >= 1e-6 &&
+            (local_data_.duration_-t_cur)/ts <= init_budget.max_samples;
+        double last_t = t_cur;
+        if (reusable) {
+          for (double t=t_cur; t<local_data_.duration_; t+=ts) {
+            if (init_budget.expired() || segment_point.size() >= init_budget.max_samples) {
+              reusable=false; break;
+            }
+            const auto pt=local_data_.position_traj_.evaluateDeBoorT(t);
+            if(!pt.allFinite()) { reusable=false; break; }
+            segment_point.push_back(pt);last_t=t;
           }
         }
-        t -= ts;
-
-        double poly_time = (local_data_.position_traj_.evaluateDeBoorT(t) - local_target_pt).norm() / pp_.max_vel_ * 2;
-        if (poly_time > ts)
-        {
-          PolynomialTraj gl_traj = PolynomialTraj::one_segment_traj_gen(local_data_.position_traj_.evaluateDeBoorT(t),
-                                                                        local_data_.velocity_traj_.evaluateDeBoorT(t),
-                                                                        local_data_.acceleration_traj_.evaluateDeBoorT(t),
-                                                                        local_target_pt, local_target_vel, Eigen::Vector3d::Zero(), poly_time);
-
-          for (t = ts; t < poly_time; t += ts)
-          {
-            if (!pseudo_arc_length.empty())
-            {
-              segment_point.push_back(gl_traj.evaluate(t));
-              pseudo_arc_length.push_back((segment_point.back() - segment_point[segment_point.size() - 2]).norm() + pseudo_arc_length.back());
-            }
-            else
-            {
-              ROS_ERROR("pseudo_arc_length is empty, return!");
-              continuous_failures_count_++;
-              return false;
+        if (reusable && segment_point.size() >= 2) {
+          const double poly_time=(segment_point.back()-local_target_pt).norm()/pp_.max_vel_*2.;
+          reusable=std::isfinite(poly_time) && poly_time/ts <= init_budget.max_samples;
+          if(reusable && poly_time > ts) {
+            const auto vel=local_data_.velocity_traj_.evaluateDeBoorT(last_t);
+            const auto acc=local_data_.acceleration_traj_.evaluateDeBoorT(last_t);
+            reusable=vel.allFinite() && acc.allFinite();
+            if(reusable) {
+              auto extension=PolynomialTraj::one_segment_traj_gen(segment_point.back(),
+                  vel,acc,local_target_pt,local_target_vel,Eigen::Vector3d::Zero(),poly_time);
+              for(double t=ts;t<poly_time;t+=ts) {
+                if(init_budget.expired() || segment_point.size()>=init_budget.max_samples) {
+                  reusable=false;break;
+                }
+                const auto pt=extension.evaluate(t);
+                if(!pt.allFinite()) { reusable=false;break; }
+                segment_point.push_back(pt);
+              }
             }
           }
+        } else reusable=false;
+        reusable = reusable && resampleInitialPolyline(segment_point,local_target_pt,
+            pp_.ctrl_pt_dist,init_budget,point_set);
+        if(reusable) {
+          start_end_derivatives={local_data_.velocity_traj_.evaluateDeBoorT(t_cur),
+              local_target_vel,local_data_.acceleration_traj_.evaluateDeBoorT(t_cur),
+              Eigen::Vector3d::Zero()};
+          for(const auto &d:start_end_derivatives)reusable=reusable && d.allFinite();
+          reusable=reusable && point_set.size() <= pp_.planning_horizon_/pp_.ctrl_pt_dist*3;
         }
-
-        double sample_length = 0;
-        double cps_dist = pp_.ctrl_pt_dist * 1.5; // cps_dist will be divided by 1.5 in the next
-        size_t id = 0;
-        do
-        {
-          cps_dist /= 1.5;
-          point_set.clear();
-          sample_length = 0;
-          id = 0;
-          while ((id <= pseudo_arc_length.size() - 2) && sample_length <= pseudo_arc_length.back())
-          {
-            if (sample_length >= pseudo_arc_length[id] && sample_length < pseudo_arc_length[id + 1])
-            {
-              point_set.push_back((sample_length - pseudo_arc_length[id]) / (pseudo_arc_length[id + 1] - pseudo_arc_length[id]) * segment_point[id + 1] +
-                                  (pseudo_arc_length[id + 1] - sample_length) / (pseudo_arc_length[id + 1] - pseudo_arc_length[id]) * segment_point[id]);
-              sample_length += cps_dist;
-            }
-            else
-              id++;
-          }
-          point_set.push_back(local_target_pt);
-        } while (point_set.size() < 7); // If the start point is very close to end point, this will help
-
-        start_end_derivatives.push_back(local_data_.velocity_traj_.evaluateDeBoorT(t_cur));
-        start_end_derivatives.push_back(local_target_vel);
-        start_end_derivatives.push_back(local_data_.acceleration_traj_.evaluateDeBoorT(t_cur));
-        start_end_derivatives.push_back(Eigen::Vector3d::Zero());
-
-        if (point_set.size() > pp_.planning_horizon_ / pp_.ctrl_pt_dist * 3) // The initial path is abnormally too long!
-        {
-          flag_force_polynomial = true;
-          flag_regenerate = true;
+        if(!reusable) {
+          ROS_WARN("Old spline expired, degenerate or over budget; use one polynomial fallback.");
+          flag_force_polynomial=true;
+          flag_regenerate=true;
         }
       }
     } while (flag_regenerate);
+
+    if(init_budget.expired() || point_set.size()<7 || start_end_derivatives.size()!=4 ||
+       !std::all_of(start_end_derivatives.begin(),start_end_derivatives.end(),
+                    [](const Eigen::Vector3d &v){return v.allFinite();})) {
+      ROS_WARN("Incomplete, non-finite or timed out trajectory initialization.");
+      initialization_budget_exhausted_=init_budget.expired();
+      continuous_failures_count_++;return false;
+    }
 
     applyLinearZReference(point_set, start_pt(2), local_target_pt(2));
 
@@ -334,6 +340,8 @@ namespace scan_planner
 
     // save planned results
     updateTrajInfo(pos, legbot::Time::now());
+    have_goal_trajectory_ = true;
+    trajectory_goal_stamp_ns_ = current_goal_stamp_ns_;
 
     cout << "total time:\033[42m" << (t_init + t_opt + t_refine).toSec() << "\033[0m,optimize:" << (t_init + t_opt).toSec() << ",refine:" << t_refine.toSec() << endl;
 

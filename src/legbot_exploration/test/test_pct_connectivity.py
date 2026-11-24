@@ -6,7 +6,8 @@ from legbot_exploration.fixed_layer_map import FixedLayerMap,MapSettings
 
 
 def tile_fixture():
-    m=FixedLayerMap(MapSettings(block_size=4,robot_radius=0.,safety_margin=0.))
+    m=FixedLayerMap(MapSettings(block_size=4,robot_radius=0.,safety_margin=0.,
+                               origin_z=.2,allow_open_ceiling=True))
     m.first_layer=0;m.last_layer=1
     m.lower=np.array([-8,-8]);m.upper=np.array([12,12])
     return m
@@ -15,6 +16,7 @@ def tile_fixture():
 def set_cell(m,key,safe=True,height=0.):
     row=m.cell(key,True)
     row['G']=height
+    row['C']=np.inf
     row['g_mature']=row['measured']=row['feature_valid']=True
     row['unknown']=row['solid']=False
     row['hard']=row['unknown_hard']=not safe

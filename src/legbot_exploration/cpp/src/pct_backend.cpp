@@ -1,6 +1,7 @@
 #include "legbot_exploration/pct_backend.hpp"
 #include <Python.h>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -64,6 +65,7 @@ struct PctBackend::Impl {
   std::size_t max_surfaces,max_cells,surface_records=0;
   std::vector<float> xyz;
   PyObject *backend=nullptr;
+  std::atomic<std::uint64_t> committed_resolved_floor_task{0};
   bool initialization_failed=false;
   std::string initialization_error;
   Impl(std::string path,double h,std::size_t records,std::size_t cells,std::string settings)
@@ -151,7 +153,9 @@ struct PctBackend::Impl {
 PctBackend::PctBackend(std::string root,double h,std::size_t records,std::size_t cells,std::string settings)
   :impl_(std::make_unique<Impl>(std::move(root),h,records,cells,std::move(settings))) {}
 PctBackend::~PctBackend()=default;
-void PctBackend::append(const std::vector<LayerPoint> &points,std::optional<Point> sensor_origin) {
+void PctBackend::append(const std::vector<LayerPoint> &points,std::optional<Point> sensor_origin,
+                        std::optional<double> body_height,const std::vector<LayerPoint> &free_ray_endpoints,
+                        std::optional<double> frontier_query_height) {
   Gil gil;
   try {
     impl_->ensure();
@@ -162,8 +166,15 @@ void PctBackend::append(const std::vector<LayerPoint> &points,std::optional<Poin
     }
     Object buffer(PyMemoryView_FromMemory(reinterpret_cast<char*>(xyz.data()),
         static_cast<Py_ssize_t>(xyz.size()*sizeof(float)),PyBUF_READ));
-    Object answer(buffer.p?(sensor_origin?
-        PyObject_CallMethod(impl_->backend,"integrate","O(ddd)",buffer.p,(*sensor_origin)[0],(*sensor_origin)[1],(*sensor_origin)[2]):
+    std::vector<float> rays;rays.reserve(free_ray_endpoints.size()*3);
+    for(const auto &p:free_ray_endpoints)if(std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z))
+      rays.insert(rays.end(),{static_cast<float>(p.x),static_cast<float>(p.y),static_cast<float>(p.z)});
+    Object ray_buffer(PyMemoryView_FromMemory(reinterpret_cast<char*>(rays.data()),
+        static_cast<Py_ssize_t>(rays.size()*sizeof(float)),PyBUF_READ));
+    Object body(body_height?PyFloat_FromDouble(*body_height):Py_NewRef(Py_None));
+    Object query_height(frontier_query_height?PyFloat_FromDouble(*frontier_query_height):Py_NewRef(Py_None));
+    Object answer(buffer.p&&ray_buffer.p&&body.p&&query_height.p?(sensor_origin?
+        PyObject_CallMethod(impl_->backend,"integrate","O(ddd)OOO",buffer.p,(*sensor_origin)[0],(*sensor_origin)[1],(*sensor_origin)[2],body.p,ray_buffer.p,query_height.p):
         PyObject_CallMethod(impl_->backend,"integrate","O",buffer.p)):nullptr);
     if(!answer.p) throw std::runtime_error(python_error());
     impl_->surface_records=PyLong_AsSize_t(answer.p);
@@ -178,6 +189,10 @@ bool PctBackend::refresh(std::uint64_t version) {
   Gil gil;
   try {
     Object answer(impl_->call("commit_pending",version,Point{}));
+    if(!answer.p)throw std::runtime_error(python_error());
+    const auto resolved=PyLong_AsUnsignedLongLong(answer.p);
+    if(PyErr_Occurred())throw std::runtime_error(python_error());
+    if(resolved)impl_->committed_resolved_floor_task.store(resolved);
     Object metrics(PyObject_GetAttrString(impl_->backend,"metadata"));
     Object json(PyImport_ImportModule("json"));
     Object encoded(metrics.p && json.p?PyObject_CallMethod(json.p,"dumps","O",metrics.p):nullptr);
@@ -354,6 +369,7 @@ PctFrontiers PctBackend::frontiers(std::uint64_t version,const Point &base,doubl
     if(auto *v=PyDict_GetItemString(answer.p,"unreachable_observers"))out.unreachable_observers=PyLong_AsSize_t(v);
     if(auto *v=PyDict_GetItemString(answer.p,"query_ms"))out.query_ms=PyFloat_AsDouble(v);
     if(auto *v=PyDict_GetItemString(answer.p,"query_pending"))out.query_pending=PyObject_IsTrue(v);
+    if(auto *v=PyDict_GetItemString(answer.p,"support_query_pending"))out.support_query_pending=PyObject_IsTrue(v);
     if(auto *v=PyDict_GetItemString(answer.p,"query_checked_clusters"))out.query_checked_clusters=PyLong_AsSize_t(v);
     if(auto *v=PyDict_GetItemString(answer.p,"observer_prepare_ms"))out.observer_prepare_ms=PyFloat_AsDouble(v);
     if(auto *phases=PyDict_GetItemString(answer.p,"observer_phase_ms")) {
@@ -361,7 +377,6 @@ PctFrontiers PctBackend::frontiers(std::uint64_t version,const Point &base,doubl
       PyObject *key,*value;Py_ssize_t at=0;
       while(PyDict_Next(phases,&at,&key,&value))out.observer_phase_ms[PyUnicode_AsUTF8(key)]=PyFloat_AsDouble(value);
     }
-    if(auto *v=PyDict_GetItemString(answer.p,"pending_stair_candidates"))out.pending_stair_candidates=PyLong_AsSize_t(v);
     if(auto *v=PyDict_GetItemString(answer.p,"observer_geometry_ms"))out.observer_geometry_ms=PyFloat_AsDouble(v);
     if(auto *v=PyDict_GetItemString(answer.p,"observer_visibility_ms"))out.observer_visibility_ms=PyFloat_AsDouble(v);
     if(auto *v=PyDict_GetItemString(answer.p,"scope"))out.scope=PyUnicode_AsUTF8(v);
@@ -377,6 +392,10 @@ PctFrontiers PctBackend::frontiers(std::uint64_t version,const Point &base,doubl
     if(auto *v=PyDict_GetItemString(answer.p,"fast_skipped_cells"))out.fast_skipped_cells=PyLong_AsSize_t(v);
     if(auto *v=PyDict_GetItemString(answer.p,"small_skipped_clusters"))out.small_skipped_clusters=PyLong_AsSize_t(v);
     if(auto *v=PyDict_GetItemString(answer.p,"small_skipped_cells"))out.small_skipped_cells=PyLong_AsSize_t(v);
+    if(auto *v=PyDict_GetItemString(answer.p,"low_yield_deferred_clusters"))out.low_yield_deferred_clusters=PyLong_AsSize_t(v);
+    if(auto *v=PyDict_GetItemString(answer.p,"low_yield_deferred_cells"))out.low_yield_deferred_cells=PyLong_AsSize_t(v);
+    if(auto *v=PyDict_GetItemString(answer.p,"global_first_after_local_failure_clusters"))out.global_first_after_local_failure_clusters=PyLong_AsSize_t(v);
+    if(auto *v=PyDict_GetItemString(answer.p,"global_first_after_local_failure_cells"))out.global_first_after_local_failure_cells=PyLong_AsSize_t(v);
     for(auto entry:{std::make_pair("no_view_clusters",&out.no_view_clusters),
                     std::make_pair("timed_out_clusters",&out.observer_timeout_clusters)}) {
       auto *rows=PyDict_GetItemString(answer.p,entry.first);
@@ -385,32 +404,25 @@ PctFrontiers PctBackend::frontiers(std::uint64_t version,const Point &base,doubl
       for(Py_ssize_t i=0;i<PyList_Size(rows);++i)
         entry.second->push_back(PyLong_AsUnsignedLongLong(PyList_GetItem(rows,i)));
     }
-    if(auto *v=PyDict_GetItemString(answer.p,"stair_flights"))out.stair_flights=PyLong_AsSize_t(v);
-    if(auto *v=PyDict_GetItemString(answer.p,"stair_step_unsafe"))out.stair_step_unsafe=PyLong_AsSize_t(v);
-    if(auto *v=PyDict_GetItemString(answer.p,"stair_index_ms"))out.stair_index_ms=PyFloat_AsDouble(v);
-    if(auto *v=PyDict_GetItemString(answer.p,"stair_platform_visible"))out.stair_platform_visible=PyObject_IsTrue(v);
     if(auto *map=PyDict_GetItemString(answer.p,"map");map && PyDict_Check(map))
       if(auto *revision=PyDict_GetItemString(map,"geometry_version"))
         out.geometry_version=PyLong_AsUnsignedLongLong(revision);
     out.unknown_blockers=read_unknown_blockers(answer.p,out.version);
-    for(auto entry:{std::make_pair("stair_targets",&out.stair_targets),
-                    std::make_pair("stair_step_targets",&out.stair_step_targets),
-                    std::make_pair("saved_stair_entrances",&out.saved_stair_entrances),
-                    std::make_pair("stair_landing_targets",&out.stair_landing_targets)}) {
+    for(auto entry:{std::make_pair("upward_support_targets",&out.upward_support_targets)}) {
       auto *rows=PyDict_GetItemString(answer.p,entry.first);
       if(!rows) continue;
-      if(!PyList_Check(rows)) throw std::runtime_error("invalid PCT stair views");
+      if(!PyList_Check(rows)) throw std::runtime_error("invalid PCT support views");
       for(Py_ssize_t i=0;i<PyList_Size(rows);++i) {
         auto *row=PyList_GetItem(rows,i);
         if(!PyList_Check(row) || PyList_Size(row)<4 || PyList_Size(row)>6)
-          throw std::runtime_error("invalid PCT stair view");
+          throw std::runtime_error("invalid PCT support view");
         std::array<double,4> values;
         for(std::size_t j=0;j<values.size();++j) {
           values[j]=PyFloat_AsDouble(PyList_GetItem(row,j));
-          if(PyErr_Occurred() || !std::isfinite(values[j])) throw std::runtime_error("invalid PCT stair view");
+          if(PyErr_Occurred() || !std::isfinite(values[j])) throw std::runtime_error("invalid PCT support view");
         }
         const auto evidence=PyList_Size(row)>=5?PyLong_AsUnsignedLongLong(PyList_GetItem(row,4)):0;
-        if(PyErr_Occurred())throw std::runtime_error("invalid PCT stair evidence");
+        if(PyErr_Occurred())throw std::runtime_error("invalid PCT support evidence");
         entry.second->push_back({{values[0],values[1],values[2]},values[3],evidence});
       }
     }
@@ -465,52 +477,6 @@ PctFrontiers PctBackend::frontiers(std::uint64_t version,const Point &base,doubl
   }
   return out;
 }
-PctStairProbe PctBackend::floor_stair_probe(
-    std::uint64_t version,const Point &base,const XY &floor,double yaw,bool depart,bool review,
-    double tolerance) {
-  PctStairProbe out;
-  Gil gil;
-  try {
-    impl_->ensure();
-    Object buffer(PyBytes_FromStringAndSize("",0));
-    Object answer(PyObject_CallMethod(impl_->backend,"floor_stair_probe","OK(ddd)(dd)dOOd",buffer.p,
-        static_cast<unsigned long long>(version),base[0],base[1],base[2],floor[0],floor[1],yaw,
-        depart?Py_True:Py_False,review?Py_True:Py_False,tolerance));
-    if(!answer.p)throw std::runtime_error(python_error());
-    auto *ready=PyDict_GetItemString(answer.p,"ready");
-    out.active=PyDict_GetItemString(answer.p,"active")==Py_True;
-    out.finished=PyDict_GetItemString(answer.p,"finished")==Py_True;
-    out.returning=PyDict_GetItemString(answer.p,"returning")==Py_True;
-    out.approaching=PyDict_GetItemString(answer.p,"approaching")==Py_True;
-    out.climbing=PyDict_GetItemString(answer.p,"climbing")==Py_True;
-    if(auto *reason=PyDict_GetItemString(answer.p,"reason"))out.reason=PyUnicode_AsUTF8(reason);
-    Object json(PyImport_ImportModule("json"));
-    Object encoded(json.p?PyObject_CallMethod(json.p,"dumps","O",answer.p):nullptr);
-    if(!encoded.p)throw std::runtime_error(python_error());
-    out.metadata=PyUnicode_AsUTF8(encoded.p);
-    auto *points=PyDict_GetItemString(answer.p,"observations");
-    auto *headings=PyDict_GetItemString(answer.p,"yaws");
-    if(ready==Py_True && points && headings && PyList_Check(points) && PyList_Check(headings) &&
-       PyList_Size(points)==PyList_Size(headings)) {
-      out.frontier.revision=version;
-      for(Py_ssize_t i=0;i<PyList_Size(points);++i) {
-        auto *row=PyList_GetItem(points,i);
-        if(!PySequence_Check(row) || PySequence_Size(row)!=3)throw std::runtime_error("invalid PCT stair pose");
-        Point p;
-        for(int j=0;j<3;++j) {Object v(PySequence_GetItem(row,j));p[j]=PyFloat_AsDouble(v.p);}
-        const double heading=PyFloat_AsDouble(PyList_GetItem(headings,i));
-        if(PyErr_Occurred() || !std::isfinite(heading) ||
-           !std::all_of(p.begin(),p.end(),[](double v){return std::isfinite(v);}))
-          throw std::runtime_error("invalid PCT stair pose");
-        out.frontier.observations.push_back(p);out.frontier.observation_yaws.push_back(heading);
-      }
-      if(!out.frontier.observations.empty())out.frontier.frontier=out.frontier.observations.front();
-    }
-    impl_->error.clear();
-  } catch(const std::exception &e) {PyErr_Clear();impl_->error=e.what();}
-  return out;
-}
-
 bool PctBackend::complete_observation(std::uint64_t version,const PctFrontier &frontier,const Point &point) {
   Gil gil;
   try {
@@ -522,12 +488,53 @@ bool PctBackend::complete_observation(std::uint64_t version,const PctFrontier &f
     impl_->error.clear();return true;
   } catch(const std::exception &e) {PyErr_Clear();impl_->error=e.what();return false;}
 }
+bool PctBackend::refresh_frontier_displays(std::uint64_t version,std::vector<PctFrontier> &clusters) {
+  Gil gil;
+  try {
+    impl_->ensure();Object groups(PyList_New(0));
+    for(const auto &cluster:clusters) {
+      Object points(PyList_New(0));
+      for(const auto &p:cluster.display) {
+        Object point(Py_BuildValue("(ddd)",p[0],p[1],p[2]));
+        if(!point.p || PyList_Append(points.p,point.p)<0)throw std::runtime_error(python_error());
+      }
+      Object group(Py_BuildValue("(KO)",static_cast<unsigned long long>(cluster.id),points.p));
+      if(!group.p || PyList_Append(groups.p,group.p)<0)throw std::runtime_error(python_error());
+    }
+    Object answer(PyObject_CallMethod(impl_->backend,"refresh_frontier_displays","KO",
+        static_cast<unsigned long long>(version),groups.p));
+    if(!answer.p || !PyList_Check(answer.p) || PyList_Size(answer.p)!=static_cast<Py_ssize_t>(clusters.size()))
+      throw std::runtime_error("invalid current frontier displays");
+    std::vector<std::vector<Point>> refreshed;
+    for(Py_ssize_t i=0;i<PyList_Size(answer.p);++i) {
+      auto *rows=PyList_GetItem(answer.p,i);std::vector<Point> points;
+      if(!PyList_Check(rows))throw std::runtime_error("invalid current frontier display");
+      for(Py_ssize_t j=0;j<PyList_Size(rows);++j) {
+        auto *row=PyList_GetItem(rows,j);Point p;
+        if(!PyList_Check(row) || PyList_Size(row)!=3)throw std::runtime_error("invalid frontier point");
+        for(int k=0;k<3;++k) {
+          p[k]=PyFloat_AsDouble(PyList_GetItem(row,k));
+          if(PyErr_Occurred() || !std::isfinite(p[k]))throw std::runtime_error("invalid frontier coordinate");
+        }
+        points.push_back(p);
+      }
+      refreshed.push_back(std::move(points));
+    }
+    for(std::size_t i=0;i<clusters.size();++i)clusters[i].display=std::move(refreshed[i]);
+    impl_->error.clear();return true;
+  }catch(const std::exception &e){PyErr_Clear();impl_->error=e.what();return false;}
+}
+
 PctObservation PctBackend::observation_task(std::uint64_t version,const std::string &operation,
     std::uint64_t cluster,const Point &point,double yaw,double half_angle,
     const std::vector<PctUnknownBlocker> *blockers) {
   PctObservation out;Gil gil;
   try {
     impl_->ensure();Object buffer(PyBytes_FromStringAndSize("",0));
+    // Reusing a cluster for a fresh attempt must not inherit an old completion.
+    if(operation=="floor_attempt" || operation=="floor_recovery_attempt" ||
+       operation=="begin_flat" || operation=="begin_floor" || operation=="begin_forward")
+      impl_->committed_resolved_floor_task.store(0);
     Object gaps(blockers?PyList_New(0):Py_NewRef(Py_None));
     if(!gaps.p)throw std::runtime_error(python_error());
     if(blockers)for(const auto &entry:*blockers) {
@@ -685,4 +692,7 @@ PctInspection PctBackend::inspect(std::uint64_t version,const Point &base,bool d
 std::size_t PctBackend::point_count() const{return impl_->surface_records;}
 const std::string &PctBackend::last_error() const{return impl_->error;}
 const std::string &PctBackend::map_metadata() const{return impl_->metadata;}
+bool PctBackend::committed_floor_task_resolved(std::uint64_t cluster) const {
+  return cluster && impl_->committed_resolved_floor_task.load()==cluster;
+}
 } // namespace legbot_exploration

@@ -35,6 +35,7 @@ void Astar::Init(const double cost_threshold, const int num_layers,
   blocked_edges_.clear();
   search_result_.clear();
   sparse_nodes_.clear();
+  sparse_aliases_.clear();
   resolution_ = resolution;
 
   max_x_ = cost_map.cols();
@@ -80,6 +81,7 @@ void Astar::Reset() {
   if (reader_) {
     search_result_.clear();
     sparse_nodes_.clear();
+    sparse_aliases_.clear();
     return;
   }
   for (size_t i = 0; i < grid_map_.size(); ++i) {
@@ -102,9 +104,23 @@ void Astar::InitAccessor(double threshold, int layers, int rows, int columns,
 
 void Astar::InitSurfaceAccessor(double threshold, int layers, int rows, int columns,
                                double resolution, double weight, SurfaceCellReader reader) {
+  InitIntervalAccessor(threshold,layers,rows,columns,resolution,weight,
+    [reader=std::move(reader)](int layer,int row,int column) {
+      const auto [cost,ground,gateway,identity]=reader(layer,row,column);
+      return std::make_tuple(cost,ground,gateway,identity,
+                             std::numeric_limits<double>::infinity(),ground,-1);
+    });
+  passage_clearance_=0.;
+  interval_accessor_=false;
+}
+
+void Astar::InitIntervalAccessor(double threshold, int layers, int rows, int columns,
+                                double resolution, double weight, IntervalCellReader reader) {
+  interval_accessor_=true;
   timed_out_ = false;
   search_result_.clear();
   sparse_nodes_.clear();
+  sparse_aliases_.clear();
   grid_map_.clear();
   cost_threshold_ = threshold;
   max_layers_ = layers; max_y_ = rows; max_x_ = columns;
@@ -122,16 +138,26 @@ Node* Astar::NodeAt(int layer, int row, int column) const {
   const auto key = GetHash(Eigen::Vector3i(layer, row, column));
   auto found = sparse_nodes_.find(key);
   if (found != sparse_nodes_.end()) return found->second.get();
-  const auto [cost, ground, gateway, surface_id] = reader_(layer, row, column);
+  const auto alias=sparse_aliases_.find(key);
+  if(alias!=sparse_aliases_.end())return sparse_nodes_.at(alias->second).get();
+  const auto [cost, ground, gateway, surface_id, ceiling, center, owner] = reader_(layer, row, column);
+  const auto physical=owner>=0?GetHash(Eigen::Vector3i(owner,row,column)):key;
+  if(physical!=key) {
+    sparse_aliases_[key]=physical;
+    found=sparse_nodes_.find(physical);
+    if(found!=sparse_nodes_.end())return found->second.get();
+  }
   auto node = std::make_unique<Node>(Eigen::Vector3i(
       static_cast<int>(ground / resolution_), row, column), nullptr);
   node->cost = cost;
   node->height = ground;
+  node->ceiling=ceiling;
+  node->interval_center=center;
   node->ele = gateway;
-  node->layer = layer;
+  node->layer = owner>=0?owner:layer;
   node->surface_id = surface_id;
   auto* result = node.get();
-  sparse_nodes_.emplace(key, std::move(node));
+  sparse_nodes_.emplace(physical, std::move(node));
   return result;
 }
 
@@ -141,6 +167,8 @@ std::int64_t Astar::GetHash(const Eigen::Vector3i& idx) const {
 }
 
 std::int64_t Astar::VisitKey(const Node* node) const {
+  if(interval_accessor_ && node->surface_id>0)
+    return GetHash(Eigen::Vector3i(static_cast<int>(node->surface_id),node->idx[1],node->idx[2]));
   if (node->surface_id < 0) return GetHash(node->idx);
   return GetHash(Eigen::Vector3i(node->layer, node->idx[1], node->idx[2]));
 }
@@ -269,11 +297,35 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
       }
       // 获取邻居节点（基于当前层layer），这个节点在grid_map中会被赋予权重，即costmap的cost
       auto neighbor_node = NodeAt(layer,i,j);
+      const bool measured = reader_ && surface_step_limit_ > 0.;
+      const auto supported_edge = [&](const Node* node) {
+        return node->cost >= 0. && node->cost <= cost_threshold_ &&
+               std::abs(node->height - current_node->height) <= surface_step_limit_ + 1e-5 &&
+               (passage_clearance_<=0. ||
+                std::min(node->ceiling,current_node->ceiling)-
+                  std::max(node->height,current_node->height)+1e-7>=passage_clearance_);
+      };
+      // Sparse measured cuts need no duplicated tread cells at a seam.
+      // A horizontal move may end on the adjacent cut's actual support.
+      const bool missing = neighbor_node->cost >= 1e6;
+      const bool other_surface = std::abs(neighbor_node->height - current_node->height) >
+                                 surface_step_limit_ + 1e-5;
+      if (measured && (missing || other_surface)) {
+        for (const int next_layer : {layer - 1, layer + 1}) {
+          if (next_layer < 0 || next_layer >= max_layers_) continue;
+          auto* candidate = NodeAt(next_layer, i, j);
+          if (supported_edge(candidate) &&
+              (!missing || std::abs(candidate->height - current_node->height) > 1e-5) &&
+              (!supported_edge(neighbor_node) || candidate->cost < neighbor_node->cost)) {
+            neighbor_node = candidate;
+          }
+        }
+      }
 
       // 检查邻居节点是否可通行
-      if (neighbor_node->cost > cost_threshold_ &&
+      if ((measured && !supported_edge(neighbor_node)) || (!measured && neighbor_node->cost > cost_threshold_ &&
           (abs(neighbor_node->ele) < 0.5 ||
-           std::abs(neighbor_node->height - current_node->height) > 0.3)) {
+           std::abs(neighbor_node->height - current_node->height) > 0.3))) {
         if (blocked_edge_radius_ > 0 && blocked_edges_.size() < 256 &&
             std::hypot(double(i) - start[2], double(j) - start[1]) <= blocked_edge_radius_ &&
             (double(i) - start[2]) * (double(goal[2]) - start[2]) +
@@ -337,6 +389,9 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
 
 
 int Astar::DecideLayer(const Node* cur_node) const {
+  // Interval queries all borrow the same owner's costs and identity. There
+  // is no alternate representation to optimize at this XY.
+  if(interval_accessor_)return cur_node->layer;
   int original_layer = cur_node->layer;  // 初始图层（默认返回值）
   int i = cur_node->idx[1];
   int j = cur_node->idx[2];

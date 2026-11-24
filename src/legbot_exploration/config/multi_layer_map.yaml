@@ -1,33 +1,27 @@
 /online_layer_map:
   ros__parameters:
     pct_mapping_mode: static           # Only static mapping is currently supported.
+    pct_allow_open_ceiling: true       # Admit a top passage only with sufficient measured ray clearance.
+    pct_open_ceiling_share_height: 5.0 # Additional height cap; actual C_clear limits interval sharing.
     pct_block_size: 32                 # Existing blocks never resize.
     pct_slice_update_workers: 0      # Auto: serial for small batches, up to 4 workers otherwise. Set 1 for serial replay.
-    # Sensor-origin XYZ range used ONLY for PCT surface evidence; 0 permits offline full-map fixtures.
+    # Paired sensor range for returns and free-ray evidence; 0 permits finite-interval offline imports.
     pct_reliable_observation_range: 5.0
     cloud_sensor_odom_topic: /slam/odometry_lidar
     auxiliary_sensor_odom_topic: /ground_lidar/odometry_lidar
     pct_maturity_min_points: 3         # Same frame or accumulated frames.
     pct_surface_noise_tolerance: 0.05  # Same-column matching and near-ground noise band, in metres.
-    pct_new_height_threshold: 0.10     # New measured support height triggers one local evidence review.
-    # Temporary normals of real frame points; no inferred/fitted ground is added.
-    pct_surface_normal_radius: 0.25
-    pct_surface_normal_min_points: 6
-    pct_surface_normal_vertical: 0.5
-    pct_surface_normal_thickness: 0.03
+    pct_new_height_threshold: 0.10     # Register a newly visited measured height; never clear map cells.
     pct_planning_budget_seconds: 1.5  # Total native search time for one endpoint request, all anchor pairs.
     pct_observation_revisit_radius: 1.0 # Suppress similar completed same-surface views until relevant new evidence.
     pct_floor_min_resolved_frontier_cells: 5 # Also require 10% of covered cells; capped by actual view coverage.
     pct_fast_exploration: true              # Prioritize useful ordinary floor observations and allow partial coverage.
-    pct_fast_min_visible_cells: 3           # Minimum number visible from the candidate pose and yaw.
+    pct_fast_min_visible_cells: 3           # Local/full task scope accounting; never excludes a first-pass view.
     pct_floor_failed_small_cluster_max_cells: 2 # Track small tasks removed after an unsuccessful review.
-    pct_floor_global_review_enabled: true
+    pct_floor_global_review_enabled: false
     pct_floor_four_direction_search: true  # One observation stance per quadrant on the first ordinary attempt.
     pct_floor_direction_search_timeout_seconds: 1.5 # Cumulative observation search work per ordinary cluster.
-    pct_landing_support_radius: 0.60   # Support radius used to rank interior staging poses, in metres.
-    pct_landing_min_area: 1.50         # Connected measured platform area in square metres.
-    pct_landing_min_width: 0.80        # Continuous level width across the ascent, in metres.
-    pct_landing_min_depth: 1.00        # Continuous level depth along the ascent, in metres.
+    pct_ascent_lookahead_slices: 3       # Rank this many upward cuts, execute targets from only one at a time.
     # Initial trial values; calibrate against registered-cloud noise.
     pct_relief_update_threshold: 0.25
     pct_terrain_update_threshold: 0.25
@@ -39,15 +33,15 @@
     pct_origin_x: 0.0
     pct_origin_y: 0.0
     pct_origin_z: 0.0
-    pct_min_clearance: 0.50
+    pct_column_continuity_threshold: 0.10 # Consecutive measured heights form occupied intervals.
+    pct_min_clearance: 0.50            # Passage admission; independent of the continuity threshold.
     pct_desired_clearance: 0.55
     pct_max_map_cells: 20000000         # Fail explicitly rather than allocating unbounded dense grids.
     use_sim_time: true
     frame_id: map
     cloud_topic: /slam/global_cloud_registered
     base_odom_topic: /slam/global_odometry_base
-    # PCT's horizontal grid and height slices are separate.  The surface
-    # height remains a measured value and is not rounded to slice_height.
+    # Sparse compatibility address spacing; actual node_z is an interval midpoint.
     xy_resolution: 0.10
     slice_height: 0.50
     max_slope_radians: 0.40

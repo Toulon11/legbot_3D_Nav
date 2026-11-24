@@ -28,6 +28,7 @@ from visualization_msgs.msg import Marker
 
 
 def main():
+    budget_test='--init-budget' in sys.argv
     rclpy.init()
     node = rclpy.create_node('near_goal_regression')
     statuses, failures, acks, commands, forwarded = [], [], [], [], []
@@ -124,13 +125,22 @@ def main():
                '-p', 'fsm.manual_goal_use_message_z:=true',
                '-r', '/grid_map/body_pose:=/near_goal_test/odom',
                '-r', '/grid_map/sensor_pose:=/near_goal_test/odom',
-               '-r', '/planning/bspline:=/scan/planning/bspline'])
+               '-r', '/planning/bspline:=/scan/planning/bspline']+
+              (['-p','manager.initialization_timeout:=0.000000001'] if budget_test else []))
         start([str(coordinator), '--mode', 'direct', '--input-topic', '/scan/waypoint_input',
                '--frame-id', 'map', '--odom-topic', '/near_goal_test/odom',
                '--output', str(statefile), '--reach-xy', '0.4', '--reach-z', '0.25',
                '--dwell-seconds', '0.30'])
         wait(lambda: odom.get_subscription_count() >= 3 and request.get_subscription_count() > 0)
         pump(1.2)  # FSM startup sleeps for one second before spinning callbacks.
+        if budget_test:
+            stamp=send(.6,.15)
+            wait(lambda:any(m.data==str(stamp)+'|initialization_budget_exhausted' for m in failures))
+            pump(.2)
+            assert not any(ns(m.header.stamp)==stamp for m in acks)
+            assert commands and abs(commands[-1].linear.x)+abs(commands[-1].linear.y)+abs(commands[-1].angular.z)<1e-8
+            print('PASS initialization limit returns a distinct computational failure without moving')
+            return
         for distance, tolerance in ((.095, None), (.158, None), (0., None),
                                     (.399, None), (.149, .15), (0., .15)):
             stamp = send(distance, tolerance)
