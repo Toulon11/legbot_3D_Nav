@@ -86,6 +86,7 @@ namespace scan_planner
 
     bspline_pub_ = nh.advertise<scan_planner::msg::Bspline>("/planning/bspline", 10);
     goal_failure_pub_ = nh.advertise<std_msgs::msg::String>("/scan/goal_plan_failed", 10);
+    goal_failure_sub_ = nh.subscribe("/scan/goal_plan_failed",10,&SCANReplanFSM::goalFailureCallback,this);
     tolerance_status_pub_=nh.advertise<std_msgs::msg::String>("/scan/goal_tolerance_status",10);
     data_disp_pub_ = nh.advertise<scan_planner::msg::DataDisp>("/planning/data_display", 100);
     self_inflation_pub_ = nh.advertise<visualization_msgs::msg::Marker>("self_inflation", 10, true);
@@ -305,6 +306,29 @@ namespace scan_planner
       changeFSMExecState(WAIT_TARGET, "GLOBAL_PLAN_FAILURE");
       publishGoalFailure(failure_reason);
     }
+  }
+
+  void SCANReplanFSM::goalFailureCallback(const std_msgs::msg::String::ConstSharedPtr &msg)
+  {
+    // Execution timeouts also terminate planning ownership. Old receipts
+    // must never stop a newer navigation goal.
+    if(!msg || navi_mode_!=NAVI_MODE::MANUAL_TARGET || !active_goal_stamp_ns_)return;
+    const auto separator=msg->data.find('|');
+    if(separator==std::string::npos || separator==0)return;
+    std::uint64_t stamp=0;
+    try {
+      std::size_t used=0;stamp=std::stoull(msg->data.substr(0,separator),&used);
+      if(used!=separator || stamp!=active_goal_stamp_ns_)return;
+    } catch(const std::exception &) {return;}
+    if(!have_target_)return;
+    have_target_=false;have_new_target_=false;trigger_=false;
+    active_goal_failure_sent_=true;active_waypoints_.clear();request_reference_=false;
+    need_hover_stop_=false;replan_fail_count_=0;
+    callEmergencyStop(odom_pos_);
+    changeFSMExecState(WAIT_TARGET,"MATCHED_EXECUTION_FAILURE");
+    tolerance_status_pub_.publish(std_msgs::msg::String().set__data(
+        "{\"source\":\"planner\",\"event\":\"terminated\",\"stamp_ns\":"+
+        std::to_string(stamp)+",\"reason\":\"matched_execution_failure\"}"));
   }
 
   void SCANReplanFSM::publishGoalFailure(const char *reason)

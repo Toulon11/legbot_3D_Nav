@@ -123,7 +123,8 @@ class ColumnObstacleTest(unittest.TestCase):
         from legbot_exploration.block_pct import BlockPlanner
         m=mapping();floor(m)
         m.integrate([(0.,0.,z) for z in (.55,.9,1.25)],sensor_origin=(0.,0.,.2));m.build()
-        reader=BlockPlanner.__new__(BlockPlanner);reader.map=m;reader._read_blocks=set()
+        reader=BlockPlanner.__new__(BlockPlanner);reader.map=m;reader._read_blocks=set();reader._intervals=False
+        reader._dependency_tiles=set()
         result=reader._read(2-m.first_layer,-int(m.lower[0]),-int(m.lower[1]))
         self.assertEqual(result[0],50.)
         with patch.object(m,'iter_cells',side_effect=AssertionError('full map scan')), \

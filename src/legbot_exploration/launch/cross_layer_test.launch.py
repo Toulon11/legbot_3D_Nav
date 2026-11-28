@@ -34,7 +34,7 @@ def generate_launch_description():
                 'metrics_floors':'[{"name":"floor_1","height":0.0},{"name":"floor_2","height":1.46},'
                                  '{"name":"floor_3","height":2.96},{"name":"floor_4","height":4.43}]',
                 'metrics_target_floor':'floor_4',
-                'metrics_single_floor':'floor_2',
+                'metrics_single_floor':'',
                 'mission_return_home':'true',
                 'metrics_spawn_ground':'[-6.75,9.60,0.0]',
                 'world': LaunchConfiguration('world'),

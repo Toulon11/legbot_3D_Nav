@@ -48,7 +48,7 @@ std::optional<PctRecoveryAction> RecoveryController::next_action(
   auto action=task.delegation_started?std::nullopt:
       task.planner.next(snapshot,version,attitude,task.blockers,constraints,can_move,stance_clear,review,stop_tolerance);
   if(!action && task.planner.pending())return std::nullopt;
-  if(!action && (!task.cross_layer || task.unsafe_start)) {
+  if(!action && !task.navigation && (!task.cross_layer || task.unsafe_start)) {
     auto goals=task.cross_layer?std::vector<Point>{}:task.goal.observations;
     for(auto &point:goals)point[2]+=snapshot.body_height;
     if(task.unsafe_start || task.cross_layer || task.goal.observations.empty()) {
@@ -58,7 +58,8 @@ std::optional<PctRecoveryAction> RecoveryController::next_action(
       for(auto &point:alternatives)point[2]+=snapshot.body_height;
       goals.insert(goals.end(),alternatives.begin(),alternatives.end());
     }
-    action=task.planner.delegate(snapshot,version,constraints,goals,stop_tolerance);
+    action=task.planner.delegate(snapshot,version,constraints,goals,stop_tolerance,
+                                !task.unsafe_start && !task.goal.observations.empty());
   }
   return action;
 }
@@ -88,7 +89,16 @@ std::optional<std::uint64_t> ExplorationController::blocker_recovery_evidence(co
            (*base_)[1]+1.5*std::sin(policy_.cross_task_.ascent_yaw()),(*base_)[2]});
   for(const auto &blocker:task.blockers)include(blocker.point);
   for(const auto &point:task.goal.observations)include(point);
-  return shared_layer_->pct->recovery_evidence(version,low,high);
+  auto signature=shared_layer_->pct->recovery_evidence(version,low,high);
+  // A descending segment can be blocked below the base's height band.
+  // Include the actual missing supports, rather than only the current band.
+  for(const auto &blocker:task.blockers) {
+    Point point=blocker.point;point[2]+=options_.layer_body_height_;
+    const auto relevant=shared_layer_->pct->recovery_evidence(version,point,point);
+    if(!signature || !relevant)return std::nullopt;
+    *signature^=*relevant+0x9e3779b97f4a7c15ULL+(*signature<<6)+(*signature>>2);
+  }
+  return signature;
 }
 
 void ExplorationController::defer_cross_layer(const std::string &reason) {
@@ -354,6 +364,7 @@ bool ExplorationController::begin_blocker_recovery(const PctFrontier &goal,
   task.platform=platform;
   task.unsafe_start=start_failure.has_value();
   task.selection_policy=policy;
+  task.navigation=navigation_goal_.has_value() || std::string(policy)=="pct_home_start";
   task.floor_failure=blockers.empty()?"floor_disconnected":"floor_no_route";
   if(enqueue) {
     recovery_.postpone(std::move(task));
@@ -374,11 +385,12 @@ bool ExplorationController::begin_blocker_recovery(const PctFrontier &goal,
          blocker_recovery_evidence(old)==wait.geometry)return false;
     }
   }
-  recovery_.restore_attempts(base_, cross_layer || goal.observations.empty(), task);
+  recovery_.restore_attempts(base_, task.navigation || cross_layer || goal.observations.empty(), task);
   if(floor_attempt)
     shared_layer_->pct->observation_task(shared_layer_->current_version.load(),
                                         "floor_recovery_attempt",goal.id,*base_);
   recovery_.blocker_recovery_=std::move(task);
+  if(navigation_goal_)navigation_goal_->recovery_evidence=navigation_dependency(*navigation_goal_).evidence;
   report(cross_layer?"cross_layer_recovery":"pct_blocker_recovery",
       start_failure.value_or(blockers.empty()?
           (cross_layer?"no_forward_progress":"pct_route_disconnected"):"recorded_unknown_blocker"));
@@ -414,6 +426,14 @@ bool ExplorationController::resume_pending_blocker_recovery() {
 void ExplorationController::finish_blocker_recovery(const char *reason) {
   auto task=std::move(*recovery_.blocker_recovery_);
   recovery_.blocker_recovery_.reset();
+  if(task.navigation) {
+    if(navigation_goal_)navigation_goal_->blockers=task.blockers;
+    if(base_)recovery_.save_attempts(*base_,std::move(task.planner));
+    if(navigation_goal_)navigation_goal_->retry_at=wall_now()+2.;
+    if(navigation_goal_)defer_navigation_goal(reason);
+    else report("return_home_blocked",reason);
+    return;
+  }
   if(task.floor_attempt) {
     const auto &goal=task.goal;
     settle_unavailable_floor_cluster(goal.id,task.floor_failure,goal.observations.empty()?
@@ -462,6 +482,63 @@ void ExplorationController::run_blocker_recovery(double current) {
   const bool feet_stable=stable_four_foot_support(current);
   if(task.cross_layer)refresh_stair_heading(policy_.cross_task_.ascent_yaw());
   const Point ground=cross_ground_pose();
+  // Fresh passive returns can repair the origin without any recovery action.
+  // The same exit applies on stairs, including a stable multilevel stance.
+  if(!task.action && task.unsafe_start && task.goal.observations.empty() && pct.start_ready(version,*base_)) {
+    if(task.cross_layer)pct.observation_task(version,"refresh_ascent_search",0,*base_);
+    recovery_.save_attempts(*base_,std::move(task.planner));
+    recovery_.blocker_recovery_.reset();policy_.cross_priority_pending_=true;
+    report("pct_blocker_start_recovered","fresh_measured_support");return;
+  }
+  if(!task.action && !task.blockers.empty()) {
+    const auto before=task.blockers.size();
+    task.blockers.erase(std::remove_if(task.blockers.begin(),task.blockers.end(),[&](const auto &blocker) {
+      const auto &p=blocker.point;
+      const auto state=pct.observation_task(version,"blocker_state",0,{p[0],p[1],p[2]+options_.layer_body_height_});
+      return state.reason=="blocker_resolved" || state.reason=="blocker_known_obstacle";
+    }),task.blockers.end());
+    if(task.blockers.size()!=before) {
+      RCLCPP_INFO(logger_,"Recovery blockers refreshed: %zu -> %zu",before,task.blockers.size());
+      if(task.cross_layer) {
+        policy_.pct_frontiers_.unknown_blockers=task.blockers;
+        pct.observation_task(version,"refresh_ascent_search",0,*base_);
+      }
+      if(task.blockers.empty() && (!task.unsafe_start || pct.start_ready(version,*base_))) {
+        // Empty review candidates do not prove that the original stopping
+        // disk is usable. Reapply its exact arrival policy before reopening.
+        PctObservation arrival;
+        bool evidence_changed=false;
+        if(task.navigation && navigation_goal_ && !navigation_goal_->target.observations.empty()) {
+          const auto signature=navigation_dependency(*navigation_goal_).evidence;
+          evidence_changed=signature && navigation_goal_->recovery_evidence &&
+              signature!=navigation_goal_->recovery_evidence;
+          const auto &goal=navigation_goal_->target;
+          auto endpoint=goal.observations.front();endpoint[2]+=options_.layer_body_height_;
+          const double heading=goal.observation_yaws.empty()?0.:goal.observation_yaws.front();
+          const bool observation=navigation_goal_->policy!="pct_return_home" &&
+              navigation_goal_->policy!="pct_upward_support";
+          arrival=observation?pct.arrival_area(version,endpoint,options_.observation_goal_xy_tolerance_,heading):
+              pct.observation_task(version,"navigation_arrival",0,endpoint,heading,
+                                   options_.observation_goal_xy_tolerance_);
+          navigation_goal_->blockers=arrival.unknown_blockers;
+        } else arrival.ready=true;
+        recovery_.save_attempts(*base_,std::move(task.planner));
+        recovery_.blocker_recovery_.reset();
+        if(navigation_goal_) {
+          const bool exhausted=note_navigation_recovery(arrival.ready || evidence_changed);
+          if(!arrival.ready && (exhausted || arrival.reason=="arrival_obstacle_footprint" ||
+                               arrival.reason=="arrival_unsafe_stop_area")) {
+            defer_navigation_goal(arrival.reason);return;
+          }
+          navigation_goal_->full_first=true;
+          navigation_goal_->retry_at=current+.3;
+        }
+        policy_.cross_priority_pending_=true;
+        report(arrival.ready?"pct_blockers_resolved":"pct_blocker_requirement_unmet",
+               arrival.ready?"replan_from_actual_support":arrival.reason);return;
+      }
+    }
+  }
   if(task.cross_layer)
     policy_.stair_scan_budget_.advance(ground,policy_.cross_task_.ascent_yaw(),.50,.16,.05);
   const auto nearby_evidence=[&](Point pose) {
@@ -495,6 +572,7 @@ void ExplorationController::run_blocker_recovery(double current) {
   PctRecoveryConstraints constraints;
   const double step_limit=std::min(.16,shared_layer_->max_step_height);
   constraints.height_band=XY{ground[2],step_limit};
+  if(task.navigation)constraints.height_band.reset();
   if(task.cross_layer) {
     constraints.ascent=policy_.cross_task_.ascent_yaw();
     if(feet_stable)constraints.contacts.assign(foot_contact_points_.begin(),foot_contact_points_.end());
@@ -550,6 +628,9 @@ void ExplorationController::run_blocker_recovery(double current) {
         const auto heading=task.planner.scan_heading(pct,version,*base_,base_attitude_,action.gap,
             task.blockers,options_.layer_body_height_,constraints);
         if(heading) {start_scan({Kind::scan,*base_,action.gap,*heading},true);return;}
+        if(task.navigation && note_navigation_recovery(false)) {
+          finish_blocker_recovery("navigation_recovery_no_progress");return;
+        }
         task.replan=true;
       } else if(task.cross_layer) {
         policy_.cross_task_.finish_reposition(cross_ground_pose());
@@ -607,6 +688,9 @@ void ExplorationController::run_blocker_recovery(double current) {
         start_scan({Kind::scan,*base_,action.gap,*yaw},true);return;
       }
     }
+    if(task.navigation && note_navigation_recovery(false)) {
+      finish_blocker_recovery("navigation_recovery_no_progress");return;
+    }
     task.replan=true;
   }
   if(task.action)return;
@@ -618,6 +702,12 @@ void ExplorationController::run_blocker_recovery(double current) {
   }
   if(task.replan) {
     task.replan=false;
+    if(task.navigation) {
+      if(base_)recovery_.save_attempts(*base_,std::move(task.planner));
+      recovery_.blocker_recovery_.reset();
+      if(navigation_goal_)navigation_goal_->retry_at=current;
+      report("navigation_replan_after_observation");return;
+    }
     if(task.cross_layer && options_.floor_exploration_ && !task.floor_attempt) {
       recovery_.save_attempts(*base_, std::move(task.planner));
       recovery_.blocker_recovery_.reset();
@@ -636,6 +726,13 @@ void ExplorationController::run_blocker_recovery(double current) {
       }
       if(refreshed.empty() &&
          (failure=="pct_planning_timeout" || failure=="planning_budget_exhausted")) {
+        if(!goal.observations.empty()) {
+          if(!navigation_goal_)navigation_goal_=NavigationGoal{goal,task.selection_policy,task.platform,{},0.};
+          navigation_goal_->blockers.clear();navigation_goal_->full_first=true;
+          navigation_goal_->retry_at=wall_now()+.25;
+          recovery_.blocker_recovery_.reset();
+          report("navigation_compute_retry","complete_route_budget");return;
+        }
         task.floor_failure="floor_route_timeout";
         finish_blocker_recovery("pct_blocker_replan_timeout");return;
       }

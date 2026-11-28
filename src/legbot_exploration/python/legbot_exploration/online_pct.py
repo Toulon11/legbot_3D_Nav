@@ -141,12 +141,19 @@ class OnlinePct:
         self.prepare(buffer, version, allow_rebuild=True)
         if isinstance(self.map,FixedLayerMap):
             model=self.map.frontier_index.observation_model
-            attempt=model.task.get('floor_attempt') if model.task else model.floor_attempt
-            members=model.task.get('members') if model.task else attempt.members if attempt else None
+            attempt=model.task.get('floor_attempt') if model.task else model.floor_attempt or model.dispatched_attempt
+            members=(model.task.get('members') if model.task else
+                     {k:attempt.members[k] for k in attempt.local if k in attempt.members}
+                     if attempt is not None and hasattr(attempt,'local') else attempt.members if attempt else None)
             if members and not self.map.frontier_index.remaining_floor_members(members):
+                owner=model.task if model.task is not None else attempt
+                if model.resolved_dispatch is owner:return 0
                 if attempt is not None:
                     self.map.frontier_index.settle_floor_attempt(attempt,False,sufficient_progress=True)
                     model.floor_attempt=None
+                # Keep the separate dispatch snapshot until arrival even
+                # though the active floor attempt has already been settled.
+                model.resolved_dispatch=owner
                 return int(model.task['cluster'] if model.task else attempt.cluster)
         return 0
 
@@ -231,6 +238,53 @@ class OnlinePct:
             for x in range(bounds[0][0],bounds[1][0]+1) for y in range(bounds[0][1],bounds[1][1]+1))
         return hash((tuple(bounds[0]),tuple(bounds[1]),first,revisions,observations)) & ((1<<52)-1)
 
+    def _navigation_dependency(self, target, blockers):
+        """Semantic local evidence, independent of hits, map versions and slice aliases."""
+        m,s=self.map,self.map.settings
+        generation=(m.revision,m.surface_observation.revision)
+        if getattr(self,'_navigation_dependency_generation',None)!=generation:
+            self._navigation_dependency_generation=generation
+            self._navigation_dependency_cache={}
+        cache_key=(tuple(target),tuple(tuple(p[:3]) for p in (blockers or ())))
+        cached=self._navigation_dependency_cache.get(cache_key)
+        if cached is not None:return cached
+        points=[np.asarray(target,dtype=float)-[0.,0.,self.reference_height]]
+        points.extend(np.asarray(p[:3],dtype=float) for p in (blockers or ()))
+        states={}
+        radius=s.robot_radius+s.safety_margin+.15
+        span=math.ceil(radius/s.resolution)
+        for point in points:
+            x,y=map(int,m.indices(point))
+            for dx in range(-span,span+1):
+                for dy in range(-span,span+1):
+                    if math.hypot(dx,dy)*s.resolution>radius+1e-7:continue
+                    xy=(x+dx,y+dy)
+                    key=(*xy,round(float(point[2]),2))
+                    if key in states:continue
+                    row=m.observed_at_height(xy,float(point[2])+s.minimum_clearance/2,
+                                             ground_height=float(point[2]))
+                    if row is None:states[key]=('unknown',);continue
+                    states[key]=(bool(row['solid']),bool(row['unknown']),bool(row['measured']),
+                        bool(row['g_mature']),int(row['g_surface_id']),
+                        bool(0<=row['terrain_cost']<=20),bool(row['unknown_hard']),
+                        bool(np.isfinite(row['C']) and row['C']-row['G']>=s.minimum_clearance))
+        # Nearby newly confirmed supports can enable a new observer. Use the
+        # existing spatial/height directory, rather than global/block versions.
+        observers=set()
+        for point in points:
+            for _,_,_,stance,k in m.support_targets.candidates(point,point[2]-.16,point[2]+.16,
+                                                              radius=2.,limit=100000):
+                xy=tuple(map(int,m.indices(stance)))
+                row=m.observed_at_height(xy,stance[2]+s.minimum_clearance/2,ground_height=stance[2])
+                if row is not None:observers.add((*xy,int(row['g_surface_id'])))
+        known=m.ground_band_obstacle(tuple(map(int,m.indices(points[0]))),float(points[0][2]))
+        parking=m.frontier_index.observation_model.pose_search._arrival_stop(target,radius)[2]
+        known=known or parking['reason'] in ('arrival_obstacle_footprint','arrival_unsafe_stop_area')
+        result=dict(ready=True,reason='navigation_known_obstacle' if known else 'navigation_dependency',
+                    evidence=hash((tuple(sorted(states.items())),tuple(sorted(observers)))) & ((1<<52)-1))
+        self._navigation_dependency_cache[cache_key]=result
+        return result
+
     def frontiers(self, buffer, version, start=None, minimum_distance=0., window_size=None,
                   query_budget=0., continuation=None, floor=None, geometry_only=False, platform_floor=None,
                   floor_selection=None, stair_heading=None, seek_ascent=False, review_remaining=None):
@@ -283,8 +337,9 @@ class OnlinePct:
                 if ground is not None and not exhausted:
                     views,blockers,pending=self._support_views(ground,minimum_distance,
                         minimum_height=floor[0]+floor[1]+1e-7,budget=query_budget or .10,global_search=True,
-                        selection_layer=selected)
+                        selection_layer=selected,allow_partial=True)
                     result['upward_support_targets']=views
+                    result['support_progress_only']=bool(self.metadata.get('support_search',{}).get('progress_only_candidates'))
                     result['support_query_pending']=pending
                     result['query_pending'] |= pending and not views
                     result['unknown_blockers']=self.map.merge_unknown_blockers(result['unknown_blockers']+blockers,ground)
@@ -311,8 +366,9 @@ class OnlinePct:
                 if raised or exhausted_frontiers:
                     views,blockers,pending=self._support_views(ground,minimum_distance,
                         minimum_height=continuation[1],budget=query_budget or .10,
-                        global_search=window_size is None)
+                        global_search=window_size is None,allow_partial=True)
                     result['upward_support_targets']=views
+                    result['support_progress_only']=bool(self.metadata.get('support_search',{}).get('progress_only_candidates'))
                     result['query_pending'] |= pending and not views
                     result['unknown_blockers']=self.map.merge_unknown_blockers(
                         result['unknown_blockers']+blockers,ground)
@@ -386,8 +442,8 @@ class OnlinePct:
         return result
 
     def _support_views(self, ground, minimum_distance, minimum_height, budget=.10, global_search=False,
-                       selection_layer=None):
-        """Validate cached upward supports through the public stopping check."""
+                       selection_layer=None,allow_partial=False):
+        """Prefer admitted stops; optionally nominate measured partial-route goals."""
         m,s=self.map,self.map.settings
         deadline=time.monotonic()+min(max(budget,.005),.10)
         low=max(minimum_height,ground[2]-s.surface_noise_tolerance)
@@ -405,7 +461,7 @@ class OnlinePct:
         if (progress is None or progress['cursor']>=len(progress['candidates']) or
                 math.dist(progress['anchor'][:2],ground[:2])>.25 or
                 abs(progress['anchor'][2]-ground[2])>s.surface_noise_tolerance):
-            progress=dict(anchor=tuple(ground),candidates=upward,cursor=0,rejections={})
+            progress=dict(anchor=tuple(ground),candidates=upward,cursor=0,rejections={},progress_candidates={})
             self._support_passes[key]=progress
             while len(self._support_passes)>16:self._support_passes.pop(next(iter(self._support_passes)))
         candidates=progress['candidates']
@@ -430,7 +486,17 @@ class OnlinePct:
                 blockers.extend(check.get('unknown_blockers',()))
                 rejections[point]=(check.get('unsafe_cells',1000),check.get('unobserved_cells',1000),
                                    point,check)
+                # This is a measured destination hint, not an admitted stop.
+                # Let the common planner find a safe partial endpoint before
+                # the missing footprint instead of requiring it before A*.
+                if allow_partial and check.get('unknown_blockers'):
+                    row=m.observed_cell((k,*m.indices(point)))
+                    if (row is not None and not row['unknown'] and not row['solid'] and
+                            row['g_mature'] and 0<=row['terrain_cost']<=20 and
+                            m.surface_observation.is_ground_source(tuple(m.indices(point)),int(row['g_surface_id']))):
+                        progress['progress_candidates'][point]=stamp
                 continue
+            progress['progress_candidates'].pop(point,None)
             rejections.pop(point,None)
             if any(math.dist(point[:2],p[:2])<.30 for p in views):continue
             if first_admitted is None:first_admitted=progress['cursor']-1
@@ -470,6 +536,13 @@ class OnlinePct:
                     not rejection_score(r)[0]]
         best=min(repairable,key=rejection_score) if repairable else None
         focused=list(best[3].get('unknown_blockers',())) if best else blockers
+        if allow_partial and not views and not pending:
+            for point,stamp in progress['progress_candidates'].items():
+                if self._arrival_geometry((*point[:2],point[2]+self.reference_height),.15)[2]!=stamp:continue
+                if any(math.dist(point[:2],p[:2])<.30 for p in views):continue
+                views.append([*point,math.atan2(point[1]-ground[1],point[0]-ground[0])])
+                if len(views)>=6:break
+            self.metadata['support_search']['progress_only_candidates']=len(views)
         return views,m.merge_unknown_blockers(focused,ground),pending
 
     def complete_observation(self, buffer, version, cluster_id, revision, point):
@@ -494,6 +567,10 @@ class OnlinePct:
 
     def observation_task(self, buffer, version, operation, cid, xyz, yaw, half_angle, blockers=None):
         self.prepare(buffer,version)
+        if operation=='refresh_ascent_search':
+            self._ascent_selection=None
+            self._support_passes.clear();self._support_admissions.clear()
+            return dict(ready=True,reason='ascent_search_refreshed')
         if operation=='advance_ascent_slice':
             selection=self._ascent_selection
             if selection is None or selection['selected'] is None:
@@ -517,7 +594,7 @@ class OnlinePct:
             pending=self.map.frontier_index.floor_work_available((float(xyz[2]),half_angle),layer)
             return dict(ready=pending,reason='floor_work_available' if pending else 'floor_work_unchanged')
         if operation=='floor_task_pending':
-            attempt=model.task.get('floor_attempt') if model.task else model.floor_attempt
+            attempt=model.task.get('floor_attempt') if model.task else model.floor_attempt or model.dispatched_attempt
             if attempt is None or attempt.cluster!=cid:
                 return dict(ready=True,reason='frontier_task_untracked')
             pending=bool(self.map.frontier_index.remaining_floor_members(attempt.members))
@@ -546,6 +623,46 @@ class OnlinePct:
         if operation=='navigation_arrival':
             s=self.map.settings
             return model.pose_search._arrival_stop(xyz,s.robot_radius+s.safety_margin+half_angle)[2]
+        if operation=='navigation_dependency':
+            return self._navigation_dependency(xyz,blockers)
+        if operation=='floor_preview_attempt':
+            # A global comparison query can replace the local query cursor.
+            # Preserve each proposal's task snapshot without arming it.
+            attempt=self.map.frontier_index.begin_floor_attempt(cid)
+            if attempt is not None:
+                key=(version,cid,tuple(xyz),yaw)
+                model.preview_attempts[key]=attempt
+                while len(model.preview_attempts)>12:model.preview_attempts.popitem(last=False)
+            return dict(ready=attempt is not None,reason='floor_attempt_previewed')
+        if operation=='floor_compare_view':
+            # Preview another already generated direction without rejecting a
+            # feasible long route or consuming a floor observation attempt.
+            index=self.map.frontier_index
+            search=index.floor_view_searches.get(cid)
+            if search is None or not search.direction_poses or not blockers:
+                return dict(ready=False,reason='no_comparison_direction')
+            deadline=time.monotonic()+max(0.,half_angle)
+            target=np.asarray(blockers[0][:3],dtype=float)
+            excluded={tuple(row[:3]) for row in blockers[1:]}
+            targets=np.asarray(list(dict.fromkeys(
+                (*self.map.position(key[:3]),index.nodes[key].height)
+                for key in search.members if key in index.nodes)),dtype=float).reshape(-1,3)
+            # The dispatched target must stay visible even if the full
+            # cluster's geometric representative lies behind an obstacle.
+            targets=np.vstack((target,targets))
+            targets=np.unique(targets,axis=0)
+            for pose in search.direction_poses:
+                if time.monotonic()>=deadline:break
+                if pose in excluded or pose in search.rejected:continue
+                body=np.asarray((*pose[:2],pose[2]+self.reference_height))
+                found=self.observation_poses(xyz,(0.,0.,yaw),targets,
+                    stances=[(body,0,True)],tolerance=.15,max_results=1)
+                view=found['views'].get(tuple(body))
+                if view is None or not np.any(np.all(np.abs(view['visible_targets']-target)<=1e-7,axis=1)):
+                    continue
+                return dict(ready=True,reason='floor_comparison_view',region=list(pose),
+                            yaw=float(view['yaw']),gain=int(view['gain']))
+            return dict(ready=False,reason='no_comparison_direction')
         if operation=='blocker_available':
             ready=model.blocker_review.available(ground)
             return dict(ready=ready,reason='blocker_review_available' if ready else 'blocker_already_reviewed')
@@ -562,21 +679,18 @@ class OnlinePct:
                 self._ascent_selection=None
                 self._support_passes.clear()
             return result
-        if operation=='blocker_pending':
-            if not model.blocker_review.available(ground):
+        if operation in ('blocker_pending','blocker_state'):
+            status=model.blocker_review._target_status(ground)
+            if status['resolved']:
+                return dict(status,ready=False,reason='blocker_known_obstacle'
+                            if status['resolution_reason']=='known_obstacle' else 'blocker_resolved')
+            available=model.blocker_review.available(ground)
+            if operation=='blocker_pending' and not available:
                 return dict(ready=False,reason='blocker_already_reviewed')
-            m,s=self.map,self.map.settings
-            x,y=m.indices(ground)
-            cells={(int(x)+dx,int(y)+dy) for dx,dy in ((0,0),(0,1),(0,-1),(1,0),(-1,0))}
-            layers={k for cx,cy in cells for k,_ in m.layers_at(cx,cy)}
-            if not layers and m.first_layer is not None:
-                layers.add(min(m.last_layer,max(m.first_layer,
-                    math.floor((ground[2]-s.origin_z)/s.slice_dh)+1)))
-            targets=[target for layer in layers for target in m.unknown_blockers(layer,cells,ground[2])]
-            pending=any(math.dist(target[:2],ground[:2])<1e-6 and
-                        abs(target[2]-ground[2])<=self.map.settings.surface_noise_tolerance+1e-7
-                        for target in targets)
-            return dict(ready=pending,reason='observation_pending' if pending else 'blocker_resolved')
+            # Candidate generation is a scheduling filter, not proof that the
+            # original parking requirement has been met. Keep explicit gaps.
+            return dict(status,ready=True,
+                        reason='observation_pending' if available else 'blocker_review_exhausted')
         if operation in ('floor_reject_view','floor_reject_view_timeout'):
             ready=self.map.frontier_index.reject_floor_view(cid,xyz,operation.endswith('_timeout'),blockers or (),half_angle)
             return dict(ready=ready,reason=operation)
@@ -615,14 +729,22 @@ class OnlinePct:
                         reason='stair_view_observed' if fresh else 'stair_view_no_local_returns')
         if operation in ('floor_attempt','floor_recovery_attempt'):
             attempt=model.floor_attempt
-            if attempt is None or attempt.cluster!=cid:
-                attempt=self.map.frontier_index.begin_floor_attempt(cid)
+            if operation=='floor_attempt' or attempt is None or attempt.cluster!=cid:
+                attempt=model.preview_attempts.pop((version,cid,tuple(xyz),yaw),None)
+                if attempt is None:attempt=self.map.frontier_index.begin_floor_attempt(cid)
+            model.preview_attempts.clear()
             self.map.frontier_index.clear_floor_view_search(cid)
             if operation=='floor_attempt' and attempt is not None and attempt.fast:
                 visible,_=model.floor_view(attempt.local,ground,yaw)
                 attempt=replace(attempt,local=visible)
-            model.floor_attempt=attempt
-            return dict(ready=model.floor_attempt is not None,reason='floor_attempt_recorded')
+            if attempt is not None:
+                # Pin only the physical members this dispatched view promised,
+                # preserving boundary/source identities across split/relabel.
+                members={k:attempt.members[k] for k in attempt.local if k in attempt.members}
+                attempt=replace(attempt,members=members,local=set(members))
+            model.floor_attempt=model.dispatched_attempt=attempt
+            model.resolved_dispatch=None
+            return dict(ready=attempt is not None and bool(attempt.local),reason='floor_attempt_recorded')
         if operation=='validate_fast_view':
             index=self.map.frontier_index;s=self.map.settings
             members=index.floor_query_members.get(cid,())
@@ -656,7 +778,8 @@ class OnlinePct:
             return model.begin(cid,ground,yaw,half_angle,floor_retry=tracked)
         if operation in ('cancel','cancel_recovery_view'):
             model.task=None
-            if operation=='cancel':model.floor_attempt=None
+            if operation=='cancel':
+                model.floor_attempt=model.dispatched_attempt=model.resolved_dispatch=None
             return dict(ready=True,reason='cancelled')
         if operation=='arm':return dict(ready=model.arm(ground,yaw),reason='armed')
         if operation=='progress':return model.progress()
@@ -678,8 +801,30 @@ class OnlinePct:
         return self.plan(buffer,version,start,target,floor,goal_height_tolerance=.02,
                          collect_blockers=True,budget=budget)
 
+    def plan_progress_surface(self,buffer,version,start,target,floor=None,budget=None,minimum_stop_ground=None):
+        return self.plan(buffer,version,start,target,floor,goal_height_tolerance=.02,
+                         collect_blockers=True,dense=True,budget=budget,allow_partial=True,
+                         minimum_stop_ground=minimum_stop_ground)
+
+    def commit_progress_surface(self,buffer,version,target,endpoint,floor=None):
+        self.prepare(buffer,version)
+        ground_target=np.asarray(target,dtype=float).copy()
+        ground_endpoint=np.asarray(endpoint,dtype=float).copy()
+        ground_target[2]-=self.reference_height
+        ground_endpoint[2]-=self.reference_height
+        search=self.map.frontier_index.observation_model.pose_search
+        _,_,revision=search._arrival_geometry(endpoint,.15)
+        self.planner.commit_progress(ground_target,ground_endpoint,floor,revision)
+        return True
+
+    def plan_approach_surface(self,buffer,version,start,target,floor=None,budget=None,minimum_stop_ground=None):
+        return self.plan(buffer,version,start,target,floor,goal_height_tolerance=.02,
+                         collect_blockers=True,dense=True,budget=budget,allow_partial=True,accept_goal=False,
+                         minimum_stop_ground=minimum_stop_ground)
+
     def plan(self, buffer, version, start, target, floor=None, *, goal_height_tolerance=None,
-             collect_blockers=False, dense=False, budget=None):
+             collect_blockers=False, dense=False, budget=None,allow_partial=False,accept_goal=True,
+             minimum_stop_ground=None):
         deadline=None if budget is None else time.monotonic()+max(0.,budget)
         self.prepare(buffer, version)
         start_check=self._admission(start,floor=floor,collect_blockers=collect_blockers)
@@ -691,7 +836,7 @@ class OnlinePct:
             if collect_blockers: metadata['unknown_blockers'] = start_check.get('unknown_blockers', [])
             return ('pct_route_outside_current_floor' if start_check['reason']=='surface_outside_current_floor'
                     else 'pct_unsafe_start'), [], metadata
-        if not goal_check['ready']:
+        if not goal_check['ready'] and not allow_partial:
             if collect_blockers: metadata['unknown_blockers'] = goal_check.get('unknown_blockers', [])
             return ('pct_route_outside_current_floor' if goal_check['reason']=='surface_outside_current_floor'
                     else 'pct_unsafe_goal'), [], metadata
@@ -699,10 +844,25 @@ class OnlinePct:
         ground_goal = np.asarray(target, dtype=float).copy()
         ground_start[2] -= self.reference_height
         ground_goal[2] -= self.reference_height
+        def stopping(point):
+            body=(*point[:2],point[2]+self.reference_height)
+            search=self.map.frontier_index.observation_model.pose_search
+            _,_,revision=search._arrival_geometry(body,.15)
+            radius=self.map.settings.robot_radius+self.map.settings.safety_margin+.15
+            result=search._arrival_stop(body,radius)[2]
+            return result['ready'],revision
+        if allow_partial and accept_goal and goal_check['ready']:
+            parking,_=stopping(ground_goal)
+            metadata['goal_parking_ready']=parking
+            accept_goal=parking
         route = self.planner.plan(ground_start, ground_goal, optimize=False,
                                   start_check=start_check, goal_check=goal_check, floor=floor,
-                                  collect_blockers=collect_blockers, dense=dense, deadline=deadline)
+                                  collect_blockers=collect_blockers, dense=dense, deadline=deadline,
+                                  allow_partial=allow_partial,stop_check=stopping,accept_goal=accept_goal,
+                                  minimum_stop_ground=minimum_stop_ground)
         metadata['anchor_search'] = self.planner.search_diagnostics
+        if collect_blockers:
+            metadata['unknown_blockers']=self.planner.search_diagnostics.get('unknown_blockers',[])
         if route is None or len(route) == 0:
             if collect_blockers:
                 metadata['unknown_blockers'] = self.planner.search_diagnostics.get('unknown_blockers', [])
@@ -714,7 +874,11 @@ class OnlinePct:
         route[:, 2] += self.reference_height - 0.50
         if not np.isfinite(route).all():
             return 'pct_invalid_route', [], metadata
-        return 'ok', route.tolist(), metadata
+        partial=self.planner.search_diagnostics.get('partial',False)
+        metadata['partial']=partial
+        metadata['final_target']=list(target)
+        metadata['segment_target']=route[-1].tolist()
+        return 'pct_partial_route' if partial else 'ok', route.tolist(), metadata
 
     def recovery_targets(self, buffer, version, start):
         self.prepare(buffer,version)
@@ -790,6 +954,11 @@ class OnlinePct:
                 if row['measured'] and mapping.observed_cell((k, *xy)) is not None
                 and not row['solid'] and 0 <= mapping.planning_cost((k, *xy)) <= 20
                 and mapping.surface_observation.is_ground_source(xy, int(row['g_surface_id']))}
+
+    def capture_inspection(self, version):
+        self.prepare(b'',version)
+        from .pct_inspection import capture
+        return capture(self)
 
     def inspect(self, version, base, options):
         self.prepare(b'',version)

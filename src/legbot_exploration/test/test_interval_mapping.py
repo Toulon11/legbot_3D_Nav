@@ -423,6 +423,50 @@ class IntervalMappingTest(unittest.TestCase):
 
 
 class BlockerNavigationEvidenceTest(unittest.TestCase):
+    def test_thin_surface_at_discrete_cut_is_not_a_known_wall(self):
+        m=mapping()
+        m.integrate([(0.,0.,2.94),(0.,0.,3.04)],sensor_origin=(1.,0.,2.7),body_height=2.7);m.build()
+        point=(0.,0.,2.956)
+        # This was the mismatched obstacle query in the recovery path.
+        cut=m.surface_observation.first_ground_slice(point[2])
+        self.assertIsNotNone(m.obstacle_at((cut,0,0)))
+        status=m.frontier_index.observation_model.blocker_review._target_status(point)
+        self.assertFalse(status['resolved'])
+        self.assertEqual(status['resolution_reason'],'missing_ground_or_headroom')
+
+    def test_unconfirmed_ground_cannot_settle_a_parking_requirement(self):
+        from unittest.mock import patch
+        m=mapping();m.integrate(plane());m.build()
+        b=m.frontier_index.observation_model.blocker_review
+        self.assertTrue(b._target_status((0.,0.,0.))['resolved'])
+        with patch.object(m.surface_observation,'ground_observed',return_value=False):
+            self.assertFalse(b._target_status((0.,0.,0.))['resolved'])
+
+    def test_known_wall_is_not_a_missing_support_in_any_recovery_entry(self):
+        m=mapping()
+        m.integrate([(0.,0.,z) for z in (.1,2.8)],sensor_origin=(1.,0.,.7));m.build()
+        m.integrate([(0.,0.,i*.05) for i in range(7,45)],sensor_origin=(1.,0.,.7));m.build()
+        point=(0.,0.,.22)
+        b=m.frontier_index.observation_model.blocker_review
+        self.assertEqual(b._target_status(point)['resolution_reason'],'known_obstacle')
+        self.assertFalse(b.available(point))
+        self.assertFalse(b.begin([point])['ready'])
+        for layer in (1,2,3):self.assertEqual(list(m.unknown_blockers(layer,[(0,0)],.22)),[])
+
+    def test_obstacle_known_before_arm_settles_without_a_new_target_return(self):
+        m=mapping();m.integrate([(1.,0.,.1)],sensor_origin=(1.,0.,.7));m.build()
+        b=m.frontier_index.observation_model.blocker_review
+        self.assertTrue(b.begin([(0.,0.,.22)])['ready'])
+        m.integrate([(0.,0.,i*.05) for i in range(7,45)],sensor_origin=(1.,0.,.7));m.build()
+        # It becomes known after selection, before a turn or a fresh matching hit.
+        early=b.progress()
+        self.assertTrue(early['ready']);self.assertFalse(early['fresh']);self.assertEqual(early['gain'],0)
+        b.arm()
+        settled=b.finish()
+        self.assertTrue(settled['ready']);self.assertEqual(settled['observed_count'],0)
+        self.assertEqual(settled['gain'],0);self.assertEqual(settled['known_obstacle_count'],1)
+        self.assertFalse(b.available((0.,0.,.22)))
+
     def test_matching_return_without_open_clearance_does_not_consume_gap(self):
         m=mapping();m.integrate([(0.,0.,1.)],sensor_origin=(1.,0.,1.3),body_height=1.32);m.build()
         b=m.frontier_index.observation_model.blocker_review

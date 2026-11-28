@@ -192,7 +192,9 @@ std::optional<PctRecoveryAction> PctBlockerRecovery::next(
   std::vector<Point> gaps;
   for(const auto &blocker:blockers) {
     const auto &p=blocker.point;
-    if(!still_unknown(map,version,p,s.body_height))continue;
+    const auto state=map.observation_task(version,"blocker_state",0,{p[0],p[1],p[2]+s.body_height});
+    if(!state.ready) {++rejections_[state.reason];continue;}
+    if(state.reason=="blocker_review_exhausted") {++rejections_[state.reason];continue;}
     // These gaps came from an actual failed route/arrival footprint. A
     // historical route bearing is not evidence that an off-axis gap is irrelevant.
     if(std::find(gaps.begin(),gaps.end(),p)==gaps.end())gaps.push_back(p);
@@ -209,8 +211,10 @@ std::optional<PctRecoveryAction> PctBlockerRecovery::next(
     return !constraints.permits_scan || constraints.permits_scan(point);
   };
   gaps.erase(std::remove_if(gaps.begin(),gaps.end(),[&](const auto &point) {
-    return !can_scan(point);
+    if(can_scan(point))return false;
+    ++rejections_["stair_scan_budget_exhausted"];return true;
   }),gaps.end());
+  if(!gaps.empty() && scans_.size()>=24)++rejections_["recovery_scan_budget_exhausted"];
   if(!gaps.empty() && scans_.size()<24) {
     const auto standing=map.observation_poses(
         version,s.base,attitude,gaps,false,std::nullopt,constraints.height_band,std::nullopt,.15,1,true);
@@ -355,7 +359,7 @@ std::optional<PctRecoveryAction> PctBlockerRecovery::next(
 
 std::optional<PctRecoveryAction> PctBlockerRecovery::delegate(
     const PlanningSnapshot &s,std::uint64_t version,const PctRecoveryConstraints &constraints,
-    const std::vector<Point> &goals,double arrival_tolerance) {
+    const std::vector<Point> &goals,double arrival_tolerance,bool require_observation) {
   if(!s.layer_fresh || !s.shared_layer || !s.shared_layer->pct)return std::nullopt;
   LayerRead read(*s.shared_layer);
   if(version!=s.shared_layer->current_version.load())return std::nullopt;
@@ -382,7 +386,8 @@ std::optional<PctRecoveryAction> PctBlockerRecovery::delegate(
         ++rejections_["delegate_support:"+checked.reason];
         continue;
       }
-      const auto arrival=map.arrival_area(version,goal,arrival_tolerance,bearing(goal));
+      const auto arrival=require_observation?map.arrival_area(version,goal,arrival_tolerance,bearing(goal)):
+          map.observation_task(version,"navigation_arrival",0,goal,bearing(goal),arrival_tolerance);
       if(!arrival.ready) {
         ++rejections_["delegate_arrival:"+arrival.reason];
         continue;
@@ -448,8 +453,29 @@ std::vector<PlannerResult> plan_recovery_request(const PlanningGoal &goal,const 
     }
     const auto checked=s.shared_layer->pct->point_check(goal.layer_version,*goal.observation_xyz,
         false,std::nullopt,0.,false,goal.pct_floor);
-    const auto arrival=s.shared_layer->pct->arrival_area(goal.layer_version,*goal.observation_xyz,
-        goal.xy_tolerance.value_or(0.),std::atan2(goal.observation[1]-s.base[1],goal.observation[0]-s.base[0]));
+    if(goal.validate_delegate_route) {
+      const auto route=s.shared_layer->pct->plan(goal.layer_version,s.base,*goal.observation_xyz,
+                                               true,goal.pct_floor,false,true);
+      const auto parking=s.shared_layer->pct->observation_task(goal.layer_version,"navigation_arrival",0,
+          *goal.observation_xyz,0.,goal.xy_tolerance.value_or(.15));
+      r.kind=PlannerKind::recovery_layer;r.source="recovery_layer";
+      r.reason=route.reason=="ok" && !parking.ready?parking.reason:route.reason;
+      r.route.reason=r.reason;
+      r.backend_metadata=route.metadata;r.xyz=route.points;
+      if(r.reason=="ok") {
+        if(!r.xyz.empty() && r.xyz.front()!=s.base)r.xyz.insert(r.xyz.begin(),s.base);
+        for(const auto &p:r.xyz) {r.route.points.push_back({p[0],p[1]});r.waypoints.push_back({p[0],p[1]});}
+        r.failure_class=PlannerFailureClass::none;
+      } else {r.xyz.clear();r.failure_class=PlannerFailureClass::disconnected;}
+      return {r};
+    }
+    const double heading=std::atan2(goal.observation[1]-s.base[1],goal.observation[0]-s.base[0]);
+    // Foothold-only startup has no native map anchor. Keep SCAN responsible
+    // for its actual connection; the destination still needs safe parking.
+    const auto arrival=goal.require_observation?s.shared_layer->pct->arrival_area(
+        goal.layer_version,*goal.observation_xyz,goal.xy_tolerance.value_or(0.),heading):
+        s.shared_layer->pct->observation_task(goal.layer_version,"navigation_arrival",0,
+            *goal.observation_xyz,heading,goal.xy_tolerance.value_or(0.));
     r.backend_metadata="{\"path_validated\":false,\"execution_owner\":\"scan\",\"goal_check\":"+
         checked.metadata+",\"arrival_area\":"+arrival.metadata+"}";
     if(checked.ready && arrival.ready) {

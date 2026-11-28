@@ -16,6 +16,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <sstream>
+#include <utility>
 
 namespace le=legbot_exploration;
 namespace {
@@ -42,6 +43,14 @@ double wall_now() {return std::chrono::duration<double>(std::chrono::steady_cloc
 }
 
 class OnlineLayerMapNode : public rclcpp::Node {
+  struct CapturedPublication {
+    std::shared_ptr<const le::PctInspectionSnapshot> snapshot;
+    std::string metadata;
+    std::uint64_t version=0;
+    std::size_t surface_records=0;
+    double commit_ms=0,inspection_ms=0,locked_ms=0;
+    bool ready=false,full=false,from_writer=false;
+  };
   struct CloudInput {
     std::string topic,pose_topic;
     bool frontier_query_reference=false;
@@ -88,6 +97,7 @@ class OnlineLayerMapNode : public rclcpp::Node {
     number("column_continuity_threshold","pct_column_continuity_threshold",.10);
     reliable_range_=number("reliable_observation_range","pct_reliable_observation_range",5.);
     number("new_height_threshold","pct_new_height_threshold",.10);
+    number("landing_min_area","pct_landing_min_area",1.5);
     number("planning_budget_seconds","pct_planning_budget_seconds",1.5);
     number("observation_revisit_radius","pct_observation_revisit_radius",1.0);
     integer("floor_min_resolved_frontier_cells","pct_floor_min_resolved_frontier_cells",5);
@@ -127,14 +137,15 @@ class OnlineLayerMapNode : public rclcpp::Node {
     const auto cloud=declare_parameter<std::string>("cloud_topic","/slam/global_cloud_registered");
     const auto base=declare_parameter<std::string>("base_odom_topic","/slam/global_odometry_base");
     const auto period=declare_parameter<double>("publish_period",1.);
+    full_period_=declare_parameter<double>("full_snapshot_period",5.);
     show_=declare_parameter<bool>("publish_map_topics",true);
     max_display_=declare_parameter<int>("max_display_surfaces",120000);
-    preview_=declare_parameter<bool>("graph_preview_enabled",true);
+    preview_=declare_parameter<bool>("graph_preview_enabled",false);
     graph_radius_=declare_parameter<double>("graph_search_radius",7.);
     graph_gain_=declare_parameter<double>("graph_min_height_gain",.07);
     graph_candidates_=declare_parameter<int>("graph_max_preview_candidates",8);
     graph_nodes_=declare_parameter<int>("graph_max_preview_nodes",4000);
-    if(!std::isfinite(period)||period<=0||max_display_<1||!std::isfinite(graph_radius_)||graph_radius_<=0||
+    if(!std::isfinite(full_period_)||full_period_<=0||!std::isfinite(period)||period<=0||max_display_<1||!std::isfinite(graph_radius_)||graph_radius_<=0||
        !std::isfinite(graph_gain_)||graph_gain_<=0||graph_candidates_<1||graph_nodes_<1)
       throw std::invalid_argument("invalid PCT publication/preview settings");
     auto qos=rclcpp::QoS(1).transient_local().reliable();
@@ -142,6 +153,8 @@ class OnlineLayerMapNode : public rclcpp::Node {
     planning_pub_=create_publisher<sensor_msgs::msg::PointCloud2>("/exploration/layers/planning_surfaces",qos);
     returns_pub_=create_publisher<sensor_msgs::msg::PointCloud2>("/exploration/layers/measured_returns",qos);
     ceilings_pub_=create_publisher<sensor_msgs::msg::PointCloud2>("/exploration/layers/ceilings",qos);
+    coverage_pub_=create_publisher<std_msgs::msg::String>("/exploration/layers/surface_updates",
+        rclcpp::QoS(100).transient_local().reliable());
     status_pub_=create_publisher<std_msgs::msg::String>("/exploration/layers/status",qos);
     graph_pub_=create_publisher<visualization_msgs::msg::MarkerArray>("/exploration/layers/graph_preview",qos);
     path_pub_=create_publisher<nav_msgs::msg::Path>("/exploration/layers/candidate_path",qos);
@@ -158,7 +171,21 @@ class OnlineLayerMapNode : public rclcpp::Node {
       base_={msg->pose.pose.position.x,msg->pose.pose.position.y,msg->pose.pose.position.z};base_wall_=wall_now();
       body_height_.store(base_[2]);body_wall_.store(base_wall_);
     });
-    timer_=create_wall_timer(std::chrono::duration<double>(period),[this]{publish_map();});
+    publish_period_=period;
+    // Failed capture attempts retry promptly, without changing the configured
+    // successful publication cadence or waiting inside an odometry callback.
+    timer_=create_wall_timer(std::chrono::duration<double>(std::min(period,.05)),[this]{
+      const double current=wall_now();
+      if(current<next_publish_due_)return;
+      if(!pending_publish_since_) {
+        pending_publish_since_=current;
+        full_requested_.store(last_full_==0 || current-last_full_>=full_period_);
+        export_requested_.store(true);
+      }
+      if(publish_map()) {
+        pending_publish_since_=0.;next_publish_due_=wall_now()+publish_period_;
+      } else ++capture_retries_;
+    });
     RCLCPP_INFO(get_logger(),"Online PCT map: %zu LiDAR inputs, registered XYZ only",inputs_.size());
   }
  private:
@@ -230,6 +257,7 @@ class OnlineLayerMapNode : public rclcpp::Node {
     if(!lock.owns_lock()||shared_->planning_active.load() || wall_now()<shared_->reader_yield_until.load()) {
       ++shared_->dropped_planning;return;
     }
+    const double acquired=wall_now();
     const double body=body_height_.load();
     shared_->pct->append(points,origin,std::isfinite(body)&&wall_now()-body_wall_.load()<.5?
                         std::optional<double>{body}:std::nullopt,free_rays,
@@ -249,41 +277,90 @@ class OnlineLayerMapNode : public rclcpp::Node {
     ++input.integrated;
     ++received_;integrated_+=points.size();last_raw_=points.size();
     shared_->last_integration_wall_seconds.store(wall_now());
+    // Fulfil a pending export while this writer already owns the coherent
+    // committed map. Continually arriving frames cannot starve publication.
+    capture_publication_locked(acquired,true);
     integration_ms_=1000*(wall_now()-start);
     shared_->writer_finished();
   }
-  void publish_map() {
-    const auto started=wall_now();
-    if(shared_->planning_active.load() || started<shared_->reader_yield_until.load())return;
-    le::PctInspection inspection;std::string metadata;std::uint64_t version;bool ready=false;
-    double lock_wait_ms=0,commit_ms=0,inspection_ms=0,locked_ms=0;
-    std::size_t surface_records=0;
-    {
-      std::unique_lock<std::shared_mutex> lock(shared_->mutex);
-      const auto acquired=wall_now();lock_wait_ms=1000*(acquired-started);
-      if(shared_->planning_active.load() || wall_now()<shared_->reader_yield_until.load())return;
-      version=shared_->current_version.load();
-      if(shared_->pct->point_count())ready=shared_->pct->refresh(version);
-      const auto committed=wall_now();commit_ms=1000*(committed-acquired);
-      if(ready) {
-        shared_->published_wall_seconds.store(wall_now());
-        shared_->committed_version.store(version);
-        inspection=shared_->pct->inspect(version,base_,show_,max_display_,
-            preview_&&base_wall_>0&&wall_now()-base_wall_<2.,graph_radius_,graph_gain_,graph_candidates_,graph_nodes_);
-      }
-      metadata=shared_->pct->map_metadata();
-      surface_records=shared_->pct->point_count();
-      inspection_ms=1000*(wall_now()-committed);locked_ms=1000*(wall_now()-acquired);
-      shared_->writer_finished();
+  void capture_publication_locked(double acquired,bool from_writer) {
+    if(!export_requested_.exchange(false))return;
+    auto result=std::make_shared<CapturedPublication>();
+    result->version=shared_->current_version.load();
+    result->full=full_requested_.load();result->from_writer=from_writer;
+    result->surface_records=shared_->pct->point_count();
+    const double began=wall_now();
+    if(result->surface_records) {
+      result->ready=shared_->committed_version.load()==result->version || shared_->pct->refresh(result->version);
+      if(result->ready)shared_->committed_version.store(result->version);
     }
+    const double committed=wall_now();result->commit_ms=1000*(committed-began);
+    if(result->ready && show_) {
+      result->snapshot=shared_->pct->capture_inspection(result->version,result->full);
+      if(!result->snapshot) {
+        RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),5000,"PCT export failed: %s",shared_->pct->last_error().c_str());
+        export_requested_.store(true);return;
+      }
+    }
+    result->metadata=shared_->pct->map_metadata();
+    result->inspection_ms=1000*(wall_now()-committed);
+    result->locked_ms=1000*(wall_now()-acquired);
+    std::lock_guard<std::mutex> handoff(publication_mutex_);
+    captured_publication_=std::move(result);
+  }
+  std::shared_ptr<CapturedPublication> take_publication() {
+    std::lock_guard<std::mutex> handoff(publication_mutex_);
+    return std::exchange(captured_publication_,{});
+  }
+  bool publish_map() {
+    const auto started=wall_now();
+    auto captured=take_publication();
+    if(!captured) {
+      // Current readers/writers finish normally. No planning_active/yield
+      // gate: owning this exclusive lock already proves snapshot consistency.
+      // A failed try keeps the request for the next writer or 50 ms retry.
+      std::unique_lock<std::shared_mutex> lock(shared_->mutex,std::try_to_lock);
+      if(lock.owns_lock()) {
+        capture_publication_locked(wall_now(),false);
+        shared_->writer_finished();
+      }
+    }
+    if(!captured)captured=take_publication();
+    if(!captured)return false;
+    const auto version=captured->version;
+    const auto surface_records=captured->surface_records;
+    const auto snapshot=captured->snapshot;
+    const bool ready=captured->ready,full=captured->full;
+    const double commit_ms=captured->commit_ms,inspection_ms=captured->inspection_ms;
+    const double locked_ms=captured->locked_ms,lock_wait_ms=1000*(started-pending_publish_since_);
+    le::PctInspection inspection;std::string metadata=captured->metadata;
+    // Optional graph diagnostics are independent of normal map export.
+    if(preview_ && full && base_wall_>0 && wall_now()-base_wall_<2.) {
+      std::unique_lock<std::shared_mutex> lock(shared_->mutex,std::try_to_lock);
+      if(lock.owns_lock())inspection=shared_->pct->inspect(shared_->current_version.load(),base_,true,
+          max_display_,true,graph_radius_,graph_gain_,graph_candidates_,graph_nodes_);
+    }
+    std::string coverage_update;
+    const double render_began=wall_now();
+    if(snapshot) {
+      auto preview=std::move(inspection);
+      inspection=le::PctBackend::render_inspection(*snapshot,max_display_,full,&coverage_update);
+      if(preview_){inspection.preview_nodes=std::move(preview.preview_nodes);
+        inspection.preview_candidates=std::move(preview.preview_candidates);
+        inspection.path=std::move(preview.path);inspection.preview_state=std::move(preview.preview_state);}
+      metadata=inspection.metadata;
+      coverage_pub_->publish(std_msgs::msg::String().set__data(coverage_update));
+      if(full){last_full_=started;full_version_=version;}
+    }
+    const double render_ms=1000*(wall_now()-render_began);
     std_msgs::msg::Header header;header.frame_id=frame_;header.stamp=now();
-    if(show_ && inspection.valid) {
+    if(show_ && full && inspection.valid) {
       surface_pub_->publish(cloud_message(std::move(inspection.display),header,true));
       planning_pub_->publish(cloud_message(std::move(inspection.surfaces),header,true));
       returns_pub_->publish(cloud_message(std::move(inspection.returns),header,false));
       ceilings_pub_->publish(cloud_message(std::move(inspection.ceilings),header,false));
     }
-    if(show_)publish_preview(inspection,header);
+    if(show_ && preview_ && full)publish_preview(inspection,header);
     std::ostringstream json;
     json<<"{\"backend\":\"project_pct_interval_online\",\"version\":"<<version
       <<",\"reliable_observation_range\":"<<reliable_range_
@@ -301,7 +378,13 @@ class OnlineLayerMapNode : public rclcpp::Node {
       <<"\",\"graph_path_points\":"<<inspection.path.size()
       <<",\"inspection_valid\":"<<(inspection.valid?"true":"false")
       <<",\"lock_wait_ms\":"<<lock_wait_ms<<",\"commit_ms\":"<<commit_ms
+      <<",\"capture_retries\":"<<capture_retries_
+      <<",\"capture_from_writer\":"<<(captured->from_writer?"true":"false")
       <<",\"inspection_ms\":"<<inspection_ms<<",\"lock_held_ms\":"<<locked_ms
+      <<",\"render_outside_lock_ms\":"<<render_ms
+      <<",\"exported_version\":"<<(snapshot?version:0)
+      <<",\"full_snapshot_version\":"<<full_version_
+      <<",\"full_snapshot_period\":"<<full_period_
       <<",\"read_wait_ms\":"<<shared_->last_read_wait_ms.load()
       <<",\"read_commit_ms\":"<<shared_->last_read_commit_ms.load()
       <<",\"read_phase_ms\":"<<shared_->last_read_phase_ms.load()
@@ -318,6 +401,7 @@ class OnlineLayerMapNode : public rclcpp::Node {
     }
     json<<"]}";
     status_pub_->publish(std_msgs::msg::String().set__data(json.str()));
+    return true;
   }
   void publish_preview(const le::PctInspection &data,const std_msgs::msg::Header &header) {
     using Marker=visualization_msgs::msg::Marker;
@@ -339,6 +423,11 @@ class OnlineLayerMapNode : public rclcpp::Node {
   le::Point base_{};double base_wall_=0,graph_radius_=7,graph_gain_=.07,reliable_range_=5.;
   std::atomic<double> body_height_{std::numeric_limits<double>::quiet_NaN()},body_wall_{0.};
   std::atomic<double> integration_ms_{0};
+  double full_period_=5.,last_full_=0.,publish_period_=1.,next_publish_due_=0.,pending_publish_since_=0.;
+  std::uint64_t full_version_=0,capture_retries_=0;
+  std::atomic<bool> export_requested_{false},full_requested_{true};
+  std::mutex publication_mutex_;
+  std::shared_ptr<CapturedPublication> captured_publication_;
   int max_display_=120000,graph_candidates_=8,graph_nodes_=4000;
   bool show_=true,preview_=true;std::string frame_;
   std::atomic<std::uint64_t> seen_{0},received_{0},rejected_{0},integrated_{0},wrong_frame_{0},invalid_cloud_{0};
@@ -346,7 +435,7 @@ class OnlineLayerMapNode : public rclcpp::Node {
   rclcpp::CallbackGroup::SharedPtr cloud_group_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr base_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr surface_pub_,planning_pub_,returns_pub_,ceilings_pub_;
-  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_,coverage_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr graph_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::TimerBase::SharedPtr timer_;

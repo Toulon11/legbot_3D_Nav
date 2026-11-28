@@ -1,6 +1,7 @@
 #include "legbot_exploration/route_orchestrator.hpp"
 
 #include <cmath>
+#include <algorithm>
 #include <chrono>
 #include <mutex>
 #include <shared_mutex>
@@ -10,9 +11,25 @@
 
 namespace legbot_exploration {
 
+RouteEffort route_effort(const PlannerResult &plan,const XY &start,double gain,
+                        double ratio_limit,double excess_limit) {
+  RouteEffort effort;
+  XY previous=start;
+  for(const auto &point:plan.route.points) {
+    effort.length+=std::hypot(point[0]-previous[0],point[1]-previous[1]);
+    previous=point;
+  }
+  effort.direct=std::hypot(plan.goal.observation[0]-start[0],plan.goal.observation[1]-start[1]);
+  effort.ratio=effort.length/std::max(.25,effort.direct);
+  effort.excess=effort.length-effort.direct;
+  effort.detour=effort.ratio>ratio_limit && effort.excess>excess_limit;
+  effort.score=(1.+effort.length)/std::sqrt(std::clamp(gain,1.,64.));
+  return effort;
+}
+
 namespace {
 PlannerFailureClass classify_failure(const std::string &reason) {
-  if (reason == "ok")
+  if (reason == "ok" || reason=="pct_partial_route")
     return PlannerFailureClass::none;
   if (reason == "unsafe_start" || reason == "unsafe_start_cell" ||
       reason == "layer_start_corridor_blocked" || reason == "layer_unsafe_start" || reason == "pct_unsafe_start")
@@ -130,7 +147,7 @@ std::vector<PlannerResult> plan_map_candidates(
             shared.pct->arrival_area(version,target,goal.xy_tolerance.value_or(0.),arrival_heading):
             shared.pct->observation_task(version,"navigation_arrival",0,target,arrival_heading,goal.xy_tolerance.value_or(0.))):
             PctObservation{};
-        if(explicit_surface && !arrival.ready) {
+        if(explicit_surface && !arrival.ready && !goal.allow_partial) {
           pct.reason=arrival.reason;
           pct.metadata="{\"arrival_area\":"+arrival.metadata+"}";
           pct.goal_safe=false;
@@ -143,7 +160,19 @@ std::vector<PlannerResult> plan_map_candidates(
           }
           pct=shared.pct->plan(version,snapshot.base,target,explicit_surface,goal.pct_floor,
                                goal.collect_unknown_blockers || goal.mode==ExplorationMode::cross_layer,
-                               goal.stair_segment,budget);
+                               goal.stair_segment,budget,goal.allow_partial,
+                               explicit_surface && !arrival.ready,goal.minimum_stop_ground);
+          layer_result.partial=pct.reason=="pct_partial_route";
+          if(layer_result.partial && !pct.points.empty()) {
+            const auto stop=shared.pct->observation_task(version,"navigation_arrival",0,pct.points.back(),
+                0.,goal.xy_tolerance.value_or(.15));
+            if(!stop.ready) {
+              pct.reason=stop.reason;pct.points.clear();layer_result.partial=false;
+              pct.unknown_blockers=stop.unknown_blockers;
+            }
+          }
+          if(layer_result.partial && !arrival.ready)
+            pct.unknown_blockers.insert(pct.unknown_blockers.end(),arrival.unknown_blockers.begin(),arrival.unknown_blockers.end());
           if(explicit_surface) {
             std::string arrival_metadata="\"arrival_area\":"+arrival.metadata;
             if(pct.reason=="ok" && !pct.points.empty()) {
@@ -186,7 +215,7 @@ std::vector<PlannerResult> plan_map_candidates(
           check.map_version=shared.current_version.load();
         }
         layer_plan.reference.reason=pct.reason;
-        layer_plan.reference.failure_stage=pct.reason=="ok"?"ready":"project_pct";
+        layer_plan.reference.failure_stage=pct.reason=="ok" || layer_result.partial?"ready":"project_pct";
         for(const auto &point:layer_result.xyz) {
           layer_plan.reference.points.push_back({point[0],point[1]});
           layer_plan.waypoints.push_back({point[0],point[1]});
@@ -264,7 +293,8 @@ const PlannerResult *select_plan(
     if (result.goal.goal_id != goal.goal_id ||
         result.goal.attempt_id != goal.attempt_id ||
         result.goal.occupancy_version != goal.occupancy_version ||
-        result.goal.layer_version != goal.layer_version || result.goal.recovery_request!=goal.recovery_request || !result.usable())
+        result.goal.layer_version != goal.layer_version || result.goal.recovery_request!=goal.recovery_request ||
+        (result.partial && !goal.allow_partial) || !result.usable())
       continue;
     if (goal.mode == ExplorationMode::cross_layer &&
         result.kind!=PlannerKind::layer && result.kind!=PlannerKind::observation_turn) continue;
@@ -273,6 +303,15 @@ const PlannerResult *select_plan(
       if (result.kind==PlannerKind::scan_direct && goal.recovery_request==RecoveryRequest::delegate) {best=&result;continue;}
       if (result.kind==PlannerKind::recovery_layer && goal.request_layer) best=&result;
       continue;
+    }
+    const bool eligible=(result.kind==PlannerKind::layer && goal.request_layer) ||
+        (result.kind==PlannerKind::occupancy && goal.request_occupancy) ||
+        (result.kind==PlannerKind::observation_turn && goal.recovery_request==RecoveryRequest::turn);
+    if(!eligible)continue;
+    // Backend preference never overrides completion of the requested goal.
+    if(best && best->partial!=result.partial) {
+      if(result.partial)continue;
+      best=nullptr;
     }
     if(result.kind==PlannerKind::observation_turn && goal.recovery_request==RecoveryRequest::turn)best=&result;
     else if (result.kind == PlannerKind::layer && goal.request_layer)
@@ -312,7 +351,8 @@ bool PathProcessor::load(const PlanningGoal &goal, const PlannerResult &result,
     if(xyz_.size()>2) references_.emplace_back(xyz_.begin()+1,xyz_.end());
     xyz_={stop};
     waypoints_={{stop[0],stop[1]}};
-  } else if(result.kind==PlannerKind::layer && !recovery && snapshot && xyz_.size()>1) {
+  } else if(((result.kind==PlannerKind::layer && !recovery) ||
+             (result.kind==PlannerKind::recovery_layer && goal.validate_delegate_route)) && snapshot && xyz_.size()>1) {
     // Admission has already checked the starting cell. Avoid a stopped mission
     // to its own grid anchor, then preserve the complete geometry in each run.
     // Native A* returns its admitted start cell as the first vertex. SCAN

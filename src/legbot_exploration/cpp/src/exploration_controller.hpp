@@ -54,6 +54,8 @@ struct ExplorationSettings {
   double sync_tolerance_ = 0.03, odom_timeout_ = 1.0, cloud_timeout_ = 2.0;
   double goal_reach_xy_ = 0.55, cooldown_ = 45.0;
   double pct_round_budget_=1.0;
+  double pct_detour_ratio_=2.,pct_detour_excess_=1.5;
+  int pct_compare_clusters_=3;
   double pct_local_above_=3.5, pct_local_below_=1.5, pct_direction_weight_=.5;
   bool cross_layer_enabled_=true;
   bool floor_exploration_=false;
@@ -223,6 +225,16 @@ class ExplorationController {
   };
   bool accept_route(const PlannerResult &chosen, const RouteSelection &selection,
                     const Point &ascent_start, const std::vector<Point> &ground_route);
+  bool stage_route(const PlannerResult &chosen,const RouteSelection &selection,
+                   const PlanningSnapshot &snapshot,std::string *failure);
+  struct FloorRoute {
+    PlannerResult plan;
+    PctFrontier frontier;
+    std::string detail,scope;
+    double started,gain;
+    std::optional<XY> platform;
+  };
+  bool dispatch_floor_route(const FloorRoute &route);
   bool prepare_route(const XY &target,
       const std::unordered_map<Cell, int, CellHash> &grid,
       const std::vector<XY> &obstacles,
@@ -234,7 +246,8 @@ class ExplorationController {
       std::optional<XY> platform_floor=std::nullopt,
       std::string *selection_failure=nullptr,
       std::vector<PctUnknownBlocker> *unknown_blockers=nullptr,
-      PctFrontier *blocked_goal=nullptr);
+      PctFrontier *blocked_goal=nullptr,
+      std::vector<FloorRoute> *floor_routes=nullptr);
   void advance_route();
 
   void cancel_recovery_action();
@@ -271,6 +284,16 @@ class ExplorationController {
       std::optional<double> minimum_frontier_height=std::nullopt);
   void run_pct_cycle(double current);
   bool run_home_mission(double current);
+  struct NavigationGoal;
+  enum class NavigationRun { idle, active, yielded, finished };
+  NavigationRun run_navigation_goal(double current);
+  NavigationRun defer_navigation_goal(const std::string &reason);
+  bool navigation_ascent_superseded();
+  bool note_navigation_recovery(bool useful);
+  PctObservation navigation_dependency(const NavigationGoal &goal);
+  bool navigation_target_available(const Point &ground);
+  bool resume_deferred_navigation(double current);
+  bool handoff_navigation_platform();
 
   void report(const std::string &state, const std::string &detail = "");
   void publish_coverage_grid(const std::unordered_map<Cell, int, CellHash> &grid);
@@ -365,6 +388,31 @@ class ExplorationController {
   std::optional<Point> selected_pct_observation_;
   bool selected_platform_frontier_=false,selected_fast_floor_=false;
   int selected_floor_attempt_=0;
+  struct NavigationGoal {
+    PctFrontier target;
+    std::string policy;
+    std::optional<XY> platform;
+    std::vector<PctUnknownBlocker> blockers;
+    double retry_at=0.;
+    bool full_first=false; // After a segment, resolve concrete blockers before another fallback.
+    std::optional<std::uint64_t> wait_evidence;
+    std::optional<Point> wait_pose;
+    bool retired=false;
+    bool required=false; // Required mission endpoint; automatic exploration stances are replaceable.
+    std::string wait_reason;
+    std::size_t evidence_version=0;
+    std::optional<Point> segment_start;
+    std::optional<double> segment_ground;
+    std::optional<std::uint64_t> segment_evidence;
+    std::optional<std::uint64_t> recovery_evidence;
+    std::optional<double> best_remaining,best_height_error;
+    unsigned no_progress_segments=0;
+    unsigned no_progress_recoveries=0;
+    unsigned compute_retries=0;
+  };
+  std::optional<NavigationGoal> navigation_goal_;
+  std::vector<NavigationGoal> deferred_navigation_goals_;
+  bool selected_partial_=false;
   double yaw_wall_=0.;
   std::optional<double> base_yaw_,base_quiet_since_;
   Point base_attitude_{};

@@ -65,6 +65,8 @@ def setup(context):
         parameters=dict(use_sim_time=True,world=world,localization_source=source,
             coverage_source=('pct_surfaces' if LaunchConfiguration('layer_map_in_process').perform(context)=='true'
                              else 'occupancy_grid'),
+            surface_updates_topic=('/exploration/layers/surface_updates' if
+                LaunchConfiguration('layer_map_in_process').perform(context)=='true' else ''),
             floor_definitions_json=ParameterValue(LaunchConfiguration('metrics_floors').perform(context),value_type=str),
             target_floor=LaunchConfiguration('metrics_target_floor').perform(context),
             single_floor=LaunchConfiguration('metrics_single_floor').perform(context),

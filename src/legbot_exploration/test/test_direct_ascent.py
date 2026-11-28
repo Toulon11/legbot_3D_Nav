@@ -264,6 +264,18 @@ class DirectAscentTest(unittest.TestCase):
         supports.assert_called_once();self.assertTrue(result['upward_support_targets'])
         self.assertFalse(hasattr(a,'_local_stair_task'))
 
+    def test_ascent_query_distinguishes_admitted_supports_from_progress_only_hints(self):
+        a=adapter(stepped_ground())
+        for progress_only in (False,True):
+            def support(*args,**kwargs):
+                a.metadata['support_search']={'progress_only_candidates':1 if progress_only else 0}
+                return [[.4,0.,.13,0.]],[],False
+            with patch.object(a.map.frontier_index,'query',return_value=dict(clusters=[],query_pending=False)), \
+                 patch.object(a,'_support_views',side_effect=support):
+                result=a.frontiers(b'',1,(-.7,0.,.32),.25,query_budget=.20,
+                    floor=(0.,.08),floor_selection=LIMITS,seek_ascent=True)
+            self.assertEqual(result['support_progress_only'],progress_only)
+
     def test_known_next_support_is_available_during_pending_frontier_search(self):
         a = adapter(stepped_ground())
         ground = (.4, 0., .13)
@@ -352,6 +364,10 @@ class DirectAscentTest(unittest.TestCase):
             for y in range(10):
                 for _, row in a.map.layers_at(x, y):
                     row['inflated_terrain_cost'] = 50.
+        # This fixture edits committed rows directly; emulate the writer's
+        # dependency invalidation that build() performs for changed costs.
+        a.map._invalidate_auxiliary({(k,x,y) for x in range(12,16) for y in range(10)
+                                   for k,_ in a.map.layers_at(x,y)})
         result = a.landing_check(b'', 1, point, (0., .08))
         self.assertEqual(result['reason'], 'platform_not_confirmed')
         self.assertLess(result['platform_area'], 1.5)

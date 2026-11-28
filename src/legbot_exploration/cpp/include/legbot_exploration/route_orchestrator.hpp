@@ -41,6 +41,11 @@ struct PlanningGoal {
   std::optional<double> xy_tolerance; // Requested only on the final position waypoint.
   ExplorationCandidate candidate;
   bool require_observation = true; // Known support navigation still checks the full stopping disk.
+  // Permit a safe intermediate stop only after complete-goal planning fails.
+  // Complete routes always outrank partial results, across backends and views.
+  bool allow_partial = false;
+  std::optional<double> minimum_stop_ground; // Ascent-only partial endpoint constraint.
+  bool validate_delegate_route=false;
 };
 
 struct PlannerResult {
@@ -56,6 +61,7 @@ struct PlannerResult {
   std::string reason;
   PlannerFailureClass failure_class = PlannerFailureClass::none;
   double planning_ms = 0.0;
+  bool partial = false;
 
   bool usable() const {
     return !waypoints.empty() && ((kind==PlannerKind::observation_turn && goal.recovery_request==RecoveryRequest::turn && waypoints.size()==1) || route.points.size()>=2 ||
@@ -76,6 +82,13 @@ struct PlanningSnapshot {
   std::uint64_t occupancy_version = 0;
   const std::vector<XY> *scan_raw_obstacles = nullptr;
 };
+
+struct RouteEffort {
+  double length=0.,direct=0.,ratio=0.,excess=0.,score=0.;
+  bool detour=false;
+};
+RouteEffort route_effort(const PlannerResult &plan,const XY &start,double gain,
+                         double ratio_limit=2.,double excess_limit=1.5);
 
 struct ExecutionResult {
   std::uint64_t goal_id = 0;

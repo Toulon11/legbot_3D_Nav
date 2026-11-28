@@ -19,8 +19,9 @@ struct FloorViewLimits {
   double max_step=0., min_rise=0.;
   std::optional<double> review_remaining;
 };
+struct PctInspectionSnapshot;
 struct PctInspection {
-  // Wire payloads only, generated from the current locked PCT map.
+  // Wire payloads only; immutable export snapshots are not planning maps.
   std::vector<std::uint8_t> surfaces,display,returns,ceilings;
   std::vector<Point> preview_nodes,preview_candidates,path;
   std::string preview_state="disabled",metadata="{}";
@@ -31,6 +32,7 @@ struct PctFrontier {
   Point frontier{};  // Unknown-boundary reference height; observers use measured ground XYZ.
   Cell cell{};
   double gain=0.0,observer_ms=0.0;
+  std::vector<double> observation_gains; // Visible physical cells per stance.
   std::size_t cells=0;
   int attempt=0;
   bool direction_limited=false;
@@ -67,6 +69,7 @@ struct PctFrontiers {
   double query_ms=0.;
   bool query_pending=false;
   bool support_query_pending=false;
+  bool support_progress_only=false;
   std::size_t query_checked_clusters=0;
   double observer_prepare_ms=0.,observer_geometry_ms=0.,observer_visibility_ms=0.;
   std::map<std::string,double> observer_phase_ms;
@@ -85,6 +88,7 @@ struct PctResult {
 };
 struct PctObservation {
   bool ready=false, fresh=false;
+  std::optional<std::uint64_t> evidence;
   double yaw=0.;
   std::optional<double> side_yaw;
   std::optional<Point> region;
@@ -119,9 +123,18 @@ class PctBackend {
   PctInspection inspect(std::uint64_t version,const Point &base,bool display,
                         std::size_t max_display,bool preview,double radius,
                         double min_gain,std::size_t max_candidates,std::size_t max_nodes);
+  // Capture only immutable changed chunks under SharedLayerMap::mutex.
+  // Rendering never touches Python, the backend, or the live map.
+  std::shared_ptr<const PctInspectionSnapshot> capture_inspection(std::uint64_t version,bool full=true);
+  static PctInspection render_inspection(const PctInspectionSnapshot &,std::size_t max_display,
+                                        bool full,std::string *coverage_update=nullptr);
   PctResult plan(std::uint64_t version, const Point &start, const Point &target,
       bool explicit_surface=false, std::optional<XY> floor=std::nullopt,
-      bool collect_blockers=false,bool stair_segment=false,std::optional<double> budget=std::nullopt);
+      bool collect_blockers=false,bool stair_segment=false,std::optional<double> budget=std::nullopt,
+      bool allow_partial=false,bool approach_only=false,
+      std::optional<double> minimum_stop_ground=std::nullopt);
+  bool commit_progress(std::uint64_t version,const Point &target,const Point &endpoint,
+                       std::optional<XY> floor=std::nullopt);
   PctResult plan_shift(std::uint64_t version,const Point &start,const Point &target);
   PctResult plan_stair_reverse(std::uint64_t version,const Point &start,const Point &target);
   // Body XYZ and roll/pitch/yaw in; surface XYZ targets in. A fixed stance
@@ -163,7 +176,8 @@ class PctBackend {
  private:
   PctResult plan_with_method(const char *method,std::uint64_t version,const Point &start,
                              const Point &target,std::optional<XY> floor=std::nullopt,
-                             std::optional<double> budget=std::nullopt);
+                             std::optional<double> budget=std::nullopt,
+                             std::optional<double> minimum_stop_ground=std::nullopt);
   std::vector<Point> read_points(const char *method,std::uint64_t version,const Point &base,
       std::optional<double> heading=std::nullopt);
   struct Impl;

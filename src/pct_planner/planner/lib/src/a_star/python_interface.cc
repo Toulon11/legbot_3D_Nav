@@ -30,6 +30,9 @@ PYBIND11_MODULE(a_star, m) {
       .def("set_passage_clearance", &Astar::SetPassageClearance)
       .def("get_blocked_edges", &Astar::GetBlockedEdges)
       .def("search", &Astar::Search)
+      .def("search_towards", &Astar::SearchTowards,py::arg("start"),py::arg("goal"),
+           py::arg("goal_height"),py::arg("stop"),py::arg("accept_goal")=true)
+      .def("get_partial_result_matrix", &Astar::GetPartialResultMatrix)
       .def("debug", &Astar::Debug)
       .def("get_result_matrix", &Astar::GetResultMatrix)
       .def("get_cost_layer", &Astar::GetCostLayer)

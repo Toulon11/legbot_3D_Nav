@@ -107,6 +107,7 @@ class RecoveryController {
     double motion_yaw=0., result_at=0.;
     bool cross_layer=false, replan=false,platform_shift=false;
     bool unsafe_start=false, delegation_started=false;
+    bool navigation=false; // Preserve a generic final target across recovery actions.
     int floor_attempt=0;
     const char *floor_failure="floor_disconnected";
     std::string selection_policy;

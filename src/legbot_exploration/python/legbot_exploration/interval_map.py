@@ -6,7 +6,7 @@ Fixed-height queries can borrow that node only inside its evidenced clearance.
 No neighboring XY cell is allocated to fill a storage block or a cost halo.
 """
 from dataclasses import dataclass, replace
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left, bisect_right, insort
 import math
 from types import SimpleNamespace
 import numpy as np
@@ -42,6 +42,7 @@ class IntervalLayerMap(FixedLayerMap):
         self._free_columns={}
         self._top_observed={}
         self._interval_nodes={}
+        self._ordered_passages={}
         self._pending_open={}
         self._pending_ground={}
         self._pending_ground_count=0
@@ -53,8 +54,9 @@ class IntervalLayerMap(FixedLayerMap):
         self._pending_frontier_query_height=None
         self._frontier_height_events={}
         self._frontier_column_events={}
-        self._frontier_event_heights=[]
-        self._frontier_events_dirty=False
+        self._frontier_event_bands=[]
+        self._frontier_endpoint_buckets={}
+        self._frontier_bucket_keys={}
         self._frontier_query_changes=set()
         self._frontier_query_checked=0
         self.radar_frontier_layer=None
@@ -76,8 +78,10 @@ class IntervalLayerMap(FixedLayerMap):
         super()._reset_slice_products()
         self._frontier_height_events.clear()
         self._frontier_column_events.clear()
-        self._frontier_event_heights=[]
-        self._frontier_events_dirty=False
+        self._ordered_passages.clear()
+        self._frontier_event_bands=[]
+        self._frontier_endpoint_buckets={}
+        self._frontier_bucket_keys={}
         self.radar_frontier_layer=None
         self._radar_known_cache.clear()
         if self.frontier_query_height is not None:
@@ -96,14 +100,16 @@ class IntervalLayerMap(FixedLayerMap):
         elif old==height:
             changed=set()
         else:
-            if self._frontier_events_dirty:
-                self._frontier_event_heights=sorted(self._frontier_height_events)
-                self._frontier_events_dirty=False
-            low,high=sorted((old,height))
-            first=bisect_left(self._frontier_event_heights,low)
-            last=bisect_right(self._frontier_event_heights,high)
-            changed=set().union(*(self._frontier_height_events[z]
-                for z in self._frontier_event_heights[first:last])) if first<last else set()
+            low,high=sorted((old,height));dh=self.settings.slice_dh
+            first=bisect_left(self._frontier_event_bands,math.floor(low/dh))
+            last=bisect_right(self._frontier_event_bands,math.floor(high/dh))
+            changed=set()
+            for band in self._frontier_event_bands[first:last]:
+                keys=self._frontier_bucket_keys.get(band)
+                if keys is None:
+                    keys=self._frontier_bucket_keys[band]=tuple(sorted(self._frontier_endpoint_buckets[band]))
+                lo=bisect_left(keys,low);hi=bisect_right(keys,high)
+                for z in keys[lo:hi]:changed.update(self._frontier_height_events[z])
         self.frontier_query_height=height
         self._pending_frontier_query_height=None
         self._frontier_query_checked=len(changed)
@@ -127,10 +133,21 @@ class IntervalLayerMap(FixedLayerMap):
         for z in previous-endpoints:
             owners=self._frontier_height_events[z];owners.discard(xy)
             if not owners:
-                del self._frontier_height_events[z];self._frontier_events_dirty=True
+                del self._frontier_height_events[z]
+                band=math.floor(z/self.settings.slice_dh)
+                values=self._frontier_endpoint_buckets[band];values.remove(z)
+                self._frontier_bucket_keys.pop(band,None)
+                if not values:
+                    del self._frontier_endpoint_buckets[band]
+                    self._frontier_event_bands.pop(bisect_left(self._frontier_event_bands,band))
         for z in endpoints-previous:
             if z not in self._frontier_height_events:
-                self._frontier_height_events[z]=set();self._frontier_events_dirty=True
+                self._frontier_height_events[z]=set()
+                band=math.floor(z/self.settings.slice_dh)
+                if band not in self._frontier_endpoint_buckets:
+                    self._frontier_endpoint_buckets[band]=set();insort(self._frontier_event_bands,band)
+                self._frontier_endpoint_buckets[band].add(z)
+                self._frontier_bucket_keys.pop(band,None)
             self._frontier_height_events[z].add(xy)
         if endpoints:self._frontier_column_events[xy]=endpoints
         else:self._frontier_column_events.pop(xy,None)
@@ -340,6 +357,7 @@ class IntervalLayerMap(FixedLayerMap):
         else:self._pending_ground.pop(xy,None)
         self._interval_node_count+=len(nodes)-len(self._interval_nodes.get(xy,()))
         self._interval_nodes[xy]=nodes
+        self._ordered_passages[xy]=tuple((n.ground,k,n.clear_to) for k,n in sorted(nodes.items()))
         if nodes:
             self.first_layer=min(nodes) if self.first_layer is None else min(self.first_layer,min(nodes))
             self.last_layer=max(nodes) if self.last_layer is None else max(self.last_layer,max(nodes))
@@ -376,6 +394,23 @@ class IntervalLayerMap(FixedLayerMap):
                         or bool(row['interval_node'])!=(node is not None)):
                     base.add(xy)
                 row['C_clear'],row['node_z'],row['interval_node']=clear,middle,node is not None
+
+    def observed_at_height(self, xy, cut, ground_height=None, *, layer_hint=None):
+        # Physical passages are disjoint and ordered: at most one can own Z.
+        # Never join endpoints from different rooms or materialise an alias.
+        xy=tuple(xy)
+        entries=self._ordered_passages.get(xy,())
+        at=bisect_left(entries,(cut-1e-7,))-1
+        column=self.columns.get(xy)
+        blocked=column is not None and column.obstacle_at(cut) is not None
+        if at>=0:
+            g,k,upper=entries[at]
+            if (cut<upper-1e-7 and (ground_height is None or
+                    abs(g-ground_height)<=self.settings.surface_noise_tolerance+1e-7)):
+                row=self._effective_row(self.cell((k,*xy)))
+                if self._covers_cut(row,cut,ground_height):
+                    return self._obstacle_view(row) if blocked else row
+        return self._blocked_cell if blocked else None
 
     def _effective_row(self, row):
         if row is None:return None

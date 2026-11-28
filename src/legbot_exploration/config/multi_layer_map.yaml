@@ -46,7 +46,8 @@
     slice_height: 0.50
     max_slope_radians: 0.40
     max_step_height: 0.16
-    publish_period: 1.0
+    publish_period: 1.0               # Versioned coverage deltas and map status.
+    full_snapshot_period: 5.0         # Complete legacy RViz/planning_surfaces messages.
     publish_map_topics: true        # 是否发布新 PCT 表面、实际命中、净空及预览信息
     max_display_surfaces: 120000
     # Diagnostic A* preview holds the map lock; keep it off during exploration.

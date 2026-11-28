@@ -1,5 +1,6 @@
 """Resolve missing navigation evidence; raw returns alone do not settle gaps."""
 import math
+from .navigation_evidence import target_status
 
 
 class BlockerReview:
@@ -9,41 +10,12 @@ class BlockerReview:
         self.active = None
 
     def _target_status(self, point):
-        m=self.map;s=m.settings;xy=tuple(map(int,m.indices(point)))
-        tolerance=s.surface_noise_tolerance+1e-7
-        # An expected tread height may be revised by at most one real step.
-        # Do not borrow an unrelated floor just because its C covers the cut.
-        for g,_,_,lo,_ in m._column_known_intervals.get(xy,()):
-            if abs(g-point[2])>min(.16,s.step_max)+1e-7:continue
-            row=m.observed_cell((lo,*xy))
-            if row is None or row['unknown'] or abs(float(row['G'])-g)>tolerance:continue
-            return dict(resolved=True,resolution_reason='known_obstacle' if row['solid'] else
-                        'support_interval_observed',actual_ground=g)
-        cut=m.surface_observation.first_ground_slice(point[2])
-        if (m.obstacle_at((cut,*xy)) is not None or
-                m.frontier_index.observation_model.support_obstacle(xy,point[2])):
-            return dict(resolved=True,resolution_reason='known_obstacle')
-        pending=list(getattr(m,'_pending_ground',{}).get(xy,()))
-        top=getattr(m,'_pending_open',{}).get(xy)
-        if top is not None:pending.append((top[0],math.nan,top[1]))
-        choices=[r for r in pending if abs(r[0]-point[2])<=min(.16,s.step_max)+tolerance]
-        if choices:
-            g,c,clear=min(choices,key=lambda r:abs(r[0]-point[2]))
-            column=m.columns[xy]
-            source=min(column.values(),key=lambda r:abs(r.high-g))
-            direct=(source.support_hit_z is not None and abs(source.support_hit_z-g)<=tolerance)
-            previous=getattr(m,'_confirmed_grounds',{}).get(xy,{}).get(source.id,math.nan)
-            confirmed=math.isfinite(previous) and abs(previous-g)<=tolerance
-            reason='missing_support_hit' if not (direct or confirmed) else 'missing_continuous_clearance'
-            return dict(resolved=False,resolution_reason=reason,candidate_ground=g,
-                        measured_ceiling=c if math.isfinite(c) else None,
-                        clearance_lower_bound=max(0.,clear-g) if math.isfinite(clear) else 0.)
-        return dict(resolved=False,resolution_reason='missing_ground_or_headroom')
+        return target_status(self.map,point)
 
     def available(self, point):
         xy = tuple(map(int, self.map.indices(point)))
         tolerance = self.map.settings.surface_noise_tolerance + 1e-7
-        return not self.map.surface_observation.refuted(xy,point[2]) and not any(low-tolerance <= point[2] <= high+tolerance
+        return not self._target_status(point)['resolved'] and not self.map.surface_observation.refuted(xy,point[2]) and not any(low-tolerance <= point[2] <= high+tolerance
                        for low,high in self.attempted.get(xy, ()))
 
     def begin(self, targets):
@@ -84,6 +56,14 @@ class BlockerReview:
 
     def progress(self):
         task = self.active
+        if task is not None and task['serial'] is None:
+            states=[dict(point=list(p),**self._target_status(p)) for p in task['targets']]
+            if states and all(s['resolved'] for s in states):
+                task['resolved']=set(task['targets'])
+                return dict(ready=True,fresh=False,gain=0,reason='blocker_evidence_already_settled',
+                    target_count=len(states),resolved_count=len(states),observed_count=0,unresolved_count=0,
+                    known_obstacle_count=sum(s['resolution_reason']=='known_obstacle' for s in states),
+                    surface_evidence=states,targets=[list(p) for p in task['targets']],serial=None)
         if task is None or task['serial'] is None:
             return dict(ready=False, fresh=False, gain=0, reason='blocker_review_not_armed')
         tolerance=self.map.settings.surface_noise_tolerance+1e-7
@@ -96,16 +76,18 @@ class BlockerReview:
             states.append(dict(point=list(point),**check,**status))
             if check['ready'] or check['new_heights']:
                 task['received'].add(point)
-            # A free-only update can activate an already hit open ground.
-            # Conversely, matching a raw height cannot settle a missing node.
-            if status['resolved'] and (point in task['received'] or not task['baseline'][point]):
+            # Known support/obstacles settle evidence without requiring a new
+            # return at the old hypothesis height. Navigation safety is separate.
+            if status['resolved']:
                 resolved.add(point)
         task['resolved']=resolved
         count=len(resolved);received=len(task['received'])
+        gained=sum(not task['baseline'].get(point,False) for point in resolved)
+        obstacles=sum(s.get('resolution_reason')=='known_obstacle' for s in states)
         ready=bool(task['targets']) and count==len(task['targets'])
         matched=sum(check['state']=='matched' for check in states)
         refuted=sum(check['state']=='refuted' for check in states)
-        return dict(ready=ready, fresh=bool(received or count), gain=count,
+        return dict(ready=ready, fresh=bool(received or gained), gain=gained,known_obstacle_count=obstacles,
                     reason='blocker_navigation_evidence_resolved' if ready else
                            'blocker_returns_received_but_unresolved' if received else 'waiting_blocker_target_returns',
                     target_count=len(task['targets']), observed_count=received,resolved_count=count,

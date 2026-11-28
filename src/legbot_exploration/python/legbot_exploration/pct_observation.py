@@ -47,6 +47,9 @@ class ObservationModel:
         self.map = mapping
         self.task = None
         self.floor_attempt = None
+        self.dispatched_attempt = None
+        self.preview_attempts=OrderedDict()
+        self.resolved_dispatch = None
         self.visibility_cache=OrderedDict()
         from .pct_blocker_review import BlockerReview
         self.blocker_review=BlockerReview(mapping)
@@ -256,9 +259,12 @@ class ObservationModel:
 
     def begin(self, cid, point, forward=None, half_angle=0., current_yaw=None, floor_retry=False):
         index=self.map.frontier_index;s=self.map.settings
-        attempt=self.floor_attempt if floor_retry and self.floor_attempt is not None and self.floor_attempt.cluster==cid else None
+        pending=self.floor_attempt or self.dispatched_attempt
+        attempt=pending if floor_retry and pending is not None and pending.cluster==cid else None
         fast=attempt is not None and attempt.fast
         self.floor_attempt=None
+        if attempt is self.dispatched_attempt:self.dispatched_attempt=None
+        self.resolved_dispatch=None
         cluster=index.task_cluster(cid)
         if attempt is not None:
             keys=sorted(index.remaining_floor_members({key:attempt.members[key] for key in attempt.local
@@ -268,7 +274,7 @@ class ObservationModel:
             if floor_retry:keys=[key for key in keys if key in index.floor_query_members.get(cid,())]
         if not keys and (attempt is not None or (forward is None and (floor_retry or cluster is None))):
             return dict(ready=False,reason='frontier_resolved',
-                        floor_attempt=index.settle_floor_attempt(attempt,False))
+                        floor_attempt=index.settle_floor_attempt(attempt,False,sufficient_progress=True))
         targets=np.array([[s.origin_x+key[1]*s.resolution,s.origin_y+key[2]*s.resolution,index.nodes[key].height]
                           for key in keys]).reshape(-1,3)
         # Only nearby compatible 3-D frontier surfaces belong to this view.

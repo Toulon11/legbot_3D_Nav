@@ -4,7 +4,7 @@ The owner holds its write lock for integrate/build and read lock for queries.
 Dense export is explicitly diagnostic; production consumers read blocks.
 """
 from collections import defaultdict
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, fields
 import os
@@ -146,6 +146,14 @@ class FixedLayerMap:
         self._column_geometry = {}
         self._column_intervals = {}
         self._column_known_intervals = {}
+        self._support_columns = {}
+        self._support_tiles = {}
+        self._auxiliary_tiles = {}
+        self._planning_states = {}
+        self._planning_records = {}
+        self.export_dirty_columns = set()
+        self.export_dirty_blocks = set()
+        self.export_epoch = 0
         self._column_ground_intervals = {}
         self._column_frontier_signatures = {}
         self._obstacle_changes = {}
@@ -309,10 +317,8 @@ class FixedLayerMap:
                         row=self.observed_cell((k,ox,oy))
                         if (math.isfinite(reference) and row is not None and
                                 self.tread_above_riser(k,ox,oy,row,reference) is not None):continue
-                        self._obstacle_costs[key]=True
-                        return True
-        self._obstacle_costs[key]=False
-        return False
+                        return self._cache_auxiliary(self._obstacle_costs,key,True)
+        return self._cache_auxiliary(self._obstacle_costs,key,False)
 
     def _covers_cut(self, row, cut, ground_height=None):
         if (row is None or row['unknown'] or not np.isfinite(row['G']) or
@@ -371,10 +377,73 @@ class FixedLayerMap:
             self._column_known_intervals.pop(xy,None)
             self._column_ground_intervals.pop(xy,None)
             self._column_frontier_signatures.pop(xy,None)
+        # Per-column physical/support entries are height ordered. The XY tile
+        # directory never includes an empty allocation or an unconfirmed G.
+        entries=tuple(sorted((float(row['G']),k) for k,row in self.layers_at(*xy)
+                            if self._covers_cut(row,s.origin_z+k*s.slice_dh)))
+        tile=xy[0]//s.block_size,xy[1]//s.block_size
+        if entries:
+            self._support_columns[xy]=entries
+            self._support_tiles.setdefault(tile,set()).add(xy)
+        else:
+            self._support_columns.pop(xy,None)
+            cells=self._support_tiles.get(tile)
+            if cells is not None:
+                cells.discard(xy)
+                if not cells:self._support_tiles.pop(tile,None)
         current=self._column_known_intervals.get(xy,())
         changed_records=set(previous)^set(current)
         affected={k for _,_,_,lo,hi in changed_records for k in range(lo,hi+1)}
         return affected,previous!=current
+
+    def support_blocks(self, low, high, lower=-math.inf, upper=math.inf):
+        """XY tile lookup then binary G-range lookup; no all-layer scan.
+
+        Return only measured address masks. Full parking/visibility checks
+        remain with callers; a directory hit is never safety admission.
+        """
+        b=self.settings.block_size;result={};checked=0
+        for bx in range(int(low[0])//b,int(high[0])//b+1):
+            for by in range(int(low[1])//b,int(high[1])//b+1):
+                for x,y in self._support_tiles.get((bx,by),()):
+                    if not (low[0]<=x<=high[0] and low[1]<=y<=high[1]):continue
+                    entries=self._support_columns[x,y];checked+=1
+                    lo=bisect_left(entries,(lower,-math.inf))
+                    hi=bisect_right(entries,(upper,math.inf))
+                    for _,k in entries[lo:hi]:
+                        key=k,bx,by
+                        if key not in result:result[key]=np.zeros((b,b),dtype=bool)
+                        result[key][x%b,y%b]=True
+        self.support_query_work=dict(columns=checked,blocks=len(result))
+        return result
+
+    def _cache_auxiliary(self, cache, key, value):
+        k,x,y=key;b=self.settings.block_size
+        self._auxiliary_tiles.setdefault((k,x//b,y//b),set()).add(key)
+        cache[key]=value
+        return value
+
+    def _invalidate_auxiliary(self, changed):
+        # Cached footprint costs read a spatial disk and adjacent real treads.
+        # Invalidate that conservative halo, preserving unrelated rooms.
+        s=self.settings;b=s.block_size
+        reach=max((max(abs(dx),abs(dy)) for dx,dy,*_ in self._seam_footprint),default=0)
+        reach=max(reach,max((max(abs(dx),abs(dy)) for dx,dy in self._footprint_offsets),default=0))
+        bands=math.ceil(2*s.step_max/s.slice_dh)+1
+        # Deduplicate before expanding the halo: thousands of changed cells
+        # in one block must not enumerate the same dependencies thousands of times.
+        sources={(k,x//b,y//b) for k,x,y in changed}
+        halo=math.ceil(reach/b)
+        tiles={(alias,ox,oy) for k,bx,by in sources
+               for alias in range(k-bands,k+bands+1)
+               for ox in range(bx-halo,bx+halo+1)
+               for oy in range(by-halo,by+halo+1)}
+        for tile in tiles:
+            keys=self._auxiliary_tiles.pop(tile,())
+            if keys and tile in self.blocks:self.export_dirty_blocks.add(tile)
+            for key in keys:
+                self._seam_costs.pop(key,None);self._obstacle_costs.pop(key,None)
+                self._planning_states.pop(key,None);self._planning_records.pop(key,None)
 
     def ground_band_obstacle(self, xy, height):
         """Measured occupancy above a support, independent of cut aliases.
@@ -387,8 +456,9 @@ class FixedLayerMap:
         if column is None:return False
         low=float(height)+min(.16,self.settings.step_max)
         high=float(height)+self.settings.minimum_clearance
-        return any(lo<high-1e-7 and hi>low+1e-7
-                   for lo,hi in column.obstacle_intervals)
+        spans=column.obstacle_intervals
+        at=bisect_left(spans,(high-1e-7,))-1
+        return at>=0 and spans[at][1]>low+1e-7
 
     def frontier_height_compatible(self, layer, target, source, height, identity):
         """Auxiliary frontier filter only; inferred heights never become G.
@@ -609,8 +679,9 @@ class FixedLayerMap:
             for k in after-before:self._obstacle_tiles.setdefault((k,*tile),set()).add(xy)
             blocking_changed |= before!=after
         if blocking_changed:
-            self._obstacle_costs.clear()
-            self._seam_costs.clear()
+            self._invalidate_auxiliary((k,*xy) for xy,old in obstacle_changes.items()
+                for k in cuts(old)^cuts(self.columns[xy].obstacle_intervals))
+        self.export_dirty_columns.update(changed)
         self.integrated_serial += 1
         affected=self.surface_relations.invalidate(changed)
         self.evidence_dirty.update(affected)
@@ -669,11 +740,16 @@ class FixedLayerMap:
         self._column_geometry.clear()
         self._column_intervals.clear()
         self._column_known_intervals.clear()
+        self._support_columns.clear();self._support_tiles.clear();self._auxiliary_tiles.clear()
+        self.export_epoch+=1
+        self.export_dirty_blocks.update(self.blocks)
+        self.export_dirty_columns.update(self.columns)
         self._column_ground_intervals.clear()
         self._column_frontier_signatures.clear()
         self.planning_block_versions.clear()
         self._seam_costs.clear()
         self._obstacle_costs.clear()
+        self._planning_states.clear();self._planning_records.clear()
         self.lower=self.upper=self.first_layer=self.last_layer=None
         self.dirty=set(self.columns)
         self.frontier_index.reset_geometry()
@@ -781,7 +857,14 @@ class FixedLayerMap:
         # Interval-only changes (including C-only columns with no G) are real
         # planning changes. Invalidate only the affected cuts and robot disks.
         for (x,y),old in self._obstacle_changes.items():
-            for k in self.layers:
+            spans=set(old)^set(self.columns[x,y].obstacle_intervals)
+            cuts={k for lo,hi in spans for k in range(
+                math.ceil((lo-s.origin_z-1e-7)/s.slice_dh),
+                math.floor((hi-s.origin_z+1e-7)/s.slice_dh)+1) if k in self.layers}
+            cuts.update(key[0] for key in self.frontier_index.by_column.get((x,y),()))
+            cuts.update(k for dx in (-1,0,1) for dy in (-1,0,1)
+                        for k in self.column_layers.get((x+dx,y+dy),()))
+            for k in cuts:
                 # Low-cut wall evidence also affects high-cut frontiers.
                 if (x,y) in self.frontier_index.by_column or any(
                         k in self.column_layers.get((x+dx,y+dy),())
@@ -806,18 +889,17 @@ class FixedLayerMap:
         for xy,touched_layers in cost_layers.items():
             for _,_,_,lo,hi in self._column_known_intervals.get(xy,()):
                 if not any(lo<=k<=hi for k in touched_layers):continue
-                for k in self.layers:
-                    if lo<=k<=hi:
+                for k in range(lo,hi+1):
+                    if k in self.layers:
                         frontiers[k].add(xy)
                         self.geometry_changed.add((k,*xy))
         # Initialize a new cut's logical index once from the column interval
         # catalog. Existing cuts subsequently receive only local changes.
-        for k in self.layers.keys()-previous_slices:
+        for k in (() if getattr(self,"frontier_query_height",None) is not None else self.layers.keys()-previous_slices):
             frontiers[k].update(xy for xy,records in self._column_known_intervals.items()
                                 if any(lo<=k<=hi for _,_,_,lo,hi in records))
         if self.geometry_changed:
-            self._seam_costs.clear()
-            self._obstacle_costs.clear()
+            self._invalidate_auxiliary(self.geometry_changed)
         # A hit can resolve a frontier even if its cut's G/C did not change.
         # Include cuts which have a local dependency on the touched column.
         for layer,(_,changes,_) in results:
@@ -851,6 +933,11 @@ class FixedLayerMap:
         for key in {(k,x//b,y//b) for k,x,y in self.geometry_changed}:
             self.planning_block_versions[key]=revision
         self._commit_planning_versions(revision)
+        # Export chunks also contain soft costs and maturity metadata.
+        self.export_dirty_blocks.update((k,x//b,y//b) for k,batch in batches.items() for x,y in batch)
+        self.export_dirty_blocks.update((layer.index,x//b,y//b)
+            for layer,(base,changed,_) in results for x,y in base | changed)
+        self.export_dirty_blocks.update((k,x//b,y//b) for k,x,y in self.geometry_changed)
         self.last_work.update(base_update_ms=1000*(prepared-started),
             cost_update_ms=1000*(costs_done-prepared),frontier_update_ms=1000*(frontier_done-costs_done),
             slice_workers=cost_workers,frontier_workers=frontier_workers,
@@ -918,10 +1005,10 @@ class FixedLayerMap:
             row = options[k]
             ceiling=row['C']
             cost=float(row['inflated_terrain_cost'])
-            if not relaxed and cost>20 and self.seam_candidate(k,float(row['G'])):
-                cost=self.planning_cost((k,x,y))
+            navigation_reason='unassessed'
+            if not relaxed:cost,navigation_reason=self.planning_state((k,x,y))
             return dict(result, layer=int(k), ground_z=float(row['G']),
-                cost=cost, source=1,
+                cost=cost, navigation_reason=navigation_reason, source=1,
                 solid=bool(row['solid']), unknown_inflated=bool(row['hard']),
                 clearance=float(ceiling-row['G']) if np.isfinite(ceiling) else None,
                 clearance_observed=bool(np.isfinite(ceiling) and
@@ -1075,6 +1162,13 @@ class FixedLayerMap:
                 (layer-1 in self.layers or layer+1 in self.layers))
 
     def unknown_blockers(self, layer, cells, reference):
+        """Only unresolved evidence may become a recovery scan target."""
+        from .navigation_evidence import target_status
+        for target in self._unknown_blocker_candidates(layer,cells,reference):
+            if not target_status(self,target[:3])['resolved']:
+                yield target
+
+    def _unknown_blocker_candidates(self, layer, cells, reference):
         """Targets for missing ground or blocked geometry; never change traversability."""
         s = self.settings
         relations = self.surface_relations
@@ -1141,27 +1235,50 @@ class FixedLayerMap:
         return result
 
     def planning_cost(self, key):
+        return self.planning_state(key)[0]
+
+    def planning_state(self, key):
+        """Authoritative navigation cost/reason, invalidated with its local halo.
+
+        A confirmed node can still fail a footprint check. Keep that result
+        alongside the cost so export and native search report the same state.
+        """
+        cached=self._planning_states.get(key)
+        if cached is not None:return cached
+        state=self._compute_planning_state(key)
+        return self._cache_auxiliary(self._planning_states,key,state)
+
+    def _compute_planning_state(self, key):
         row = self.observed_cell(key)
-        if row is None or row['unknown'] or row['solid'] or row['inflated_terrain_cost'] < 0:
-            return 50.
-        if self.obstacle_footprint(key):return 50.
+        if row is None or row['unknown']:return (50.,'missing_support')
+        if row['solid']:
+            return (50.,'known_obstacle' if self.obstacle_at(key) is not None else
+                    'insufficient_clearance' if row['passage_cost']>=50 else 'terrain_limit')
+        if row['inflated_terrain_cost']<0:return (50.,'unassessed')
+        if self.obstacle_footprint(key):return (50.,'known_obstacle_footprint')
         if not row['hard'] and row['inflated_terrain_cost']<=20:
-            return float(row['inflated_terrain_cost'])
+            return (float(row['inflated_terrain_cost']),'ready')
         layer,x,y = key
         if (not (row['unknown_hard'] or row['solid_hard']) or not self.seam_candidate(layer,float(row['G'])) or
                 not 0<=row['terrain_cost']<=20):
-            return 50. if row['hard'] else float(row['inflated_terrain_cost'])
+            cost=50. if row['hard'] else float(row['inflated_terrain_cost'])
+            return (cost,'missing_footprint' if row['unknown_hard'] else 'terrain_limit')
         if key not in self._seam_costs:
             cost = float(row['terrain_cost'])
+            reason='terrain_limit'
             for dx,dy,weight,in_footprint in self._seam_footprint:
                 support = self.footprint_support(layer,x+dx,y+dy,float(row['G']))
                 if in_footprint and (support is None or support['unknown'] or support['solid']):
                     cost = 50.
+                    reason='known_obstacle_footprint' if support is not None and support['solid'] else 'missing_footprint'
                     break
                 if support is not None:
                     cost=max(cost,weight*float(support['terrain_cost']))
-            self._seam_costs[key] = cost
-        return self._seam_costs[key]
+            self._cache_auxiliary(self._seam_costs,key,cost)
+            return (cost,'ready' if cost<=20 else reason)
+        cost=self._seam_costs[key]
+        return (cost,'ready' if cost<=20 else
+                'missing_footprint' if row['unknown_hard'] else 'terrain_limit')
 
     def traversable_block(self, key, block, floor=None):
         """Use the same footprint support for selecting and routing to poses."""

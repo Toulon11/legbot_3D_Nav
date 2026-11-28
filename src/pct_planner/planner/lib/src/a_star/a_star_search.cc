@@ -26,6 +26,7 @@ void Astar::Init(const double cost_threshold, const int num_layers,
                  const double resolution,  const double step_cost_weight, const Eigen::MatrixXd& cost_map,
                  const Eigen::MatrixXd& height_map,
                  const Eigen::MatrixXd& ele_map) {
+  partial_result_.clear();
   auto t0 = std::chrono::high_resolution_clock::now();
 
   cost_threshold_ = cost_threshold;
@@ -78,6 +79,7 @@ void Astar::Init(const double cost_threshold, const int num_layers,
 }
 
 void Astar::Reset() {
+  partial_result_.clear();
   if (reader_) {
     search_result_.clear();
     sparse_nodes_.clear();
@@ -119,6 +121,7 @@ void Astar::InitIntervalAccessor(double threshold, int layers, int rows, int col
   interval_accessor_=true;
   timed_out_ = false;
   search_result_.clear();
+  partial_result_.clear();
   sparse_nodes_.clear();
   sparse_aliases_.clear();
   grid_map_.clear();
@@ -209,10 +212,21 @@ void Astar::SetTimeLimit(double seconds) {
 }
 
 bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
+  return SearchImpl(start,goal,false,0.,{});
+}
+
+bool Astar::SearchTowards(const Eigen::Vector3i& start,const Eigen::Vector3i& goal,
+                         double height,StopReader stop,bool accept_goal) {
+  return SearchImpl(start,goal,true,height,stop,accept_goal);
+}
+
+bool Astar::SearchImpl(const Eigen::Vector3i& start,const Eigen::Vector3i& goal,
+                      bool progress,double goal_height,const StopReader &stop,bool accept_goal) {
   auto t0 = std::chrono::high_resolution_clock::now();
   const auto began = std::chrono::steady_clock::now();
   timed_out_ = false;
   blocked_edges_.clear();
+  partial_result_.clear();
 
   if (reader_) Reset();
 
@@ -222,16 +236,23 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
   }
   
   //检测是否起始点和终点都符合要求
-  if (!IsValidNodeCoord(start[0],start[2],start[1]) || !IsValidNodeCoord(goal[0],goal[2],goal[1]))
+  if (!IsValidNodeCoord(start[0],start[2],start[1]) ||
+      (!progress && !IsValidNodeCoord(goal[0],goal[2],goal[1])))
   {
     return false;
   }
   
   auto start_node = NodeAt(start[0],start[2],start[1]);
-  auto goal_node = NodeAt(goal[0],goal[2],goal[1]);
+  const bool goal_in_map=goal[0]>=0 && goal[0]<max_layers_ &&
+      goal[2]>=0 && goal[2]<max_y_ && goal[1]>=0 && goal[1]<max_x_;
+  Node hint(Eigen::Vector3i(goal[0],goal[2],goal[1]),nullptr);hint.height=goal_height;
+  auto goal_node = goal_in_map?NodeAt(goal[0],goal[2],goal[1]):&hint;
+  const bool valid_goal=accept_goal && goal_in_map && goal_node->cost<=cost_threshold_ &&
+      (!progress || std::abs(goal_node->height-goal_height)<=.021);
+  if(progress && (!std::isfinite(goal_height) || start_node->cost>cost_threshold_))return false;
   start_node->g = 0.0;
 
-  if (goal_node->cost > cost_threshold_) {
+  if (!progress && goal_node->cost > cost_threshold_) {
     printf("goal node is not reachable, cost: %f, layer: %d\n", goal_node->cost, goal_node->layer);
     return false;
   }
@@ -244,13 +265,20 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
 
   printf("start searching\n");
 
-  Node* best_node = start_node;
+  Node* best_node = nullptr;
+  double best_score=std::numeric_limits<double>::infinity();
+  std::size_t stop_checks=0;
+  const auto save_partial=[&]() {
+    for(auto *p=best_node;p && p->parent;p=p->parent)partial_result_.push_back(p);
+    std::reverse(partial_result_.begin(),partial_result_.end());
+  };
   std::size_t iterations = 0;
   while (!open_set.empty()) {
     if ((iterations++ & 63) == 0 && time_limit_seconds_ > 0. &&
         std::chrono::duration<double>(std::chrono::steady_clock::now()-began).count() >= time_limit_seconds_) {
       timed_out_ = true;
       search_result_.clear();
+      if(progress)save_partial();
       return false;
     }
     // 步骤1：从开放集取出 f 值最小的节点（当前节点）
@@ -258,10 +286,10 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
     open_set.pop();
 
     // 步骤2：判断是否到达终点
-    const bool reached_goal = goal_node->surface_id < 0
+    const bool reached_goal = valid_goal && (goal_node->surface_id < 0
         ? current_node->idx == goal_node->idx
         : current_node->idx.tail<2>() == goal_node->idx.tail<2>() &&
-          SameGroundAtXY(current_node, goal_node);
+          SameGroundAtXY(current_node, goal_node));
     if (reached_goal) {
       while (current_node->parent != nullptr) {
         search_result_.emplace_back(current_node);
@@ -278,6 +306,18 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
 
     // 步骤3：将当前节点加入封闭集（标记为已访问）
     closed_set[VisitKey(current_node)] = current_node;
+    if(progress && current_node->parent && stop && stop_checks<64) {
+      const double travel=(current_node->idx.tail<2>()-start_node->idx.tail<2>()).cast<double>().norm()*resolution_;
+      const double remaining=std::hypot((current_node->idx.tail<2>()-goal_node->idx.tail<2>()).cast<double>().norm()*resolution_,
+                                        current_node->height-goal_height);
+      const double score=remaining+.002*current_node->g*resolution_;
+      if(travel>=.30 && score<best_score) {
+        ++stop_checks;
+        if(stop(current_node->layer,current_node->idx[1],current_node->idx[2])) {
+          best_node=current_node;best_score=score;
+        }
+      }
+    }
     // 步骤4：确定当前节点所在的图层（基于地形特征动态调整）
     int layer = DecideLayer(current_node);
     // 步骤5：遍历所有邻居节点（8方向+对角线，共9个邻居）
@@ -326,10 +366,11 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
       if ((measured && !supported_edge(neighbor_node)) || (!measured && neighbor_node->cost > cost_threshold_ &&
           (abs(neighbor_node->ele) < 0.5 ||
            std::abs(neighbor_node->height - current_node->height) > 0.3))) {
-        if (blocked_edge_radius_ > 0 && blocked_edges_.size() < 256 &&
-            std::hypot(double(i) - start[2], double(j) - start[1]) <= blocked_edge_radius_ &&
+        if (blocked_edge_radius_ > 0 && blocked_edges_.size() < (progress?4096u:256u) &&
+            (progress || std::hypot(double(i) - start[2], double(j) - start[1]) <= blocked_edge_radius_) &&
+            (progress ||
             (double(i) - start[2]) * (double(goal[2]) - start[2]) +
-            (double(j) - start[1]) * (double(goal[1]) - start[1]) > 0.) {
+            (double(j) - start[1]) * (double(goal[1]) - start[1]) > 0.)) {
           const auto& from = current_node->idx;
           blocked_edges_.try_emplace(GetHash(Eigen::Vector3i(layer, i, j)),
               std::array<int, 6>{layer, i, j, current_node->layer, from[1], from[2]});
@@ -363,17 +404,6 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
       }
     }  
 
-    if (open_set.empty())
-    {
-      /* code */
-      while (current_node->parent != nullptr) {
-        // search_result_.emplace_back(Eigen::Vector3i(
-        //     current_node->layer, current_node->idx[1],
-        //     current_node->idx[2]));
-        search_result_.emplace_back(current_node);
-        current_node = current_node->parent;
-      }
-    }
   }
 
 // 若open_set为空仍未找到终点，说明无路径
@@ -384,6 +414,7 @@ bool Astar::Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal) {
   if (debug_) {
     ConvertClosedSetToMatrix(closed_set);// 调试模式下记录访问过的节点
   }
+  if(progress)save_partial();
   return false;
 }
 
@@ -513,6 +544,13 @@ Eigen::MatrixXd Astar::GetResultMatrix() const {
     path_matrix(i, 2) = search_result_[i]->idx[2];
   }
   return path_matrix;
+}
+
+Eigen::MatrixXd Astar::GetPartialResultMatrix() const {
+  Eigen::MatrixXd out(partial_result_.size(),3);
+  for(std::size_t i=0;i<partial_result_.size();++i)
+    out.row(i)<<partial_result_[i]->layer,partial_result_[i]->idx[1],partial_result_[i]->idx[2];
+  return out;
 }
 
 void Astar::ConvertClosedSetToMatrix(

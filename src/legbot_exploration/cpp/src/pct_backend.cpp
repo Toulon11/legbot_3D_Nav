@@ -5,6 +5,10 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <cstring>
+#include <sstream>
+#include <iomanip>
+#include <tuple>
 #include <mutex>
 #include <stdexcept>
 
@@ -59,10 +63,23 @@ std::vector<PctUnknownBlocker> read_unknown_blockers(PyObject *details,std::uint
 }
 
 }
+struct PctInspectionSnapshot {
+  using Buffer=std::shared_ptr<const std::vector<std::uint8_t>>;
+  std::vector<Buffer> surfaces,returns,changes;
+  std::vector<std::array<int,3>> changed_blocks;
+  std::uint64_t version=0,previous_version=0,epoch=0;
+  int first_layer=0;
+  std::string metadata;
+  bool reset=false;
+};
+
 struct PctBackend::Impl {
   std::string root,error,settings_json,metadata="{}";
   double height;
   std::size_t max_surfaces,max_cells,surface_records=0;
+  std::map<std::array<int,3>,PctInspectionSnapshot::Buffer> export_surfaces;
+  std::map<std::array<int,2>,PctInspectionSnapshot::Buffer> export_returns;
+  std::uint64_t export_version=0;
   std::vector<float> xyz;
   PyObject *backend=nullptr;
   std::atomic<std::uint64_t> committed_resolved_floor_task{0};
@@ -118,13 +135,18 @@ struct PctBackend::Impl {
   PyObject *call(const char *method,std::uint64_t version,const Point &start,
                  const Point *target=nullptr,std::optional<XY> floor=std::nullopt,
                  std::optional<double> heading=std::nullopt,std::optional<double> platform_reference=std::nullopt,
-                 std::optional<double> budget=std::nullopt) {
+                 std::optional<double> budget=std::nullopt,
+                 std::optional<double> minimum_stop_ground=std::nullopt) {
     ensure();
     Object buffer(PyMemoryView_FromMemory(reinterpret_cast<char*>(xyz.data()),
         static_cast<Py_ssize_t>(xyz.size()*sizeof(float)),PyBUF_READ));
     if(!buffer.p) throw std::runtime_error(python_error());
-    Object floor_arg(budget && floor?Py_BuildValue("(dd)",(*floor)[0],(*floor)[1]):Py_NewRef(Py_None));
-    PyObject *answer=target && budget?PyObject_CallMethod(backend,method,"OK(ddd)(ddd)Od",
+    Object floor_arg(floor?Py_BuildValue("(dd)",(*floor)[0],(*floor)[1]):Py_NewRef(Py_None));
+    Object budget_arg(budget?PyFloat_FromDouble(*budget):Py_NewRef(Py_None));
+    PyObject *answer=target && minimum_stop_ground?PyObject_CallMethod(backend,method,"OK(ddd)(ddd)OOd",
+        buffer.p,static_cast<unsigned long long>(version),start[0],start[1],start[2],
+        (*target)[0],(*target)[1],(*target)[2],floor_arg.p,budget_arg.p,*minimum_stop_ground):
+        target && budget?PyObject_CallMethod(backend,method,"OK(ddd)(ddd)Od",
         buffer.p,static_cast<unsigned long long>(version),start[0],start[1],start[2],
         (*target)[0],(*target)[1],(*target)[2],floor_arg.p,*budget):
         target && floor?PyObject_CallMethod(backend,method,"OK(ddd)(ddd)(dd)",
@@ -202,10 +224,20 @@ bool PctBackend::refresh(std::uint64_t version) {
   }catch(const std::exception &e){impl_->error=e.what();return false;}
 }
 PctResult PctBackend::plan(std::uint64_t version,const Point &start,const Point &target,bool explicit_surface,
-    std::optional<XY> floor,bool collect_blockers,bool stair_segment,std::optional<double> budget) {
-  return plan_with_method(budget?"plan_review_surface":stair_segment?"plan_stair_surface":
+    std::optional<XY> floor,bool collect_blockers,bool stair_segment,std::optional<double> budget,
+    bool allow_partial,bool approach_only,std::optional<double> minimum_stop_ground) {
+  return plan_with_method(allow_partial?(approach_only?"plan_approach_surface":"plan_progress_surface"):
+      budget?"plan_review_surface":stair_segment?"plan_stair_surface":
       explicit_surface?(collect_blockers?"plan_surface_with_blockers":"plan_surface"):"plan",
-      version,start,target,floor,budget);
+      version,start,target,floor,budget,allow_partial?minimum_stop_ground:std::nullopt);
+}
+bool PctBackend::commit_progress(std::uint64_t version,const Point &target,const Point &endpoint,
+                                std::optional<XY> floor) {
+  Gil gil;
+  try {
+    Object result(impl_->call("commit_progress_surface",version,target,&endpoint,floor));
+    impl_->error.clear();return PyObject_IsTrue(result.p)==1;
+  } catch(const std::exception &e) {impl_->error=e.what();return false;}
 }
 PctResult PctBackend::plan_shift(std::uint64_t version,const Point &start,const Point &target) {
   return plan_with_method("plan_shift",version,start,target);
@@ -258,11 +290,12 @@ std::vector<PctObservationPose> PctBackend::observation_poses(std::uint64_t vers
   } catch(const std::exception &e){PyErr_Clear();impl_->error=e.what();return {};}
 }
 PctResult PctBackend::plan_with_method(const char *method,std::uint64_t version,const Point &start,
-    const Point &target,std::optional<XY> floor,std::optional<double> budget) {
+    const Point &target,std::optional<XY> floor,std::optional<double> budget,
+    std::optional<double> minimum_stop_ground) {
   PctResult out;
   Gil gil;
   try {
-    Object answer(impl_->call(method,version,start,&target,floor,std::nullopt,std::nullopt,budget));
+    Object answer(impl_->call(method,version,start,&target,floor,std::nullopt,std::nullopt,budget,minimum_stop_ground));
     if(!PyTuple_Check(answer.p) || PyTuple_Size(answer.p)!=3) throw std::runtime_error("invalid PCT result");
     const char *reason=PyUnicode_AsUTF8(PyTuple_GetItem(answer.p,0));
     if(!reason) throw std::runtime_error(python_error());
@@ -370,6 +403,7 @@ PctFrontiers PctBackend::frontiers(std::uint64_t version,const Point &base,doubl
     if(auto *v=PyDict_GetItemString(answer.p,"query_ms"))out.query_ms=PyFloat_AsDouble(v);
     if(auto *v=PyDict_GetItemString(answer.p,"query_pending"))out.query_pending=PyObject_IsTrue(v);
     if(auto *v=PyDict_GetItemString(answer.p,"support_query_pending"))out.support_query_pending=PyObject_IsTrue(v);
+    if(auto *v=PyDict_GetItemString(answer.p,"support_progress_only"))out.support_progress_only=PyObject_IsTrue(v);
     if(auto *v=PyDict_GetItemString(answer.p,"query_checked_clusters"))out.query_checked_clusters=PyLong_AsSize_t(v);
     if(auto *v=PyDict_GetItemString(answer.p,"observer_prepare_ms"))out.observer_prepare_ms=PyFloat_AsDouble(v);
     if(auto *phases=PyDict_GetItemString(answer.p,"observer_phase_ms")) {
@@ -461,6 +495,15 @@ PctFrontiers PctBackend::frontiers(std::uint64_t version,const Point &base,doubl
           c.observation_yaws.push_back(yaw);
         }
       }
+      if(auto *gains=PyDict_GetItemString(item,"observation_gains")) {
+        if(!PyList_Check(gains) || PyList_Size(gains)!=static_cast<Py_ssize_t>(c.observations.size()))
+          throw std::runtime_error("invalid observation gains");
+        for(Py_ssize_t j=0;j<PyList_Size(gains);++j) {
+          const auto gain=PyFloat_AsDouble(PyList_GetItem(gains,j));
+          if(!std::isfinite(gain) || gain<0.)throw std::runtime_error("invalid visible gain");
+          c.observation_gains.push_back(gain);
+        }
+      }
       out.clusters.push_back(std::move(c));
     }
     if(auto *metrics=PyDict_GetItemString(answer.p,"map")) {
@@ -547,6 +590,7 @@ PctObservation PctBackend::observation_task(std::uint64_t version,const std::str
     if(!answer.p || !PyDict_Check(answer.p))throw std::runtime_error(python_error());
     if(auto *v=PyDict_GetItemString(answer.p,"ready"))out.ready=PyObject_IsTrue(v);
     if(auto *v=PyDict_GetItemString(answer.p,"fresh"))out.fresh=PyObject_IsTrue(v);
+    if(auto *v=PyDict_GetItemString(answer.p,"evidence"))out.evidence=PyLong_AsUnsignedLongLong(v);
     if(auto *v=PyDict_GetItemString(answer.p,"yaw"))out.yaw=PyFloat_AsDouble(v);
     if(auto *v=PyDict_GetItemString(answer.p,"side_yaw");v && v!=Py_None)out.side_yaw=PyFloat_AsDouble(v);
     if(auto *v=PyDict_GetItemString(answer.p,"gain"))out.gain=PyLong_AsSize_t(v);
@@ -689,6 +733,102 @@ PctInspection PctBackend::inspect(std::uint64_t version,const Point &base,bool d
   }catch(const std::exception &e){PyErr_Clear();impl_->error=e.what();out.preview_state="pct_inspection_unavailable";}
   return out;
 }
+std::shared_ptr<const PctInspectionSnapshot> PctBackend::capture_inspection(std::uint64_t version,bool full) {
+  Gil gil;
+  try {
+    impl_->ensure();
+    Object answer(PyObject_CallMethod(impl_->backend,"capture_inspection","K",static_cast<unsigned long long>(version)));
+    if(!answer.p || !PyDict_Check(answer.p))throw std::runtime_error(python_error());
+    auto snapshot=std::make_shared<PctInspectionSnapshot>();
+    snapshot->version=version;snapshot->previous_version=impl_->export_version;
+    snapshot->reset=PyDict_GetItemString(answer.p,"reset")==Py_True;
+    snapshot->epoch=PyLong_AsUnsignedLongLong(PyDict_GetItemString(answer.p,"epoch"));
+    snapshot->first_layer=PyLong_AsLong(PyDict_GetItemString(answer.p,"first_layer"));
+    if(snapshot->reset){impl_->export_surfaces.clear();impl_->export_returns.clear();}
+    const auto update=[&](const char *field,auto &cache,auto changed) {
+      auto *rows=PyDict_GetItemString(answer.p,field);
+      if(!rows || !PyList_Check(rows))throw std::runtime_error("invalid export fragments");
+      for(Py_ssize_t i=0;i<PyList_Size(rows);++i) {
+        auto *row=PyList_GetItem(rows,i);auto *key=PyTuple_GetItem(row,0);auto *bytes=PyTuple_GetItem(row,1);
+        typename std::decay_t<decltype(cache)>::key_type address{};
+        if(!key || !PyTuple_Check(key) || PyTuple_Size(key)!=address.size() || !bytes || !PyBytes_Check(bytes))
+          throw std::runtime_error("invalid export fragment");
+        for(std::size_t j=0;j<address.size();++j)address[j]=PyLong_AsLong(PyTuple_GetItem(key,j));
+        auto payload=std::make_shared<std::vector<std::uint8_t>>();
+        const auto *begin=reinterpret_cast<const std::uint8_t*>(PyBytes_AsString(bytes));
+        payload->assign(begin,begin+PyBytes_Size(bytes));
+        if(payload->empty())cache.erase(address);else cache[address]=payload;
+        changed(address,payload);
+      }
+    };
+    update("surfaces",impl_->export_surfaces,[&](const auto &key,const auto &payload){
+      snapshot->changed_blocks.push_back(key);snapshot->changes.push_back(payload);});
+    update("returns",impl_->export_returns,[](const auto &,const auto &){});
+    if(full || snapshot->reset) {
+      for(const auto &[_,buffer]:impl_->export_surfaces)snapshot->surfaces.push_back(buffer);
+      for(const auto &[_,buffer]:impl_->export_returns)snapshot->returns.push_back(buffer);
+    }
+    Object json(PyImport_ImportModule("json"));
+    Object encoded(json.p?PyObject_CallMethod(json.p,"dumps","O",PyDict_GetItemString(answer.p,"metadata")):nullptr);
+    if(!encoded.p || PyErr_Occurred())throw std::runtime_error(python_error());
+    snapshot->metadata=PyUnicode_AsUTF8(encoded.p);
+    impl_->export_version=version;impl_->error.clear();return snapshot;
+  }catch(const std::exception &e){PyErr_Clear();impl_->error=e.what();return {};}
+}
+
+PctInspection PctBackend::render_inspection(const PctInspectionSnapshot &snapshot,
+    std::size_t max_display,bool full,std::string *coverage_update) {
+  // Entirely native and snapshot-owned: no map lock, GIL or backend access.
+  struct Row {
+    float x,y,z;std::uint32_t rgb;float cost,ceiling,clearance;
+    std::uint32_t source,flags,slice;float passage,relief,terrain,inflated,node,clear;
+  };
+  static_assert(sizeof(Row)==64);
+  PctInspection out;out.metadata=snapshot.metadata;
+  const auto rows=[&](const auto &buffers,auto operation) {
+    for(const auto &buffer:buffers)for(std::size_t at=0;at+sizeof(Row)<=buffer->size();at+=sizeof(Row)) {
+      Row row;std::memcpy(&row,buffer->data()+at,sizeof(row));operation(row);
+    }
+  };
+  if(coverage_update) {
+    std::ostringstream json;json<<std::setprecision(9)<<"{\"version\":"<<snapshot.version
+      <<",\"base_version\":"<<snapshot.previous_version<<",\"epoch\":"<<snapshot.epoch
+      <<",\"full\":"<<(full||snapshot.reset?"true":"false")<<",\"blocks\":[";
+    bool first=true;
+    for(const auto &key:snapshot.changed_blocks){if(!first)json<<',';first=false;
+      json<<'['<<key[0]<<','<<key[1]<<','<<key[2]<<']';}
+    json<<"],\"coverage\":[";first=true;
+    rows(full||snapshot.reset?snapshot.surfaces:snapshot.changes,[&](const Row &row){
+      if(!first)json<<',';first=false;json<<'['<<row.x<<','<<row.y<<','<<row.z<<','<<row.flags<<']';});
+    json<<"]}";*coverage_update=json.str();
+  }
+  if(full) {
+    std::vector<Row> records;
+    std::size_t size=0;for(const auto &buffer:snapshot.surfaces)size+=buffer->size()/64;
+    records.reserve(size);
+    rows(snapshot.surfaces,[&](Row row){
+      row.slice=static_cast<std::int32_t>(row.slice)-snapshot.first_layer;records.push_back(row);});
+    const auto append=[](auto &target,const auto &value){
+      auto *begin=reinterpret_cast<const std::uint8_t*>(&value);
+      target.insert(target.end(),begin,begin+sizeof(value));};
+    out.surfaces.resize(records.size()*64);
+    if(!records.empty())std::memcpy(out.surfaces.data(),records.data(),out.surfaces.size());
+    const auto rank=[](std::uint32_t rgb){return rgb==0x20c860?0:rgb==0x808080?1:rgb==0x4070d0?2:3;};
+    std::sort(records.begin(),records.end(),[&](const Row &a,const Row &b){
+      return std::make_tuple(a.x,a.y,a.z,rank(a.rgb),a.cost)<std::make_tuple(b.x,b.y,b.z,rank(b.rgb),b.cost);});
+    records.erase(std::unique(records.begin(),records.end(),[](const Row &a,const Row &b){
+      return a.x==b.x && a.y==b.y && a.z==b.z;}),records.end());
+    const auto stride=std::max<std::size_t>(1,(records.size()+std::max<std::size_t>(1,max_display)-1)/std::max<std::size_t>(1,max_display));
+    for(std::size_t i=0;i<records.size();i+=stride)append(out.display,records[i]);
+    struct PointRow{float x,y,z;std::uint32_t rgb;};
+    std::size_t ceiling=0;
+    rows(snapshot.surfaces,[&](const Row &row){if(std::isfinite(row.ceiling) && ceiling++%stride==0)
+      append(out.ceilings,PointRow{row.x,row.y,row.ceiling,0xffb030});});
+    for(const auto &buffer:snapshot.returns)out.returns.insert(out.returns.end(),buffer->begin(),buffer->end());
+  }
+  out.valid=true;return out;
+}
+
 std::size_t PctBackend::point_count() const{return impl_->surface_records;}
 const std::string &PctBackend::last_error() const{return impl_->error;}
 const std::string &PctBackend::map_metadata() const{return impl_->metadata;}

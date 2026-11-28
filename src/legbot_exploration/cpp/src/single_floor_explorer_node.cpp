@@ -86,6 +86,13 @@ le::ExplorationSettings declare_exploration_settings(
     throw std::invalid_argument("observation_min_distance must exceed valid observation_goal_xy_tolerance");
   options.cooldown_ = node.declare_parameter<double>("failed_frontier_cooldown", 45.0);
   options.pct_round_budget_=node.declare_parameter<double>("pct_candidate_round_budget",1.0);
+  options.pct_detour_ratio_=node.declare_parameter<double>("pct_detour_ratio",2.0);
+  options.pct_detour_excess_=node.declare_parameter<double>("pct_detour_excess",1.5);
+  options.pct_compare_clusters_=node.declare_parameter<int>("pct_compare_clusters",3);
+  if(!std::isfinite(options.pct_detour_ratio_) || options.pct_detour_ratio_<=1. ||
+     !std::isfinite(options.pct_detour_excess_) || options.pct_detour_excess_<0. ||
+     options.pct_compare_clusters_<1 || options.pct_compare_clusters_>3)
+    throw std::invalid_argument("invalid PCT detour thresholds or comparison count (1..3)");
   options.pct_local_above_=node.declare_parameter<double>("pct_local_height_above",3.5);
   options.pct_local_below_=node.declare_parameter<double>("pct_local_height_below",1.5);
   options.pct_direction_weight_=node.declare_parameter<double>("pct_direction_weight",.5);

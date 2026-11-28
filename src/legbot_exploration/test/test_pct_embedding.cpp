@@ -1,6 +1,7 @@
 #include "legbot_exploration/pct_backend.hpp"
 #include "legbot_exploration/shared_layer_map.hpp"
 #include <thread>
+#include <algorithm>
 #include <cassert>
 #include <cmath>
 #include <iostream>
@@ -77,6 +78,23 @@ int main(int argc,char **argv) {
     }
   }
   assert(observation_planned);
+  // Immutable export can be rendered after the map has changed, with no
+  // backend/Python access. Full and delta streams carry committed versions.
+  auto snapshot=backend.capture_inspection(1);
+  assert(snapshot);
+  std::string update;
+  auto native=le::PctBackend::render_inspection(*snapshot,1000,true,&update);
+  assert(native.valid && native.surfaces.size()==inspection.surfaces.size());
+  const auto sorted_rows=[](const auto &data) {
+    std::vector<std::array<std::uint8_t,64>> rows(data.size()/64);
+    for(std::size_t i=0;i<rows.size();++i)std::copy_n(data.data()+i*64,64,rows[i].begin());
+    std::sort(rows.begin(),rows.end());return rows;
+  };
+  assert(sorted_rows(native.surfaces)==sorted_rows(inspection.surfaces));
+  assert(update.find("\"version\":1")!=std::string::npos);
+  auto unchanged=backend.capture_inspection(1,false);
+  auto delta=le::PctBackend::render_inspection(*unchanged,1000,false,&update);
+  assert(delta.valid && delta.surfaces.empty() && update.find("\"coverage\":[]")!=std::string::npos);
   const auto records=backend.point_count();
   backend.append(cloud);
   assert(backend.point_count()==records && records<cloud.size());
@@ -88,6 +106,14 @@ int main(int argc,char **argv) {
   for(int k=1;k<25;++k) obstacle.push_back({0,0,k*0.05});
   backend.append(obstacle);
   assert(backend.refresh(3));
+  const auto old_render=le::PctBackend::render_inspection(*snapshot,1000,true);
+  assert(old_render.surfaces==native.surfaces && old_render.returns==native.returns);
+  auto changed_snapshot=backend.capture_inspection(3);
+  assert(changed_snapshot);
+  auto changed_export=le::PctBackend::render_inspection(*changed_snapshot,1000,true);
+  auto changed_legacy=backend.inspect(3,{},true,1000,false,3.,.07,8,1000);
+  assert(changed_export.valid && changed_legacy.valid);
+  assert(sorted_rows(changed_export.surfaces)==sorted_rows(changed_legacy.surfaces));
   // Place the start inside the configured 0.35 m body + 0.05 m margin.
   auto unsafe=backend.plan(3,{-0.3,0,0.32},{0.5,0,0.32});
   assert(unsafe.reason=="pct_unsafe_start");

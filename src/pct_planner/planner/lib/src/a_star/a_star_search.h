@@ -94,6 +94,12 @@ class Astar {
   void Debug() { debug_ = true; }
 
   bool Search(const Eigen::Vector3i& start, const Eigen::Vector3i& goal);
+  using StopReader = std::function<bool(int,int,int)>;
+  // Opt-in goal-directed search. An unknown goal is only a heuristic hint;
+  // every returned vertex still comes from the measured map accessor.
+  bool SearchTowards(const Eigen::Vector3i& start, const Eigen::Vector3i& goal,
+                     double goal_height, StopReader stop, bool accept_goal=true);
+  Eigen::MatrixXd GetPartialResultMatrix() const;
 
   std::vector<PathPoint> GetPathPoints() const;
 
@@ -104,6 +110,9 @@ class Astar {
   Eigen::MatrixXd GetEleLayer(int layer) const;
 
  private:
+  bool SearchImpl(const Eigen::Vector3i& start,const Eigen::Vector3i& goal,
+                  bool progress,double goal_height,const StopReader &stop,bool accept_goal=true);
+  std::vector<Node*> partial_result_;
   double time_limit_seconds_ = 0.; // Original API is unlimited unless requested.
   bool timed_out_ = false;
   int blocked_edge_radius_ = 0;

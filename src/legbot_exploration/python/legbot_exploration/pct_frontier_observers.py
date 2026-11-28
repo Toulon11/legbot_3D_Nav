@@ -108,41 +108,41 @@ class FrontierObservers:
             clearance_radius=max(s.robot_radius+s.safety_margin,s.ground_lidar_min_range)+.15
             halo=math.ceil(clearance_radius/s.resolution)+1
             from .map_costs import gather
-            # Frontiers belong to the scheduling cut. Physical observers
-            # may stand on any measured representation of the same height.
-            # In particular an open-ceiling G may exist only on its first cut.
-            # Borrowing the stance does not declare the higher cut known.
-            for layer in sorted(m.layers):
-                for bx in range(low[0], high[0]+1):
-                    for by in range(low[1], high[1]+1):
-                        dependency = layer, bx, by
-                        dependencies.add(dependency)
-                        block = m.blocks.get(dependency)
-                        if block is None:continue
-                        valid=m.traversable_block(dependency,block)
-                        valid &= (block['G']>=data[:,2].min()-s.step_max-1e-5)&(
-                                  block['G']<=data[:,2].max()+s.step_max+1e-5)
-                        ii,jj=np.nonzero(valid)
-                        if not len(ii):continue
-                        points=np.column_stack(((bx*b+ii)*s.resolution+s.origin_x,
-                            (by*b+jj)*s.resolution+s.origin_y,block['G'][ii,jj]))
-                        costs=block['inflated_terrain_cost'][ii,jj]
-                        known=(gather(m,dependency,halo,'measured',False)&
-                            ~gather(m,dependency,halo,'unknown',True)&
-                            ~gather(m,dependency,halo,'solid',True))
-                        clearance=distance_transform_edt(known)[halo:halo+b,halo:halo+b]*s.resolution
-                        margins=clearance[ii,jj]
-                        for dx in (-1,0,1):
-                            for dy in (-1,0,1):
-                                dependencies.update((alias,bx+dx,by+dy) for alias in (layer-1,layer,layer+1))
-                        for offset in range(0,len(points),256):
-                            batch=points[offset:offset+256]
-                            nearest=self.distances(batch,seeds,s.step_max)
-                            keep=nearest<=index.radius+1e-8
-                            if keep.any():
-                                choices.append(np.column_stack((batch[keep],nearest[keep],
-                                    costs[offset:offset+256][keep],margins[offset:offset+256][keep],
-                                    np.full(int(keep.sum()),layer))))
+            lower=data[:,2].min()-s.step_max-1e-5
+            upper=data[:,2].max()+s.step_max+1e-5
+            # Absent owner addresses are dependencies too: a newly confirmed
+            # station in this G band must reopen the cache.
+            for alias in range(math.floor((lower-s.origin_z)/s.slice_dh),
+                               math.floor((upper-s.origin_z)/s.slice_dh)+3):
+                dependencies.update((alias,bx,by) for bx in range(low[0]-1,high[0]+2)
+                                    for by in range(low[1]-1,high[1]+2))
+            masks=m.support_blocks(low*b,(high+1)*b-1,lower,upper)
+            for dependency,selected in sorted(masks.items()):
+                layer,bx,by=dependency
+                dependencies.add(dependency)
+                block=m.blocks[dependency]
+                valid=m.traversable_block(dependency,block)&selected
+                ii,jj=np.nonzero(valid)
+                if not len(ii):continue
+                points=np.column_stack(((bx*b+ii)*s.resolution+s.origin_x,
+                    (by*b+jj)*s.resolution+s.origin_y,block['G'][ii,jj]))
+                costs=block['inflated_terrain_cost'][ii,jj]
+                known=(gather(m,dependency,halo,'measured',False)&
+                    ~gather(m,dependency,halo,'unknown',True)&
+                    ~gather(m,dependency,halo,'solid',True))
+                clearance=distance_transform_edt(known)[halo:halo+b,halo:halo+b]*s.resolution
+                margins=clearance[ii,jj]
+                for dx in (-1,0,1):
+                    for dy in (-1,0,1):
+                        dependencies.update((alias,bx+dx,by+dy) for alias in (layer-1,layer,layer+1))
+                for offset in range(0,len(points),256):
+                    batch=points[offset:offset+256]
+                    nearest=self.distances(batch,seeds,s.step_max)
+                    keep=nearest<=index.radius+1e-8
+                    if keep.any():
+                        choices.append(np.column_stack((batch[keep],nearest[keep],
+                            costs[offset:offset+256][keep],margins[offset:offset+256][keep],
+                            np.full(int(keep.sum()),layer))))
             values=np.vstack(choices) if choices else np.empty((0,7))
             if len(values):
                 order=np.lexsort((-values[:,5],values[:,4],values[:,2],values[:,1],values[:,0]))
@@ -220,6 +220,32 @@ class FrontierObservers:
             cells.update(tuple(m.indices(p)) for p in xyz if abs(p[2]-floor[0])<=floor[1]+1e-7)
         return sorted(cells)
 
+    def _current_stance(self, members, base, completed, floor, physical, admission, rejected, deadline, minimum_gain):
+        """Try the actual XY before proposing another movement. Same full
+        parking, blind-area, visibility and measured occlusion policy as a
+        newly reached station; this does not bypass an unknown footprint.
+        """
+        index=self._index();s=index.map.settings
+        pose=tuple(map(float,base))
+        if pose in rejected or abs(pose[2]-floor[0])>floor[1]+1e-7:return []
+        if any(len(p)==3 and math.dist(p[:2],pose[:2])<=s.observation_revisit_radius and
+               abs(p[2]-pose[2])<=s.step_max for p in completed):return []
+        seeds=np.asarray([p for p,_ in physical] if physical is not None else
+            sorted({(s.origin_x+k[1]*s.resolution,s.origin_y+k[2]*s.resolution,index.nodes[k].height)
+                    for k in members})).reshape(-1,3)
+        tolerance=admission[2]
+        radius=max(0.,index.radius-tolerance-s.resolution/math.sqrt(2.))
+        near=(np.linalg.norm(seeds[:,:2]-pose[:2],axis=1)<=radius)&(abs(seeds[:,2]-pose[2])<=s.step_max)
+        if not near.any():return []
+        done=[p for p in completed if len(p)<5 or any(k in members for k,_ in index.completed_views.get(p,()))]
+        signature=('stationary',frozenset((k,index.nodes[k]) for k in members),frozenset(done),floor,tolerance,minimum_gain)
+        search=self.searches.setdefault(signature,dict(groups=set(self.groups(members)),tested=set(),
+            visible={},rays={},scores={},pose_rays={}))
+        self.searches.move_to_end(signature)
+        while len(self.searches)>64:self.searches.popitem(last=False)
+        return self._safe_views([pose],{pose:0.},seeds,done,search,admission,rejected,minimum_gain,
+            deadline,base,time.monotonic(),lambda p:(False,0.,p),None,False)
+
     def select(self, members, base=None, minimum_distance=0., completed=(), component=None,
                window=None, deadline=None, continuation=None, floor=None, minimum_gain=1, physical=None,
                connectivity=None, admission=None, rejected=(), ascent_limits=None,
@@ -231,6 +257,16 @@ class FrontierObservers:
         self.unknown_blockers=[]
         index = self._index()
         s = index.map.settings
+        self.last_views={};self.last_unreachable=0
+        if (base is not None and minimum_distance>0 and floor is not None and
+                continuation is None and ascent_limits is None and admission is not None):
+            current=self._current_stance(members,base,completed,floor,physical,admission,rejected,deadline,minimum_gain)
+            if current:
+                self.geometry_ms=1000*(time.monotonic()-began)-self.visibility_ms
+                self.geometry_ms=max(0.,self.geometry_ms)
+                self.phase_ms['stationary_prepare_ms']=self.geometry_ms
+                return current
+            self.pending=False
         groups = self.groups(members)
         connectivity = connectivity if connectivity is not None else index.map.connectivity
         choices = {}

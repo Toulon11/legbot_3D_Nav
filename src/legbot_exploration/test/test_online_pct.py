@@ -331,37 +331,27 @@ class PctAdapterTest(unittest.TestCase):
         self.assertFalse(review.available((0.,0.,1.47)))
         self.assertTrue(review.available((0.,0.,3.)))
 
-    def test_blocker_review_accepts_the_actual_tread_without_inventing_expected_height(self):
+    def test_blocker_review_does_not_scan_an_already_measured_tread(self):
         adapter=OnlinePct(str(PCT))
         adapter.integrate(np.asarray([(0.,0.,z) for z in (.65,2.)]*3,dtype='float32').tobytes())
         adapter.prepare(b'',1)
         review=adapter.map.frontier_index.observation_model.blocker_review
-        review.begin([(0.,0.,.78)]);review.arm()
-        adapter.integrate(np.asarray([(0.,0.,.65)],dtype='float32').tobytes())
-        adapter.prepare(b'',2)
-        self.assertTrue(review.progress()['ready'])
-        self.assertAlmostEqual(next(adapter.map.columns[0,0].values()).height,.65,places=6)
-        self.assertTrue(adapter.map.column_layers[0,0])
-        review.finish()
+        self.assertFalse(review.begin([(0.,0.,.78)])['ready'])
         self.assertFalse(review.available((0.,0.,.65)))
         self.assertFalse(review.available((0.,0.,.78)))
+        self.assertAlmostEqual(next(adapter.map.columns[0,0].values()).height,.65,places=6)
 
-    def test_blocker_review_can_confirm_an_unchanged_obstacle_once(self):
+    def test_blocker_review_does_not_scan_a_known_unsafe_surface(self):
         adapter=OnlinePct(str(PCT))
         points=[(i*.1,j*.1,1.46) for i in range(-12,13) for j in range(-12,13)]
         points.append((0.,0.,1.60))
         adapter.integrate(np.asarray(points*3,dtype='float32').tobytes())
         pose=(0.,0.,1.78);targets=[[0.,0.,1.46,3]]
-        def op(version,name):return adapter.observation_task(b'',version,name,0,pose,0.,0.,targets)
-        op(1,'begin_blocker_review');op(1,'arm_blocker_review')
-        self.assertFalse(op(1,'blocker_review_progress')['ready'])
-        revision=adapter.map.revision
-        adapter.integrate(np.asarray([(0.,0.,1.46)],dtype='float32').tobytes())
-        self.assertTrue(op(2,'blocker_review_progress')['ready'])
-        self.assertEqual(adapter.map.revision,revision)
+        adapter.prepare(b'',1)
+        review=adapter.map.frontier_index.observation_model.blocker_review
+        self.assertTrue(review._target_status((0.,0.,1.46))['resolved'])
+        self.assertFalse(adapter.observation_task(b'',1,'begin_blocker_review',0,pose,0.,0.,targets)['ready'])
         self.assertFalse(adapter.map.point_safe_check(pose,floor=(1.46,.05))['ready'])
-        op(2,'finish_blocker_review')
-        self.assertFalse(op(3,'begin_blocker_review')['ready'])
 
     def test_blocker_review_without_target_returns_can_change_view_before_consuming_observation(self):
         adapter=OnlinePct(str(PCT))

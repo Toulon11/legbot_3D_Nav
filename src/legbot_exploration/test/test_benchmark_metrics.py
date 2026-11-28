@@ -12,6 +12,13 @@ from legbot_exploration.benchmark_reference import build_reference,save_referenc
 
 
 class BenchmarkTest(unittest.TestCase):
+    def test_partial_segment_is_not_a_complete_goal_planning_success(self):
+        m=ExperimentMetrics()
+        m.planning_result(dict(goal_id=1,attempt_id=1,planner='layer',usable=True,partial=True,planning_ms=10.))
+        m.planning_result(dict(goal_id=1,attempt_id=2,planner='layer',usable=True,partial=False,planning_ms=20.))
+        s=m.summary()['planning']
+        self.assertEqual(s['attempts'],2);self.assertEqual(s['usable'],1)
+        self.assertEqual(s['partial_segments'],1);self.assertEqual(s['success_rate'],.5)
     def reference(self,root,points):
         path=Path(root)/'reference.npz'
         np.savez(path,xyz=np.asarray(points),resolution=.1,metadata=json.dumps({'test':True}))
@@ -251,6 +258,57 @@ class BenchmarkTest(unittest.TestCase):
                             single_floor='floor_2',floor_dwell=0.)
         m.start(0.,0.)
         return m
+
+    def test_four_floor_windows_freeze_independently_and_share_one_result_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            floors=[dict(name='floor_'+str(i+1),height=h) for i,h in enumerate((0.,1.46,2.96,4.43))]
+            c=SurfaceCoverage(reference=self.reference(root,[[x,0,f['height']] for f in floors for x in (0.,.1)]))
+            m=ExperimentMetrics(c,floors,per_floor=True,floor_dwell=0.)
+            m.start(0.,0.)
+            for i,floor in enumerate(floors):
+                start=10.*(i+1);end=start+i+3
+                c.observe([[0.,0.,floor['height']]])
+                m.odometry([0.,0.,floor['height']+.32],start,2*start)
+                m.update_status(self.floor_status(started=start,height=floor['height']),2*start,start)
+                value=self.floor_status(started=start,ended=end,height=floor['height'])
+                if i==3:value['mission']=dict(returning=True)
+                m.update_status(value,2*end,end)
+                c.observe([[.1,0.,floor['height']]])  # Late scans cannot change the frozen floor.
+            m.finish('manual_finish',100.,50.)
+            writer=ResultWriter(root,dict(per_floor=True));r=writer.snapshot(m.summary())
+            writer.snapshot(m.summary())
+            self.assertEqual(r['schema_version'],5)
+            self.assertEqual(len(r['floors']),4)
+            self.assertNotIn('single_floor',r);self.assertNotIn('coverage_percent',r['metrics'])
+            for i,floor in enumerate(r['floors']):
+                self.assertEqual(floor['state'],'settled');self.assertTrue(floor['completed'])
+                self.assertEqual(floor['coverage_percent'],50.)
+                self.assertAlmostEqual(floor['reference_area_m2'],.02)
+                self.assertEqual(floor['exploration_sim_seconds'],i+3)
+                self.assertEqual(floor['exploration_wall_seconds'],2*(i+3))
+            self.assertEqual(len(list(Path(root).glob('*.json'))),1)
+            script=Path(__file__).resolve().parents[1]/'python/scripts/summarize_exploration_metrics'
+            subprocess.run([sys.executable,str(script),root],check=True,capture_output=True)
+            grouped=json.loads((Path(root)/'comparison.json').read_text())
+            self.assertEqual(len(grouped[0]['floors']),4)
+            self.assertEqual(grouped[0]['floors'][3]['per_run_metrics']['exploration_sim_seconds']['mean'],6.)
+
+    def test_skipped_and_unreached_floors_are_not_successful_zero_duration_trials(self):
+        m=ExperimentMetrics(floors=[dict(name='floor_1',height=0.),dict(name='floor_2',height=1.46),
+                                   dict(name='floor_3',height=2.96),dict(name='floor_4',height=4.43)],per_floor=True)
+        m.start(0.,0.)
+        skipped=self.floor_status(height=0.);skipped['pct_floor']['start_floor_skipped']=True
+        m.update_status(skipped,2.,1.)
+        m.instant_floor='floor_2';m.update_status(self.floor_status(),20.,10.)
+        m.finish('interrupted',24.,12.)
+        rows=m.summary()['floor_trials']
+        self.assertEqual([f['state'] for f in rows],['skipped','interrupted','not_started','not_started'])
+        self.assertEqual(rows[1]['exploration_sim_seconds'],2.)
+        self.assertIsNone(rows[1]['coverage_percent'])  # Independent reference is unavailable.
+        for i in (0,2,3):
+            self.assertFalse(rows[i]['completed'])
+            self.assertIsNone(rows[i]['exploration_sim_seconds'])
+            self.assertIsNone(rows[i]['coverage_percent'])
 
     def floor_status(self,started=10.,ended=None,height=1.46):
         return dict(state='pct_floor_exploration_started' if ended is None else 'pct_floor_handoff_with_deferred_frontiers',

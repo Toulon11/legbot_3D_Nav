@@ -4,6 +4,7 @@ import math
 import time
 import numpy as np
 from scipy.spatial.transform import Rotation
+from .navigation_evidence import footprint_status
 
 
 class ObservationPoseSearch:
@@ -175,25 +176,20 @@ class ObservationPoseSearch:
         choices={}
         valid_blocks={}
         for target in targets:
-            lo,hi=m.indices(target[:2]-2.)//s.block_size,m.indices(target[:2]+2.)//s.block_size
-            for layer in range(m.first_layer,m.last_layer+1):
-                for bx in range(lo[0],hi[0]+1):
-                    for by in range(lo[1],hi[1]+1):
-                        key=(layer,bx,by)
-                        block=m.blocks.get(key)
-                        if block is None:continue
-                        if key not in valid_blocks:
-                            valid_blocks[key]=np.nonzero(m.traversable_block(key,block,floor))
-                        valid=valid_blocks[key]
-                        for i,j in zip(*valid):
-                            cell=(bx*s.block_size+int(i),by*s.block_size+int(j))
-                            if not m.surface_observation.is_ground_source(cell,int(block['g_surface_id'][i,j])):continue
-                            ground=(s.origin_x+(bx*s.block_size+i)*s.resolution,
-                                    s.origin_y+(by*s.block_size+j)*s.resolution,float(block['G'][i,j]))
-                            if math.dist(ground[:2],target[:2])>2.:continue
-                            score=math.dist(ground[:2],base[:2])+.2*math.dist(ground[:2],target[:2])
-                            if preferred is not None:score+=2.*math.dist(ground,preferred)
-                            choices[ground]=min(score,choices.get(ground,math.inf))
+            lo,hi=m.indices(target[:2]-2.),m.indices(target[:2]+2.)
+            lower,upper=(-math.inf,math.inf) if floor is None else (floor[0]-floor[1]-1e-7,floor[0]+floor[1]+1e-7)
+            for key,selected in m.support_blocks(lo,hi,lower,upper).items():
+                layer,bx,by=key;block=m.blocks[key]
+                if key not in valid_blocks:
+                    valid_blocks[key]=m.traversable_block(key,block,floor)
+                for i,j in zip(*np.nonzero(valid_blocks[key]&selected)):
+                    cell=(bx*s.block_size+int(i),by*s.block_size+int(j))
+                    if not m.surface_observation.is_ground_source(cell,int(block['g_surface_id'][i,j])):continue
+                    ground=(s.origin_x+cell[0]*s.resolution,s.origin_y+cell[1]*s.resolution,float(block['G'][i,j]))
+                    if math.dist(ground[:2],target[:2])>2.:continue
+                    score=math.dist(ground[:2],base[:2])+.2*math.dist(ground[:2],target[:2])
+                    if preferred is not None:score+=2.*math.dist(ground,preferred)
+                    choices[ground]=min(score,choices.get(ground,math.inf))
         # A nearest-first cap can spend every slot inside the target's blind
         # region. Retain measured stations at several distances and bearings
         # before the common FOV, stopping, occlusion and route checks run.
@@ -341,12 +337,10 @@ class ObservationPoseSearch:
             height=float(m.observed_cell((layer,*m.indices(xyz)))['G'])
             missing,known,unsafe={},[],0
             for x,y in stopping:
-                row=m.footprint_support(layer,x,y,height)
-                if (row is None or row['unknown'] or not row['measured'] or
-                        not m.surface_observation.is_ground_source((x,y),int(row['g_surface_id'])) or
-                        not m.surface_observation.ground_observed((x,y),float(row['G']),layer)):
+                state,row=footprint_status(m,layer,(x,y),height)
+                if state=='missing':
                     missing[x,y]=height
-                elif row['solid'] or abs(float(row['G'])-height)>s.step_max+1e-5:
+                elif state=='unsafe':
                     unsafe+=1
                     blockers.extend(m.unknown_blockers(layer,[(x,y)],height))
                 else:

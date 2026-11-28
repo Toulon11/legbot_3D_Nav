@@ -8,6 +8,65 @@ SURFACE_DTYPE = np.dtype([(name, '<f4') for name in
     (name, '<f4') for name in ('passage_cost', 'relief_cost', 'terrain_cost', 'inflated_terrain_cost',
                              'node_z', 'C_clear')])
 POINT_DTYPE = np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4'), ('rgb', '<u4')])
+# Keep the 64-byte surface wire format and existing evidence bits unchanged.
+# flags[8:16] records the common planning-state reason.
+NAVIGATION_REASONS=('ready','missing_support','known_obstacle','known_obstacle_footprint',
+                    'missing_footprint','insufficient_clearance','terrain_limit','unassessed')
+
+
+def surface_chunk(m, key):
+    s=m.settings;k,bx,by=key;block=m.blocks.get(key)
+    if block is None:return np.empty(0,dtype=SURFACE_DTYPE)
+    i,j=np.nonzero(np.isfinite(block['G']))
+    if not len(i):return np.empty(0,dtype=SURFACE_DTYPE)
+    row=block[i,j];chunk=np.empty(len(i),dtype=SURFACE_DTYPE)
+    states=[m.planning_state((k,bx*s.block_size+int(x),by*s.block_size+int(y))) for x,y in zip(i,j)]
+    cost=np.asarray([state[0] for state in states],dtype='<f4')
+    reasons=np.asarray([NAVIGATION_REASONS.index(state[1]) for state in states],dtype='<u4')
+    rgb=np.where(np.isin(reasons,(2,3,5)),0xff3030,np.where(np.isin(reasons,(1,4,7)),0x4070d0,
+        np.where(cost>20,0x808080,0x20c860))).astype('<u4')
+    chunk['x']=s.origin_x+(bx*s.block_size+i)*s.resolution
+    chunk['y']=s.origin_y+(by*s.block_size+j)*s.resolution
+    chunk['z'],chunk['rgb'],chunk['cost']=row['G'],rgb.view('<f4'),cost
+    chunk['ceiling_z']=row['C']
+    chunk['clearance']=np.where(np.isfinite(row['C']),row['C'],row['C_clear'])-row['G']
+    chunk['source']=1
+    chunk['flags']=sum(row[name].astype('<u4')<<bit for bit,name in enumerate(
+        ('solid','unknown','solid_hard','unknown_hard')))
+    chunk['flags']|=np.isfinite(row['C']).astype('<u4')<<4
+    chunk['flags']|=row['g_mature'].astype('<u4')<<5
+    chunk['flags']|=row['c_mature'].astype('<u4')<<6
+    chunk['flags']|=reasons<<8
+    chunk['slice_index']=np.uint32(k & 0xffffffff)
+    for name in ('passage_cost','relief_cost','terrain_cost','inflated_terrain_cost','node_z','C_clear'):
+        chunk[name]=row[name]
+    chunk.flags.writeable=False
+    return chunk
+
+
+def capture(backend):
+    """Locked phase: encode changed immutable chunks, never concatenate a map.
+
+    C++ retains native shared buffers and renders without the map lock or GIL.
+    Compatibility inspect() remains available for standalone diagnostics.
+    """
+    m,s=backend.map,backend.map.settings
+    reset=getattr(backend,'_export_epoch',None)!=m.export_epoch
+    blocks=set(m.blocks) if reset else m.export_dirty_blocks.copy()
+    columns=set(m.columns) if reset else m.export_dirty_columns.copy()
+    surfaces=[(key,surface_chunk(m,key).tobytes()) for key in sorted(blocks)]
+    returns=[]
+    for x,y in sorted(columns):
+        rows=[(s.origin_x+x*s.resolution,s.origin_y+y*s.resolution,e[1],0xff5050)
+              for e in m.columns.get((x,y),{}).values()]
+        returns.append(((x,y),np.asarray(rows,dtype=POINT_DTYPE).tobytes()))
+    m.export_dirty_blocks.difference_update(blocks)
+    m.export_dirty_columns.difference_update(columns)
+    backend._export_epoch=m.export_epoch
+    metadata=dict(backend.metadata,export_changed_blocks=len(blocks),export_changed_columns=len(columns))
+    return dict(reset=reset,epoch=m.export_epoch,first_layer=m.first_layer or 0,
+                surfaces=surfaces,returns=returns,metadata=metadata,
+                changed_blocks=len(blocks),changed_columns=len(columns))
 
 
 def inspect(backend, base, options):
@@ -21,37 +80,9 @@ def inspect(backend, base, options):
     if getattr(backend, '_display_key', None) != cache_key:
         # Only message buffers are assembled here; no second planning map.
         # Vectorize each sparse block instead of interpreting every row in Python.
-        chunks=[]
-        for (k,bx,by), block in m.blocks.items():
-            i,j=np.nonzero(np.isfinite(block['G']))
-            if not len(i):continue
-            row=block[i,j];chunk=np.empty(len(i),dtype=SURFACE_DTYPE)
-            cost=np.where(~row['unknown']&~row['solid']&~row['hard']&
-                          (row['inflated_terrain_cost']>=0),row['inflated_terrain_cost'],50.)
-            if k-1 in m.layers or k+1 in m.layers:
-                cut=s.origin_z+k*s.slice_dh
-                seam=np.minimum(abs(row['G']-cut),abs(row['G']-cut+s.slice_dh))
-                for at in np.flatnonzero((row['unknown_hard'] | row['solid_hard']) &
-                                         (row['terrain_cost']>=0) & (row['terrain_cost']<=20) &
-                                         (seam<=2*s.step_max+1e-7)):
-                    cost[at]=m.planning_cost((k,bx*s.block_size+int(i[at]),by*s.block_size+int(j[at])))
-            rgb=np.where(row['solid'],0xff3030,np.where(row['unknown'],0x4070d0,
-                np.where(cost>20,0x808080,0x20c860))).astype('<u4')
-            chunk['x']=s.origin_x+(bx*s.block_size+i)*s.resolution
-            chunk['y']=s.origin_y+(by*s.block_size+j)*s.resolution
-            chunk['z'],chunk['rgb'],chunk['cost']=row['G'],rgb.view('<f4'),cost
-            chunk['ceiling_z']=row['C']
-            chunk['clearance']=np.where(np.isfinite(row['C']),row['C'],row['C_clear'])-row['G']
-            chunk['source']=1
-            chunk['flags']=sum(row[name].astype('<u4')<<bit for bit,name in enumerate(
-                ('solid','unknown','solid_hard','unknown_hard')))
-            chunk['flags']|=np.isfinite(row['C']).astype('<u4')<<4
-            chunk['flags']|=row['g_mature'].astype('<u4')<<5
-            chunk['flags']|=row['c_mature'].astype('<u4')<<6
-            chunk['slice_index']=k-m.first_layer
-            for name in ('passage_cost','relief_cost','terrain_cost','inflated_terrain_cost','node_z','C_clear'):
-                chunk[name]=row[name]
-            chunks.append(chunk)
+        chunks=[surface_chunk(m,key).copy() for key in m.blocks]
+        for chunk in chunks:
+            chunk['slice_index']=(chunk['slice_index'].view('<i4')-m.first_layer).astype('<u4')
         records=np.concatenate(chunks) if chunks else np.empty(0,dtype=SURFACE_DTYPE)
         # Shared G is identical across its slice representations. Keep the
         # complete planner payload, but draw each physical surface once using

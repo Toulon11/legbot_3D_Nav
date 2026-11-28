@@ -5,6 +5,7 @@ can respect the first-num maturity rule. Mature records retain no sample list.
 """
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
+from heapq import merge
 
 
 def same_ground_surface(first_id, first_height, second_id, second_height):
@@ -114,7 +115,9 @@ class SurfaceColumn:
         extend a span. A gap equal to clearance stays open. The small epsilon
         only stabilizes the strict comparison for float32 point clouds.
         """
-        spans=sorted((*self._obstacle_samples,*((float(z),float(z)) for z in heights)))
+        # Historical occupied spans are already ordered. Sort only this batch,
+        # then merge the two sequences without re-sorting accumulated history.
+        spans=merge(self._obstacle_samples,sorted((float(z),float(z)) for z in heights))
         merged=[]
         for low,high in spans:
             if merged and low-merged[-1][1] < clearance-1e-7:

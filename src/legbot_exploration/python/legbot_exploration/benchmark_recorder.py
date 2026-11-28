@@ -21,6 +21,7 @@ from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 
 from .benchmark_metrics import ExperimentMetrics, SurfaceCoverage, ResultWriter, distribution, default_result_root
+from .surface_update_stream import SurfaceUpdateStream
 from .benchmark_reference import build_reference, save_reference, REFERENCE_VERSION
 
 
@@ -54,6 +55,7 @@ class BenchmarkRecorder(Node):
         floors=json.loads(str(parameter('floor_definitions_json','[]')))
         target=str(parameter('target_floor',''))
         single_floor=str(parameter('single_floor',''))
+        per_floor=bool(parameter('per_floor',bool(floors) and not single_floor))
         reference_issue=None
         if not reference and auto and self.world:
             try:
@@ -77,7 +79,7 @@ class BenchmarkRecorder(Node):
         floor_dwell=float(parameter('floor_dwell_seconds',2.))
         transition_timeout=float(parameter('transition_timeout_seconds',600.))
         self.metrics=ExperimentMetrics(coverage,floors,target,floor_dwell,transition_timeout,
-            partial_run=self.partial,single_floor=single_floor)
+            partial_run=self.partial,single_floor=single_floor,per_floor=per_floor)
         def topic(name,default):return str(parameter(name,default))
         odom=topic('odometry_topic','/Odometry_gazebo')
         self.cloud_topic=topic('surfaces_topic','/exploration/layers/planning_surfaces')
@@ -100,7 +102,7 @@ class BenchmarkRecorder(Node):
             reference_builder_version=coverage.reference_meta.get('builder_version'),
             reference_issue=reference_issue,odometry_topic=odom,surfaces_topic=self.cloud_topic,
             coverage_source=self.coverage_source,
-            floors=floors,target_floor=target,single_floor=single_floor,partial_run=self.partial,
+            floors=floors,target_floor=target,single_floor=single_floor,per_floor=per_floor,partial_run=self.partial,
             start_floor_skip_option=start_floor_skip,max_sim_seconds=self.limit,
             capture_wall_seconds=self.capture,
             metric_resolution=resolution,height_tolerance=tolerance,
@@ -109,6 +111,9 @@ class BenchmarkRecorder(Node):
             reference_sha256=asset_hash(reference) if reference else None,
             source_sha256=hashlib.sha256(json.dumps(
                 {str(p.relative_to(package)):asset_hash(p) for p in sorted(paths)},sort_keys=True).encode()).hexdigest()))
+        self.updates_topic=str(parameter('surface_updates_topic',''))
+        self.surface_stream=SurfaceUpdateStream(coverage) if self.updates_topic and self.coverage_source=='pct_surfaces' else None
+        self.pending_status=[]
         self.pid=int(parameter('explorer_pid',0)) or self._explorer_pid()
         self.resource_last=None;self.cpu=[];self.rss=[];self.resource={}
         self.frontier_deferral_peaks={}
@@ -123,6 +128,9 @@ class BenchmarkRecorder(Node):
             self.create_subscription(OccupancyGrid,'/exploration/coverage_grid',self.on_grid,retained),
             self.create_subscription(String,'/exploration/planning_results',lambda m:self.event('planning',m),events),
             self.create_subscription(String,'/exploration/execution_feedback',lambda m:self.event('execution',m),events)]
+        if self.surface_stream is not None:
+            self.subscriptions_owned.append(self.create_subscription(String,self.updates_topic,
+                self.on_surface_update,QoSProfile(depth=100,durability=DurabilityPolicy.TRANSIENT_LOCAL)))
         self.summary_pub=self.create_publisher(String,'/exploration/benchmark',retained)
         self.create_service(Trigger,'/exploration/benchmark/finish',self.finish_service)
         self.timer=self.create_timer(1.,self.sample,clock=Clock(clock_type=ClockType.STEADY_TIME))
@@ -143,13 +151,28 @@ class BenchmarkRecorder(Node):
         if value.get('state')!=self.status.get('state'):
             self.writer.event('state',self.now_sim(),dict(state=value.get('state'),paused=value.get('paused')))
         self.status=value;self.maybe_start()
-        self.metrics.update_status(value,time.monotonic(),self.now_sim())
+        # Ordinary-window closure must see coverage through the controller's
+        # committed version; RViz full-snapshot throttling cannot freeze stale area.
+        end=value.get('pct_floor',{}).get('ordinary_ended_sim')
+        terminal=value.get('state') in ('mission_complete','exploration_complete','pct_region_complete','current_region_complete')
+        closing=end is not None or value.get('mission',{}).get('returning') or terminal
+        if self.surface_stream is not None and (self.pending_status or
+                closing and not self.surface_stream.covers(value.get('layer_map_version',0))):
+            signature=(value.get('pct_floor',{}).get('number'),end,
+                       value.get('mission',{}).get('returning'),terminal)
+            if self.pending_status and self.pending_status[-1][0]==signature:
+                # Keep the FIRST closing version; chasing every later status
+                # would postpone closure indefinitely while mapping continues.
+                if not closing:self.pending_status[-1]=(signature,value)
+            else:self.pending_status.append((signature,value))
+            self.metrics.defer_floor_closure=True
+        else:self.metrics.update_status(value,time.monotonic(),self.now_sim())
         for name in ['low_yield_deferred_clusters','low_yield_deferred_cells']:
             count=value.get('pct_'+name)
             if isinstance(count,int):
                 self.frontier_deferral_peaks[name]=max(count,self.frontier_deferral_peaks.get(name,0))
         if value.get('state') in ('mission_complete','exploration_complete','pct_region_complete','current_region_complete'):
-            self.finalize('controller_complete')
+            if not self.pending_status:self.finalize('controller_complete')
 
     def on_map_status(self,message):
         value=json.loads(message.data);self.metrics.map_status=value
@@ -170,13 +193,23 @@ class BenchmarkRecorder(Node):
         self.metrics.odometry(self.pose,seconds,time.monotonic(),self.reference_height)
 
     def on_surfaces(self,message):
-        if self.coverage_source!='pct_surfaces':return
+        if self.coverage_source!='pct_surfaces' or self.surface_stream is not None:return
         fields={field.name for field in message.fields}
         if not {'x','y','z','flags'}<=fields:
             self.metrics.odom_anomalies['invalid_surface_schema']+=1;return
         data=point_cloud2.read_points(message,field_names=['x','y','z','flags'],skip_nans=False)
         xyz=np.column_stack([data[name].reshape(-1) for name in ['x','y','z']])
         self.metrics.coverage.observe(xyz,data['flags'].reshape(-1))
+
+    def on_surface_update(self,message):
+        if not self.surface_stream.apply(json.loads(message.data)):return
+        while self.pending_status and self.surface_stream.covers(self.pending_status[0][1].get('layer_map_version',0)):
+            _,value=self.pending_status.pop(0)
+            self.metrics.defer_floor_closure=False
+            self.metrics.update_status(value,time.monotonic(),self.now_sim())
+            self.metrics.defer_floor_closure=bool(self.pending_status)
+            if value.get('state') in ('mission_complete','exploration_complete','pct_region_complete','current_region_complete'):
+                self.finalize('controller_complete');break
 
     def on_grid(self,message):
         if self.coverage_source!='occupancy_grid':return
@@ -247,7 +280,10 @@ class BenchmarkRecorder(Node):
         response.message=str(self.writer.prefix.with_suffix('.json'));return response
 
     def extras(self):
-        return dict(resources=self.resource,frontier_deferrals={k:self.status.get('pct_'+k) for k in
+        return dict(coverage_export=(None if self.surface_stream is None else dict(
+            version=self.surface_stream.version,epoch=self.surface_stream.epoch,
+            synchronized=self.surface_stream.synchronized,gaps=self.surface_stream.gaps,
+            pending_closures=len(self.pending_status))),resources=self.resource,frontier_deferrals={k:self.status.get('pct_'+k) for k in
             ['low_yield_deferred_clusters','low_yield_deferred_cells']},
             frontier_deferral_peak_per_query=self.frontier_deferral_peaks,
             map_counters={k:self.metrics.map_status.get(k) for k in

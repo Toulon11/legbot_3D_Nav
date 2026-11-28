@@ -106,13 +106,14 @@ namespace scan_planner
     /* ROS utils */
     legbot::NodeHandle node_;
     legbot::Timer exec_timer_, safety_timer_;
-    legbot::Subscriber goal_request_sub_, goal_sub_, odom_sub_, path_sub_, go2_execution_frozen_sub_;
+    legbot::Subscriber goal_request_sub_, goal_sub_, odom_sub_, path_sub_, go2_execution_frozen_sub_, goal_failure_sub_;
     legbot::Publisher replan_pub_, new_pub_, bspline_pub_, data_disp_pub_, self_inflation_pub_, goal_failure_pub_;
     std::uint64_t active_goal_stamp_ns_{0};
     bool active_goal_failure_sent_{false};
     bool active_goal_reached_{false};
     legbot::Publisher tolerance_status_pub_;
     void publishGoalFailure(const char *reason);
+    void goalFailureCallback(const std_msgs::msg::String::ConstSharedPtr &msg);
 
     /* helper functions */
     bool callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj); // front-end and back-end method

@@ -28,6 +28,8 @@ def main():
     surface=node.create_publisher(PointCloud2,'/test/benchmark_surfaces',retained)
     plans=node.create_publisher(String,'/exploration/planning_results',10)
     feedback=node.create_publisher(String,'/exploration/execution_feedback',10)
+    updates_test='--updates' in sys.argv
+    updates=node.create_publisher(String,'/test/benchmark_updates',QoSProfile(depth=100,durability=DurabilityPolicy.TRANSIENT_LOCAL))
     process=None
     with tempfile.TemporaryDirectory(prefix='benchmark_trial_') as temporary:
         root=Path(temporary);reference=root/'ref.npz';out=root/'result';log=root/'node.log'
@@ -37,8 +39,9 @@ def main():
         args=[sys.executable,str(script),'--ros-args','-p','use_sim_time:=false',
             '-p','auto_reference:=false','-p','result_directory:='+str(out),
             '-p','reference_file:='+str(reference),'-p',"floor_definitions_json:='"+floors+"'",
-            '-p','target_floor:=second','-p','single_floor:=second','-p','floor_dwell_seconds:=0.15',
+            '-p','target_floor:=second','-p','floor_dwell_seconds:=0.15',
             '-p','odometry_topic:=/test/benchmark_odom','-p','surfaces_topic:=/test/benchmark_surfaces']
+        if updates_test:args+=['-p','surface_updates_topic:=/test/benchmark_updates']
         floor_begin=[None,None];floor_end=[None,None];late_surface=[False]
         def publish(height):
             msg=Odometry();msg.header.stamp=node.get_clock().now().to_msg();msg.header.frame_id='map'
@@ -48,7 +51,7 @@ def main():
             if height>.4 and floor_begin[0] is None:
                 floor_begin[:]=[node.get_clock().now().nanoseconds*1e-9,time.monotonic()]
             status.publish(String(data=json.dumps(dict(state='waiting_for_scan_completion',task_active=True,
-                paused=False,observation_only=False,pct_floor=dict(number=99,height=height,
+                paused=False,observation_only=False,layer_map_version=2 if floor_end[0] is not None else 1,pct_floor=dict(number=99,height=height,
                     ordinary_started_sim=floor_begin[0],ordinary_started_wall=floor_begin[1],
                     ordinary_ended_sim=floor_end[0],ordinary_ended_wall=floor_end[1]),
                 pct_low_yield_deferred_clusters=2,pct_low_yield_deferred_cells=3))))
@@ -57,6 +60,10 @@ def main():
             surface.publish(point_cloud2.create_cloud(Header(frame_id='map'),fields,
                 [(0.,0.,0.,32),(.1,0.,.5,32),(0.,0.,0.,32)]+
                 ([(.2,0.,.5,32)] if late_surface[0] else [])))
+            if updates_test:
+                version=2 if late_surface[0] else 1
+                rows=[[0.,0.,0.,32],[.1,0.,.5,32]]+([ [.2,0.,.5,32] ] if late_surface[0] else [])
+                updates.publish(String(data=json.dumps(dict(version=version,base_version=version-1,epoch=0,full=True,coverage=rows))))
             plans.publish(String(data=json.dumps(dict(goal_id=1,attempt_id=1,planner='layer',usable=True,planning_ms=4.))))
             feedback.publish(String(data=json.dumps(dict(goal_id=1,attempt_id=1,stage_index=0,scan_goal_stamp=5,status='succeeded'))))
         def spin_for(seconds,height):
@@ -78,9 +85,13 @@ def main():
             assert process.wait(timeout=5)==0,log.read_text()
             result=json.loads(next(out.glob('*.json')).read_text())
             values=result['metrics']
-            assert values['coverage_percent']==50.,result
-            assert result['single_floor']['state']=='settled',result
-            assert values['exploration_wall_seconds']<1.,result
+            if updates_test:assert result['accounting']['coverage_export']['version']==2,result
+            assert result['schema_version']==5 and len(result['floors'])==2,result
+            second_floor=result['floors'][1]
+            assert result['floors'][0]['state']=='not_started',result
+            assert second_floor['coverage_percent']==(100. if updates_test else 50.),result
+            assert second_floor['state']=='settled',result
+            assert second_floor['exploration_wall_seconds']<1.,result
             assert values['upward_attempt_count']==values['upward_success_count']==1,result
             assert values['upward_success_percent']==100.,result
             assert values['upward_mean_sim_seconds']>0.,result
@@ -88,9 +99,9 @@ def main():
             assert values['planning_attempt_count']==1,result
             assert values['planning_success_count']==1,result
             assert values['planning_mean_ms']==values['planning_p95_ms']==4.,result
-            assert values['exploration_sim_seconds']>0.,result
-            assert values['exploration_wall_seconds']>0.,result
-            assert 'floors' not in result,result
+            assert second_floor['exploration_sim_seconds']>0.,result
+            assert second_floor['exploration_wall_seconds']>0.,result
+            assert 'single_floor' not in result and 'coverage_percent' not in values,result
             assert result['termination']=='manual_finish' and result['finalized'],result
             assert len(list(out.iterdir()))==1,list(out.iterdir())
             first=set(out.glob('*.json'))
@@ -105,7 +116,7 @@ def main():
             result=json.loads(second.pop().read_text())
             assert result['finalized'] and result['termination']=='interrupted',log.read_text()
             assert not list(out.glob('*.json.tmp'))
-            print('PASS scoped single-floor window freezes before late scans; cross-layer outcome, one JSON and SIGINT finalization')
+            print('PASS independent floor windows freeze before late scans; cross-layer outcome, one JSON and SIGINT finalization')
         finally:
             if process is not None and process.poll() is None:
                 process.send_signal(signal.SIGINT)

@@ -137,12 +137,23 @@ class SingleFloorTrial:
     def status(self,value,physical_floor,wall,sim):
         if self.ended_sim is not None:return
         band=value.get('pct_floor',{});height=band.get('height')
+        same_band=isinstance(height,(int,float)) and abs(height-self.floor['height'])<=.08+1e-7
+        if same_band and band.get('start_floor_skipped') and self.started_sim is None:
+            self.outcome='skipped'
+        if self.outcome=='skipped':return
+        end=band.get('ordinary_ended_sim');end_wall=band.get('ordinary_ended_wall')
+        valid_end=all(isinstance(t,(int,float)) and not isinstance(t,bool) and math.isfinite(t)
+                      for t in (end,end_wall))
+        # A final-floor handoff can arrive in the same status as return mode.
+        # Prefer the controller's completed window over recorder receipt time.
+        if same_band and self.started_sim is not None and valid_end and end>=self.started_sim and end_wall>=self.started_wall:
+            self.close('settled',end_wall,end);return
         if self.started_sim is not None and (value.get('mission',{}).get('returning') or
                 (isinstance(height,(int,float)) and abs(height-self.floor['height'])>.08+1e-7
                  and physical_floor!=self.floor['name'])):
             self.close('incomplete_left_floor',wall,sim)
             return
-        if not isinstance(height,(int,float)) or abs(height-self.floor['height'])>.08+1e-7:return
+        if not same_band:return
         start=band.get('ordinary_started_sim');start_wall=band.get('ordinary_started_wall')
         if not all(isinstance(t,(int,float)) and not isinstance(t,bool) and math.isfinite(t)
                    for t in (start,start_wall)):return
@@ -151,9 +162,7 @@ class SingleFloorTrial:
             # odometry at the floor's independently referenced XY/support.
             if physical_floor!=self.floor['name'] or value.get('mission',{}).get('returning'):return
             self.started_sim=float(start);self.started_wall=float(start_wall);self.outcome='active'
-        end=band.get('ordinary_ended_sim');end_wall=band.get('ordinary_ended_wall')
-        if all(isinstance(t,(int,float)) and not isinstance(t,bool) and math.isfinite(t)
-               for t in (end,end_wall)) and end>=self.started_sim and end_wall>=self.started_wall:
+        if valid_end and end>=self.started_sim and end_wall>=self.started_wall:
             self.close('settled',end_wall,end)
 
     def close(self,outcome,wall,sim):
@@ -175,7 +184,7 @@ class SingleFloorTrial:
 
 class ExperimentMetrics:
     def __init__(self,coverage=None,floors=(),target_floor='',floor_dwell=2.,
-                 transition_timeout=600.,departure_height=.16,partial_run=False,single_floor=''):
+                 transition_timeout=600.,departure_height=.16,partial_run=False,single_floor='',per_floor=False):
         self.coverage=coverage or SurfaceCoverage()
         self.floors=sorted((dict(f) for f in floors),key=lambda f:f['height'])
         names=[f['name'] for f in self.floors]
@@ -183,6 +192,9 @@ class ExperimentMetrics:
         if len(set(names))!=len(names):raise ValueError('duplicate floor names')
         if target_floor and target_floor not in names:raise ValueError('unknown target floor')
         if single_floor and single_floor not in names:raise ValueError('unknown single metric floor')
+        if per_floor and single_floor:raise ValueError('per-floor and single-floor scopes are mutually exclusive')
+        if per_floor and not names:raise ValueError('per-floor metrics require floor definitions')
+        self.floor_trials=[SingleFloorTrial(self.coverage,floor) for floor in self.floors] if per_floor else []
         self.single_floor=(SingleFloorTrial(self.coverage,next(f for f in self.floors if f['name']==single_floor))
                            if single_floor else None)
         self.target_floor=target_floor;self.floor_dwell=floor_dwell
@@ -211,8 +223,12 @@ class ExperimentMetrics:
     def update_status(self,value,wall,sim):
         self.tick(wall,sim)
         self.status=value
-        if self.single_floor and self.started_wall is not None and not self.finalized:
-            self.single_floor.status(value,self.instant_floor,wall,sim)
+        self._trial_status(wall,sim)
+
+    def _trial_status(self,wall,sim):
+        if self.started_wall is None or self.finalized or getattr(self,'defer_floor_closure',False):return
+        for trial in self.floor_trials+([self.single_floor] if self.single_floor else []):
+            trial.status(self.status,self.instant_floor,wall,sim)
 
     def tick(self,wall,sim):
         if self.started_wall is None or self.finalized:return
@@ -255,12 +271,11 @@ class ExperimentMetrics:
                     # Keep the last distance anchor while rejecting body jitter.
                     self.path_last_sample=stamp
                     self._floor_progress(p-[0.,0.,reference_height],stamp)
-                    if self.single_floor:self.single_floor.status(self.status,self.instant_floor,wall,stamp)
+                    self._trial_status(wall,stamp)
                     return
             self.path_anchor=p;self.path_stamp=stamp;self.path_last_sample=stamp
         self._floor_progress(p-[0.,0.,reference_height],stamp)
-        if self.single_floor:
-            self.single_floor.status(self.status,self.instant_floor,wall,stamp)
+        self._trial_status(wall,stamp)
 
     def _floor_progress(self,ground,sim):
         floor=self.coverage.floor_at(ground,self.floors)
@@ -309,7 +324,8 @@ class ExperimentMetrics:
             self.tick(wall,sim)
             if self.finalized:return
             if self.transition:self._end_transition('interrupted' if reason!='time_limit' else 'timeout',sim)
-        if self.single_floor:self.single_floor.close('timeout' if reason=='time_limit' else 'interrupted',wall,sim)
+        for trial in self.floor_trials+([self.single_floor] if self.single_floor else []):
+            trial.close('timeout' if reason=='time_limit' else 'interrupted',wall,sim)
         self.termination=reason;self.finalized=True
 
     def summary(self):
@@ -320,6 +336,8 @@ class ExperimentMetrics:
         failed=sum(t['outcome'] not in ('succeeded','interrupted') for t in self.transitions)
         completed=successes+failed
         plans=list(self.plans.values());feedback=list(self.feedback.values())
+        # A safe intermediate segment does not complete the requested goal.
+        plan_successes=sum(bool(p.get('complete_goal_plan',p.get('usable') and not p.get('partial',False))) for p in plans)
         upward=[t for t in self.transitions if t['direction']=='up']
         up_success=[t for t in upward if t['outcome']=='succeeded']
         up_pending=int(self.transition is not None and self.transition['direction']=='up')
@@ -358,6 +376,7 @@ class ExperimentMetrics:
         return dict(schema_version=1,finalized=self.finalized,termination=self.termination,
             partial_run=self.partial_run,started=self.started_wall is not None,
             single_floor=None if self.single_floor is None else self.single_floor.summary(self.last_wall,self.last_sim),
+            floor_trials=[trial.summary(self.last_wall,self.last_sim) for trial in self.floor_trials],
             floors=floors,returned_home=bool(mission_status.get('returned_home')),
             target_exploration_finished=bool(mission_status.get('exploration_finished')),
             elapsed_sim_seconds=elapsed,elapsed_wall_seconds=wall,
@@ -388,8 +407,9 @@ class ExperimentMetrics:
                     sum(t['duration_sim_seconds'] for t in up_success)/len(up_success)),
             mission_success=mission,success_criterion=criteria,target_floor=self.target_floor or None,
             includes_return=bool(return_required),
-            planning=dict(attempts=len(plans),usable=sum(bool(p.get('usable')) for p in plans),
-                success_rate=None if not plans else sum(bool(p.get('usable')) for p in plans)/len(plans),
+            planning=dict(attempts=len(plans),usable=plan_successes,
+                partial_segments=sum(bool(p.get('partial')) for p in plans),
+                success_rate=None if not plans else plan_successes/len(plans),
                 timing_samples=plan_times['count'],
                 # Do not silently report a mean/P95 over only the timed successes.
                 mean_ms=plan_times['mean'] if plan_times['count']==len(plans) else None,
@@ -409,11 +429,12 @@ class ResultWriter:
         self.directory=Path(root).expanduser();self.directory.mkdir(parents=True,exist_ok=True)
         self.prefix=self.directory/name
         with self.prefix.with_suffix('.json').open('x') as handle:
-            json.dump(dict(schema_version=4,finalized=False,termination='initializing'),handle)
+            json.dump(dict(schema_version=5 if metadata.get('per_floor') else 4,
+                           finalized=False,termination='initializing'),handle)
         keys=('created_at_utc','method','world','world_sha256','git_head','localization_source',
               'start_floor_skip_option','metric_resolution','height_tolerance','reference_issue','reference_builder_version',
               'source_sha256','reference_sha256','floor_dwell_seconds','transition_timeout_seconds',
-              'robot_reference_height','coverage_source','target_floor','trial_seed','single_floor')
+              'robot_reference_height','coverage_source','target_floor','trial_seed','single_floor','per_floor')
         self.metadata={k:metadata[k] for k in keys if k in metadata}
         self.metadata['run_id']=name
 
@@ -427,6 +448,11 @@ class ResultWriter:
         result=dict(schema_version=4,**{k:summary.get(k) for k in keys},metadata=self.metadata)
         plan=summary['planning'];up=summary['upward']
         scope=summary.get('single_floor')
+        floor_trials=summary.get('floor_trials',[])
+        if floor_trials:
+            result['schema_version']=5
+            result['floors']=floor_trials
+            result['metadata']['per_floor']=True
         result['single_floor']=(None if scope is None else {k:scope[k] for k in
             ('name','ground_height_m','state','completed','started_sim','ended_sim')})
         measured=scope if scope is not None else dict(
@@ -454,10 +480,18 @@ class ResultWriter:
             'upward_success_count':'上楼成功次数','upward_attempt_count':'上楼总次数',
             'upward_success_percent':'上楼成功率（%）','upward_mean_sim_seconds':'成功上楼任务平均耗时（仿真s）',
             'exploration_sim_seconds':'探索耗时（仿真s）','exploration_wall_seconds':'探索耗时（墙钟s）'}
+        if floor_trials:
+            floor_keys=('reference_area_m2','observed_area_m2','coverage_percent',
+                        'exploration_sim_seconds','exploration_wall_seconds')
+            result['floor_metric_labels']={key:result['metric_labels'].pop(key) for key in floor_keys}
+            for key in floor_keys:result['metrics'].pop(key)
+            result.pop('single_floor')
         result['accounting']=dict(upward_failed_count=up['failed'],upward_interrupted_count=up['interrupted'],
             upward_pending_count=up['pending'],planning_timing_samples=plan['timing_samples'],
             coverage_reference_available=measured['reference_area_m2'] is not None,
             includes_return=bool(summary.get('includes_return',False)))
+        if extra and extra.get('coverage_export') is not None:
+            result['accounting']['coverage_export']=extra['coverage_export']
         result['definitions']={
             'coverage':('仅评价'+scope['name']+'；结束时已观测地面面积/该层独立参考面积；包含到达前提前扫到的该层地面，按物理地面去重。' if scope else
                 '参考范围内成熟实测地面投影面积/独立参考总面积；按XY及地面高度去重，切片别名不重复计数。'),
@@ -466,6 +500,10 @@ class ResultWriter:
             'time':('从'+scope['name']+'普通探索开始，到该层首次局部及全局首轮收尾；包含选点、规划、行走、观测和等待，不含前后跨层及返航。未完成时为实际已用时间。' if scope else
                 '执行就绪、任务活动且已有位姿时开始，至结束/中断/超时；包括选点、观测、行走、等待和跨层。返航配置由includes_return标明。'),
             'unavailable':'无独立参考、无尝试或无有效完整耗时样本时为null；未结束文件finalized=false，不视为完成试验。'}
+        if floor_trials:
+            result['definitions']['coverage']='四层分别统计该层首次普通探索收尾时的实测地面面积/该层独立参考面积；按物理地面去重，包含开始前提前观测的地面，收尾后冻结。'
+            result['definitions']['time']='各层从ordinary_started到首次ordinary_ended独立计时；包含选点、规划、行走、观测和等待，排除跨层及返航。中断或未正常收尾离开时保留实际已用时间并标注未完成。'
+            result['definitions']['floor_state']='settled为本层任务收尾，不代表100%覆盖；skipped为跳过普通探索；not_started为未开始；无普通探索窗口时覆盖率和耗时为null。'
         temp=Path(str(self.prefix)+'.json.tmp')
         try:
             temp.write_text(json.dumps(result,ensure_ascii=False,indent=2,allow_nan=False))

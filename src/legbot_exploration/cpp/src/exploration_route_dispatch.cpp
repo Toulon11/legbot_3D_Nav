@@ -7,12 +7,8 @@ bool ExplorationController::try_dispatch_route() {
   if(active_ || !path_processor_.active())return false;
   if(!base_ || wall_now()-base_wall_>options_.odom_timeout_ || options_.observation_only_ || paused_ ||
      !ready_ || output_.waypoint_subscribers()==0)return false;
-  // Mapping commits cache task completion. A segment handoff must not
-  // synchronously commit geometry or wait on the Python interpreter.
-  if(selected_floor_attempt_ && selected_pct_ && shared_layer_ && shared_layer_->pct &&
-     shared_layer_->pct->committed_floor_task_resolved(selected_pct_->id)) {
-    reset_planned_route();report("pct_frontier_resolved_in_transit");return true;
-  }
+  // Task completion/relabeling never truncates an accepted movement route.
+  // Physical safety remains enforced by SCAN and the execution controller.
   publish_target(path_processor_.current(),path_processor_.recovery()?"recovery_route":
                  path_processor_.source()+"_route");
   return active_.has_value();
@@ -157,6 +153,7 @@ void ExplorationController::reset_planned_route() {
   selected_platform_frontier_=false;
   selected_fast_floor_=false;
   selected_floor_attempt_=0;
+  selected_partial_=false;
   if (options_.frontier_source_=="pct") pct_markers_dirty_=true;
   route_skipped_nearby_ = 0;
   publish_planned_path({});
@@ -234,6 +231,87 @@ RoutePlanner::Plans RoutePlanner::plan(const PlanningGoal &goal, const PlanningS
   return {std::move(candidates), index};
 }
 
+bool ExplorationController::stage_route(const PlannerResult &chosen,const RouteSelection &selection,
+    const PlanningSnapshot &snapshot,std::string *failure) {
+  const double minimum_travel=selection.detail=="pct_return_home"?options_.observation_goal_xy_tolerance_:
+      (selection.stair_segment || selection.stair_climb || selection.detail=="pct_floor_ascent_frontier")?
+      cross_layer_minimum_travel():options_.observation_min_distance_;
+  const XY current_xy{snapshot.base[0],snapshot.base[1]};
+  if(chosen.partial && chosen.goal.minimum_stop_ground && !chosen.xyz.empty() &&
+     chosen.xyz.back()[2]-options_.layer_body_height_<*chosen.goal.minimum_stop_ground-1e-7) {
+    *failure="ascent_segment_loses_support_height";return false;
+  }
+  std::vector<Point> ground_route;
+  auto ascent_start=cross_ground_pose();
+  if((selection.stair_climb || selection.stair_segment) && chosen.start_ground_z)
+    ascent_start[2]=*chosen.start_ground_z;
+  if((selection.detail=="pct_floor_ascent_frontier")) {
+    if(!chosen.start_ground_z || chosen.xyz.empty()) {
+      *failure="stair_start_support_unavailable";return false;
+    }
+  }
+  if(!chosen.partial && options_.cross_layer_enabled_ && selection.frontier && chosen.kind==PlannerKind::layer &&
+     !selection.platform_floor && (!options_.floor_exploration_ || selection.stair_climb || (selection.detail=="pct_floor_ascent_frontier") || policy_.cross_task_.engaged())) {
+    ground_route=chosen.xyz;
+    for(auto &p:ground_route)p[2]-=options_.layer_body_height_;
+    if (const auto *reason = policy_.check_ascent(ascent_start, ground_route, selection.departure_height, selection.stair_climb)) {
+      *failure = reason;
+      return false;
+    }
+  }
+  if(!selection.recovery && !chosen.waypoints.empty() &&
+     xy_distance(current_xy,chosen.waypoints.back())<(chosen.partial?.25:minimum_travel)) {
+    *failure="observation_position_too_close";return false;
+  }
+  if (!path_processor_.load(chosen.goal, chosen, selection.recovery, &snapshot)) {
+    *failure = "route_staging_failed";
+    return false;
+  }
+  if(recovery_.stair_reposition_ && recovery_.stair_reposition_->stage==StairReposition::Stage::forward &&
+     chosen.kind==PlannerKind::layer) {
+    const auto &failed=recovery_.stair_reposition_->start;
+    const auto &points=path_processor_.xyz();
+    Point from=*base_;
+    bool blocked_departure=false;
+    for(const auto &to:points) {
+      const double dx=to[0]-from[0],dy=to[1]-from[1];
+      if(std::hypot(dx,dy)>1e-6 && std::hypot(from[0]-failed[0],from[1]-failed[1])<=.20 &&
+         scan_start_inflated(from,std::atan2(dy,dx))) {
+        blocked_departure=true;
+        break;
+      }
+      from=to;
+    }
+    if(blocked_departure) {
+      path_processor_.clear();
+      *failure="stair_retry_departure_inflated";
+      return false;
+    }
+  }
+  if (!accept_route(chosen, selection, ascent_start, ground_route)) {
+    reset_planned_route();
+    *failure = "observation_position_already_reached";
+    return false;
+  }
+  return true;
+}
+
+bool ExplorationController::dispatch_floor_route(const FloorRoute &route) {
+  static const std::unordered_map<Cell,int,CellHash> no_grid;
+  static const std::vector<XY> no_obstacles;
+  const RouteSelection selection{&route.frontier,route.detail,nullptr,route.started,false,
+      false,false,(route.detail=="pct_frontier_fast" || (route.detail=="pct_frontier_review" && policy_.pct_frontiers_.fast_floor)),route.frontier.attempt,route.platform,std::nullopt};
+  auto snapshot=planning_snapshot(no_grid,no_obstacles);
+  if(route.platform)snapshot.base[2]=(*route.platform)[0]+options_.layer_body_height_;
+  std::string failure;
+  const auto scope=policy_.pct_frontiers_.scope;
+  policy_.pct_frontiers_.scope=route.scope;
+  const bool accepted=stage_route(route.plan,selection,snapshot,&failure);
+  policy_.pct_frontiers_.scope=scope;
+  if(accepted)return true;
+  report("pct_floor_selection_pending",failure);return false;
+}
+
 bool ExplorationController::prepare_route(const XY &target,
     const std::unordered_map<Cell, int, CellHash> &grid,
     const std::vector<XY> &obstacles,
@@ -245,8 +323,13 @@ bool ExplorationController::prepare_route(const XY &target,
     std::optional<XY> platform_floor,
     std::string *selection_failure,
     std::vector<PctUnknownBlocker> *unknown_blockers,
-    PctFrontier *blocked_goal) {
+    PctFrontier *blocked_goal,
+    std::vector<FloorRoute> *floor_routes) {
   SelectionPhaseTimer route_timer(selection_timings_,"route_ms");
+  std::optional<PctFrontier> comparison_frontier;
+  if(floor_routes && pct_candidate) {
+    comparison_frontier=*pct_candidate;pct_candidate=&*comparison_frontier;
+  }
   const bool recovery = stair_short_action;
   if(recovery && base_ &&
      (request==RecoveryRequest::position || request==RecoveryRequest::delegate) &&
@@ -264,15 +347,53 @@ bool ExplorationController::prepare_route(const XY &target,
   if (options_.planner_mode_=="layer" && !layer_fresh) {
     report("waiting_for_layer_map");return false;
   }
+  // A current-stance candidate is an observation, not a zero-length route.
+  // Revalidate at the actual body pose/attitude before arming any turn.
+  const bool ordinary_current=pct_candidate && pct_candidate->attempt && !recovery && base_ &&
+      (detail=="pct_frontier" || detail=="pct_frontier_fast" || detail=="pct_frontier_review") &&
+      std::any_of(pct_candidate->observations.begin(),pct_candidate->observations.end(),[&](const auto &p) {
+        return std::hypot(p[0]-(*base_)[0],p[1]-(*base_)[1])<=1e-6;
+      });
+  if(ordinary_current) {
+    LayerMapReadPhase lock(*shared_layer_);
+    const auto version=shared_layer_->current_version.load();
+    const auto checked=shared_layer_->pct->observation_poses(version,*base_,base_attitude_,
+        {pct_candidate->frontier},false,std::nullopt,
+        policy_.floor_height_?std::optional<XY>{{*policy_.floor_height_,options_.floor_height_tolerance_}}:std::nullopt,
+        *base_,options_.observation_goal_xy_tolerance_,1);
+    if(checked.empty()) {
+      if(selection_failure)*selection_failure="stationary_view_no_longer_safe";
+      const auto stance=std::find_if(pct_candidate->observations.begin(),pct_candidate->observations.end(),[&](const auto &p) {
+        return std::hypot(p[0]-(*base_)[0],p[1]-(*base_)[1])<=1e-6;
+      });
+      shared_layer_->pct->observation_task(version,"floor_reject_view",pct_candidate->id,*stance);
+      return false;
+    }
+    const auto recorded=shared_layer_->pct->observation_task(version,"floor_attempt",pct_candidate->id,
+        *base_,checked.front().yaw);
+    if(!recorded.ready) {
+      if(selection_failure)*selection_failure="stationary_frontier_changed";return false;
+    }
+    ObservationTask task;task.frontier=*pct_candidate;task.began=wall_now();
+    task.planned_pose=*base_;task.floor_attempt=pct_candidate->attempt;
+    task.fast_floor=detail=="pct_frontier_fast";
+    task.platform_frontier=platform_floor.has_value();
+    observation_task_=std::move(task);
+    if(policy_.cross_task_.engaged())policy_.cross_task_.exploring_platform(policy_.floor_height_.value_or(
+        (*base_)[2]-options_.layer_body_height_));
+    control_mode_=ExplorationMode::flat;
+    report("observation_stationary_selected","verified_current_stance");return true;
+  }
   const auto viewpoint_snapshot = planning_snapshot(grid, obstacles);
-  const auto views = route_planner_.find_viewpoints(
+  auto views = route_planner_.find_viewpoints(
       viewpoint_snapshot, target, pct_candidate, recovery, options_.planner_mode_ != "layer",
       options_.planner_mode_ != "occupancy" && layer_fresh, base_attitude_);
   if (!views.layer_error.empty())
     RCLCPP_WARN_THROTTLE(logger_, *clock_, 5000, "PCT observation search: %s", views.layer_error.c_str());
-  const auto &viewpoints = views.xy;
+  auto &viewpoints = views.xy;
   const auto &layer_views = views.layer;
   if (viewpoints.empty()) {
+    if(selection_failure)*selection_failure="no_safe_observation_position";
     if (recovery) recovery_.recovery_last_failure_ = "no_safe_recovery_viewpoint";
     if (!recovery) suppressed_.push_back({target, wall_now() + options_.cooldown_});
     report("route_unavailable", "no_safe_observation_position");
@@ -308,7 +429,8 @@ bool ExplorationController::prepare_route(const XY &target,
         pct_candidate->observations[i],0.,bounded_review?wall_now()-planning_started:0.,blockers);
   };
   PctObservationProgress *progress=nullptr;
-  if(pct_candidate && !floor_attempt) {
+  if(pct_candidate && !floor_attempt && detail!="pct_return_home" &&
+     !(navigation_goal_ && detail==navigation_goal_->policy)) {
     const auto &key=detail;
     progress=pct_candidate->id?&pct_observation_progress_[pct_candidate->id]:&stair_route_progress_[key];
     const auto revision=pct_candidate->id?pct_candidate->revision:
@@ -326,9 +448,42 @@ bool ExplorationController::prepare_route(const XY &target,
       ((policy_.cross_task_.engaged() && policy_.cross_task_.phase()!="exploring_platform") || stair_climb);
   const bool stair_segment=options_.floor_exploration_ && (cross_layer_target || ascent_frontier) && !platform_floor;
   const auto departure_height=(stair_climb || ascent_frontier)?policy_.floor_height_:std::nullopt;
-  const double minimum_travel=(cross_layer_target || ascent_frontier)?
-      cross_layer_minimum_travel():options_.observation_min_distance_;
+  const double minimum_travel=detail=="pct_return_home"?options_.observation_goal_xy_tolerance_:
+      (cross_layer_target || ascent_frontier)?cross_layer_minimum_travel():options_.observation_min_distance_;
   const XY current_xy{(*base_)[0],(*base_)[1]};
+  std::vector<std::pair<PlannerResult,std::size_t>> partial_fallbacks;
+  const auto dispatch_plan=[&](const PlannerResult &chosen,std::size_t i) {
+    if(stair_climb && chosen.partial && pct_candidate && !pct_candidate->id &&
+       !chosen.unknown_blockers.empty()) {
+      for(const auto &old:deferred_navigation_goals_) {
+        if(old.policy!="pct_upward_support" || old.blockers.empty() ||
+           (old.wait_reason!="no_verified_recovery_action" &&
+            old.wait_reason!="segments_without_effective_progress" &&
+            old.wait_reason!="navigation_recovery_no_progress" &&
+            old.wait_reason!="pct_blocker_no_verified_action"))continue;
+        const auto matching=[&](const auto &p,const auto &others) {
+          return std::any_of(others.begin(),others.end(),[&](const auto &q) {
+            return std::hypot(p.point[0]-q.point[0],p.point[1]-q.point[1])<.05 &&
+                   std::abs(p.point[2]-q.point[2])<.05;
+          });
+        };
+        const auto new_matches=std::count_if(chosen.unknown_blockers.begin(),chosen.unknown_blockers.end(),
+            [&](const auto &p){return matching(p,old.blockers);});
+        const auto old_matches=std::count_if(old.blockers.begin(),old.blockers.end(),
+            [&](const auto &p){return matching(p,chosen.unknown_blockers);});
+        if(2*new_matches<chosen.unknown_blockers.size() || 2*old_matches<old.blockers.size())continue;
+        const auto dependency=navigation_dependency(old);
+        if(dependency.evidence && dependency.evidence==old.wait_evidence) {
+          failure="ascent_gap_already_deferred";return false;
+        }
+      }
+    }
+    const RouteSelection selection{pct_candidate,detail,progress,planning_started,recovery,
+        stair_segment,stair_climb,fast_floor,floor_attempt,platform_floor,departure_height};
+    if(stage_route(chosen,selection,snapshot,&failure))return true;
+    reject_view(i);incompatible_failure=true;return false;
+  };
+  const auto collected_before=floor_routes?floor_routes->size():0;
   for (std::size_t i = first_viewpoint; i < viewpoints.size() && attempted_viewpoints<(floor_attempt?3u:12u); ++i) {
     if(pct_candidate && pct_round_deadline_>0. && wall_now()>=pct_round_deadline_) {
       if(selection_failure)*selection_failure="planning_budget_exhausted";
@@ -337,10 +492,15 @@ bool ExplorationController::prepare_route(const XY &target,
         search_timed_out=true;
         break;
       }
+      if(!partial_fallbacks.empty())break;
       return false;
     }
     if(progress)progress->next=i+1;
     PlanningGoal goal;
+    if(pct_candidate && !recovery && detail!="pct_return_home" &&
+       !navigation_target_available(pct_candidate->observations[i])) {
+      failure="navigation_target_deferred";continue;
+    }
     if(!recovery && xy_distance(current_xy,viewpoints[i])<minimum_travel) {
       reject_view(i);
       failure="observation_position_too_close";continue;
@@ -362,6 +522,29 @@ bool ExplorationController::prepare_route(const XY &target,
     goal.collect_unknown_blockers=unknown_blockers!=nullptr;
     goal.stair_segment=stair_segment;
     goal.require_observation=!stair_climb;
+    if(detail=="pct_return_home")goal.require_observation=false;
+    const bool support_escape=recovery && request==RecoveryRequest::delegate &&
+        recovery_.blocker_recovery_ && recovery_.blocker_recovery_->unsafe_start &&
+        recovery_.blocker_recovery_->action && !recovery_.blocker_recovery_->action->targeted;
+    if(support_escape)goal.require_observation=false;
+    goal.allow_partial=pct_candidate && !recovery;
+    if(goal.allow_partial && !ordinary_floor && !platform_floor && detail!="pct_return_home" &&
+       (stair_climb || ascent_frontier || cross_layer_target)) {
+      const auto support=shared_layer_->pct->point_check(goal.layer_version,*base_,false,
+          std::nullopt,0.,false,std::nullopt,true);
+      if(support.ready && support.ground_z) {
+        double highest=*support.ground_z;
+        if(navigation_goal_ && navigation_goal_->policy==detail && navigation_goal_->segment_ground)
+          highest=std::max(highest,*navigation_goal_->segment_ground);
+        goal.minimum_stop_ground=highest-.05;
+      }
+      else {failure="stair_start_support_unavailable";continue;}
+    }
+    if(navigation_goal_ && detail==navigation_goal_->policy && navigation_goal_->full_first)
+      goal.allow_partial=false;
+    goal.validate_delegate_route=recovery && request==RecoveryRequest::delegate &&
+        recovery_.blocker_recovery_ && (recovery_.blocker_recovery_->navigation ||
+          (support_escape && shared_layer_->pct->start_ready(goal.layer_version,*base_)));
     goal.recovery_yaw=base_yaw_.value_or(0.0);
     if(recovery && (request==RecoveryRequest::position || request==RecoveryRequest::delegate))
       goal.xy_tolerance=options_.recovery_goal_xy_tolerance_;
@@ -388,7 +571,7 @@ bool ExplorationController::prepare_route(const XY &target,
       if(i<pct_candidate->observation_yaws.size())goal.observation_yaw=pct_candidate->observation_yaws[i];
       (*goal.observation_xyz)[2]+=options_.layer_body_height_;
     }
-    if(fast_floor && !floor_search) {
+    if(fast_floor) {
       const auto check=shared_layer_->pct->observation_task(goal.layer_version,"validate_fast_view",
           pct_candidate->id,*goal.observation_xyz,goal.observation_yaw.value_or(0.));
       if(!check.ready) {
@@ -437,8 +620,9 @@ bool ExplorationController::prepare_route(const XY &target,
           unknown_blockers && unknown_blockers->empty();
       if(floor_search && !result.usable())
         rejected_blockers.insert(rejected_blockers.end(),result.unknown_blockers.begin(),result.unknown_blockers.end());
-      if((!floor_search || has_blockers) && pct_candidate && blocked_goal && (first_flat_blocker ||
-         (blocked_goal->observations.empty() && (has_blockers || disconnection)))) {
+      const bool compute_only=!result.usable() && result.failure_class==PlannerFailureClass::timeout && !has_blockers;
+      if(pct_candidate && blocked_goal && (first_flat_blocker ||
+         (blocked_goal->observations.empty() && (has_blockers || disconnection || compute_only)))) {
         *blocked_goal=*pct_candidate;
         blocked_goal->observations={pct_candidate->observations[i]};
         blocked_goal->observation_yaws.clear();
@@ -449,7 +633,7 @@ bool ExplorationController::prepare_route(const XY &target,
         unknown_blockers->insert(unknown_blockers->end(),result.unknown_blockers.begin(),result.unknown_blockers.end());
       search_timed_out=search_timed_out || result.failure_class==PlannerFailureClass::timeout;
       if(pct_candidate && !floor_attempt && !cross_layer_target &&
-         result.failure_class==PlannerFailureClass::timeout) {
+         result.failure_class==PlannerFailureClass::timeout && !compute_only) {
         policy_.pct_timeout_pending_[pct_candidate->id]=wall_now()+2.;
         policy_.pct_timed_out_observers_[pct_candidate->observations[i]]=wall_now()+12.;
       }
@@ -471,6 +655,8 @@ bool ExplorationController::prepare_route(const XY &target,
           << "\",\"planner\":\"" << planner_name(result.kind)
           << "\",\"usable\":" << (result.usable() ? "true" : "false")
           << ",\"waypoints\":" << result.waypoints.size()
+          << ",\"partial\":" << (result.partial?"true":"false")
+          << ",\"complete_goal_plan\":" << (result.usable() && !result.partial?"true":"false")
           << ",\"planning_ms\":" << result.planning_ms
           << ",\"candidate_source\":\"" << candidate_source_name(result.goal.candidate.source) << "\""
           << ",\"backend\":" << result.backend_metadata
@@ -504,81 +690,60 @@ bool ExplorationController::prepare_route(const XY &target,
         });
         if(endpoint==results.end() || endpoint->failure_class==PlannerFailureClass::unsafe_start ||
            endpoint->failure_class==PlannerFailureClass::unavailable)break;
-        reject_view(i,endpoint->failure_class==PlannerFailureClass::timeout,&rejected_blockers);
+        // A compute deadline does not refute this observation stance. Keep
+        // its physical target for a bounded warm retry, without task failure.
+        if(endpoint->failure_class!=PlannerFailureClass::timeout || !rejected_blockers.empty())
+          reject_view(i,endpoint->failure_class==PlannerFailureClass::timeout,&rejected_blockers);
       }
       if (!recovery && unsafe_start_failure && !incompatible_failure) break;
       continue;
     }
-    std::vector<Point> ground_route;
-    auto ascent_start=cross_ground_pose();
-    if((stair_climb || stair_segment) && chosen->start_ground_z)
-      ascent_start[2]=*chosen->start_ground_z;
-    if(ascent_frontier) {
-      if(!chosen->start_ground_z || chosen->xyz.empty()) {
-        reject_view(i);failure="stair_start_support_unavailable";continue;
-      }
+    if(chosen->partial) {
+      partial_fallbacks.emplace_back(*chosen,i);
+      continue; // Try the other complete routes before any advance.
     }
-    if(options_.cross_layer_enabled_ && pct_candidate && chosen->kind==PlannerKind::layer &&
-       !platform_floor && (!options_.floor_exploration_ || stair_climb || ascent_frontier || policy_.cross_task_.engaged())) {
-      ground_route=chosen->xyz;
-      for(auto &p:ground_route)p[2]-=options_.layer_body_height_;
-      if (const auto *reason = policy_.check_ascent(ascent_start, ground_route, departure_height, stair_climb)) {
-        failure = reason;
-        incompatible_failure = true;
-        continue;
-      }
-    }
-    if(!recovery && !chosen->waypoints.empty() &&
-       xy_distance(current_xy,chosen->waypoints.back())<minimum_travel) {
-      reject_view(i);
-      failure="observation_position_too_close";continue;
-    }
-    if(bounded_review && wall_now()>=pct_round_deadline_) {
-      reject_view(i,true);
-      pct_round_exhausted_=true;
-      failure="pct_planning_timeout";
-      break;
-    }
-    if (!path_processor_.load(goal, *chosen, recovery, &snapshot)) {
-      reject_view(i);
-      incompatible_failure = true;
-      failure = "route_staging_failed";
-      continue;
-    }
-    if(recovery_.stair_reposition_ && recovery_.stair_reposition_->stage==StairReposition::Stage::forward &&
-       chosen->kind==PlannerKind::layer) {
-      const auto &failed=recovery_.stair_reposition_->start;
-      const auto &points=path_processor_.xyz();
-      Point from=*base_;
-      bool blocked_departure=false;
-      for(const auto &to:points) {
-        const double dx=to[0]-from[0],dy=to[1]-from[1];
-        if(std::hypot(dx,dy)>1e-6 && std::hypot(from[0]-failed[0],from[1]-failed[1])<=.20 &&
-           scan_start_inflated(from,std::atan2(dy,dx))) {
-          blocked_departure=true;
-          break;
+    if(floor_routes && ordinary_floor) {
+      shared_layer_->pct->observation_task(goal.layer_version,"floor_preview_attempt",pct_candidate->id,
+          *goal.observation_xyz,goal.observation_yaw.value_or(0.));
+      const auto gain=i<pct_candidate->observation_gains.size()?pct_candidate->observation_gains[i]:
+          pct_candidate->gain/cfg_.resolution;
+      floor_routes->push_back({*chosen,*pct_candidate,detail,policy_.pct_frontiers_.scope,
+                               planning_started,gain,platform_floor});
+      const auto effort=route_effort(*chosen,current_xy,pct_candidate->gain,
+                                    options_.pct_detour_ratio_,options_.pct_detour_excess_);
+      if(!effort.detour)return true;
+      if(comparison_frontier && pct_candidate->direction_limited && i+1==viewpoints.size() &&
+         attempted_viewpoints<3 && wall_now()<pct_round_deadline_) {
+        std::vector<PctUnknownBlocker> compared{{pct_candidate->frontier,0,goal.layer_version}};
+        for(const auto &pose:pct_candidate->observations)compared.push_back({pose,0,goal.layer_version});
+        const auto alternative=shared_layer_->pct->observation_task(goal.layer_version,"floor_compare_view",
+            pct_candidate->id,*base_,base_yaw_.value_or(0.),pct_round_deadline_-wall_now(),&compared);
+        if(alternative.ready && alternative.region) {
+          auto &extended=*comparison_frontier;
+          if(extended.observation_gains.empty())extended.observation_gains.resize(
+              extended.observations.size(),extended.gain/cfg_.resolution);
+          extended.observations.push_back(*alternative.region);
+          extended.observation_yaws.push_back(alternative.yaw);
+          extended.observation_gains.push_back(alternative.gain);
+          viewpoints.push_back({(*alternative.region)[0],(*alternative.region)[1]});
         }
-        from=to;
       }
-      if(blocked_departure) {
-        path_processor_.clear();
-        failure="stair_retry_departure_inflated";
-        incompatible_failure=true;
-        continue;
-      }
+      continue; // Long complete paths remain available while comparing other stances.
     }
-    const RouteSelection selection{pct_candidate, detail, progress, planning_started, recovery,
-        stair_segment, stair_climb, fast_floor, floor_attempt,
-        platform_floor, departure_height};
-    if (!accept_route(*chosen, selection, ascent_start, ground_route)) {
-      reject_view(i);
-      reset_planned_route();
-      failure = "observation_position_already_reached";
-      incompatible_failure = true;
-      continue;
-    }
-    return true;
+    if(dispatch_plan(*chosen,i))return true;
   }
+  // Search failure/exhaustion (including the shared budget) opens fallback.
+  // No provisional segment is executed while a complete route is available.
+  if(floor_routes && ordinary_floor) {
+    if(floor_routes->size()>collected_before)return true;
+    for(const auto &[partial,index]:partial_fallbacks)
+      floor_routes->push_back({partial,*pct_candidate,detail,policy_.pct_frontiers_.scope,
+                               planning_started,index<pct_candidate->observation_gains.size()?
+                                 pct_candidate->observation_gains[index]:pct_candidate->gain/cfg_.resolution,
+                               platform_floor});
+    if(!partial_fallbacks.empty())return true;
+  } else for(const auto &[partial,index]:partial_fallbacks)
+    if(dispatch_plan(partial,index))return true;
   if (!recovery && !floor_attempt && !recovery_.blocker_recovery_ &&
       (!unknown_blockers || unknown_blockers->empty()) && (!blocked_goal || blocked_goal->observations.empty())) {
     if(pct_candidate && pct_candidate->id && !cross_layer_target) {
@@ -606,14 +771,41 @@ bool ExplorationController::accept_route(
   selected_platform_frontier_=selection.platform_floor && selection.frontier && selection.frontier->id;
   selected_fast_floor_=selection.fast_floor;
   selected_floor_attempt_=selection.floor_attempt;
+  selected_partial_=chosen.partial;
   if (selection.frontier) pct_markers_dirty_=true;
   route_skipped_nearby_ = 0;
   if (!skip_nearby_route_waypoints()) return false;
+  if(chosen.partial && selection.frontier) {
+    if(!goal.observation_xyz || chosen.xyz.empty() ||
+       !shared_layer_->pct->commit_progress(goal.layer_version,*goal.observation_xyz,
+                                           chosen.xyz.back(),goal.pct_floor))return false;
+    if(!navigation_goal_) {
+      auto final_target=*selection.frontier;
+      // Preserve the chosen final stance, not the first alternative stance.
+      auto ground=*goal.observation_xyz;ground[2]-=options_.layer_body_height_;
+      final_target.observations={ground};
+      final_target.observation_yaws=goal.observation_yaw?std::vector<double>{*goal.observation_yaw}:std::vector<double>{};
+      navigation_goal_=NavigationGoal{final_target,selection.detail,selection.platform_floor,chosen.unknown_blockers,0.};
+    } else navigation_goal_->blockers=chosen.unknown_blockers;
+    navigation_goal_->compute_retries=0;
+    navigation_goal_->segment_start=base_;
+    if(chosen.start_ground_z)navigation_goal_->segment_ground=std::max(
+        navigation_goal_->segment_ground.value_or(*chosen.start_ground_z),*chosen.start_ground_z);
+    navigation_goal_->segment_evidence=navigation_dependency(*navigation_goal_).evidence;
+    if(!navigation_goal_->best_remaining && base_) {
+      auto final=navigation_goal_->target.observations.front();final[2]+=options_.layer_body_height_;
+      navigation_goal_->best_remaining=std::hypot(std::hypot((*base_)[0]-final[0],(*base_)[1]-final[1]),(*base_)[2]-final[2]);
+      navigation_goal_->best_height_error=std::abs((*base_)[2]-final[2]);
+    }
+    selected_floor_attempt_=0;
+  }
+  if(!chosen.partial && navigation_goal_ && selection.detail==navigation_goal_->policy)
+    navigation_goal_.reset();
   if (selection.frontier) {
     if (selection.progress) selection.progress->next = 0;
     policy_.pct_timeout_pending_.erase(selection.frontier->id);
   }
-  if (selection.floor_attempt) {
+  if (selection.floor_attempt && !chosen.partial) {
     shared_layer_->pct->observation_task(goal.layer_version,"floor_attempt",
         selection.frontier->id,*goal.observation_xyz,goal.observation_yaw.value_or(0.));
     RCLCPP_INFO(logger_,"Floor %zu h=%.3f frontier %llu attempt=%d scope=%s map=%llu observer_ms=%.1f planning_ms=%.1f: route_ready",
@@ -627,11 +819,11 @@ bool ExplorationController::accept_route(
   const bool ordinary_floor=selection.floor_attempt &&
       (selection.detail=="pct_frontier" || selection.detail=="pct_frontier_fast" ||
        selection.detail=="pct_frontier_review");
-  if(ordinary_floor && policy_.cross_task_.engaged()) {
+  if(!chosen.partial && ordinary_floor && policy_.cross_task_.engaged()) {
     policy_.cross_task_.exploring_platform(policy_.floor_height_.value_or(ascent_start[2]));
     policy_.cross_priority_pending_=false;
     control_mode_=ExplorationMode::flat;
-  } else if (policy_.adopt_ascent(ascent_start, ground_route, selection.departure_height,
+  } else if (!chosen.partial && policy_.adopt_ascent(ascent_start, ground_route, selection.departure_height,
                            selection.stair_climb ? goal.observation_yaw : std::nullopt,
                            selection.detail=="pct_floor_ascent_frontier")) {
     control_mode_ = ExplorationMode::cross_layer;

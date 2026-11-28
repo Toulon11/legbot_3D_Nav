@@ -53,7 +53,7 @@ class PctBlockerRecovery {
   std::optional<PctRecoveryAction> delegate(
       const PlanningSnapshot &snapshot, std::uint64_t version,
       const PctRecoveryConstraints &constraints, const std::vector<Point> &goals,
-      double arrival_tolerance);
+      double arrival_tolerance,bool require_observation=true);
   void retry_delegates() { delegated_.clear(); observer_routes_.clear(); }
   const std::map<std::string,std::size_t> &rejections() const { return rejections_; }
   bool pending() const { return pending_; }

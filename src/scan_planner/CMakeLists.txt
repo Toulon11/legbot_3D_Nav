@@ -64,5 +64,9 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test/test_near_goal_ros.py
     $<TARGET_FILE:scan_go2_cmd_adapter> $<TARGET_FILE:scan_planner_node> --init-budget)
   set_tests_properties(scan_initialization_budget PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
+  add_test(NAME scan_execution_failure_clear COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/test_near_goal_ros.py
+    $<TARGET_FILE:scan_go2_cmd_adapter> $<TARGET_FILE:scan_planner_node> --failure-clear)
+  set_tests_properties(scan_execution_failure_clear PROPERTIES TIMEOUT 35 RUN_SERIAL TRUE)
 endif()
 ament_package()

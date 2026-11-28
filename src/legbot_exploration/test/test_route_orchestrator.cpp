@@ -13,6 +13,107 @@ namespace le = legbot_exploration;
 int main(int argc,char **argv) {
   assert(argc==2);
   {
+    // Compare the complete reference arc, including its actual start connector.
+    // Staged stop chords would hide this detour, and node-Z changes are irrelevant.
+    le::PlannerResult detour;detour.goal.observation={2.,0.};
+    detour.route.points={{0.,3.5},{2.,3.5},{2.,0.}};
+    detour.waypoints={{2.,0.}};
+    const auto long_route=le::route_effort(detour,{0.,0.},16.);
+    assert(std::abs(long_route.length-9.)<1e-6 && long_route.detour);
+    le::PlannerResult direct;direct.goal.observation={3.,0.};
+    direct.route.points={{0.,0.},{1.5,.8},{3.,0.}};
+    const auto short_route=le::route_effort(direct,{0.,0.},16.);
+    assert(!short_route.detour && short_route.score<long_route.score);
+    // A tiny denominator alone does not trigger comparison.
+    direct.goal.observation={.1,0.};direct.route.points={{0.,.3},{.1,.3},{.1,0.}};
+    assert(!le::route_effort(direct,{0.,0.},16.).detour);
+    // Coverage matters: a longer route can be worthwhile for more physical gain.
+    assert(le::route_effort(detour,{0.,0.},64.).score<
+           le::route_effort(detour,{0.,0.},1.).score);
+  }
+  {
+    // A complete route wins even when the preferred backend offers a segment.
+    // Eligibility, attempt identity, and explicit fallback permission still apply.
+    le::PlanningGoal goal;goal.allow_partial=true;
+    le::PlannerResult complete;complete.goal=goal;complete.kind=le::PlannerKind::occupancy;
+    complete.waypoints={{1.,0.}};complete.route.points={{0.,0.},{1.,0.}};
+    auto partial=complete;partial.kind=le::PlannerKind::layer;partial.partial=true;
+    for(bool reversed:{false,true}) {
+      std::vector<le::PlannerResult> results=reversed?
+          std::vector<le::PlannerResult>{partial,complete}:std::vector<le::PlannerResult>{complete,partial};
+      assert(le::select_plan(goal,results)->kind==le::PlannerKind::occupancy);
+    }
+    goal.mode=le::ExplorationMode::cross_layer;
+    assert(le::select_plan(goal,{complete,partial})->partial); // Occupancy is ineligible here.
+    complete.kind=le::PlannerKind::layer;
+    assert(!le::select_plan(goal,{partial,complete})->partial);
+    complete.goal.attempt_id++;
+    assert(le::select_plan(goal,{partial,complete})->partial);
+    goal.allow_partial=false;
+    assert(!le::select_plan(goal,{partial,complete}));
+  }
+  {
+    // All goals share safe partial routes; a failed goal admission must not
+    // turn a partial stop into completion or weaken its parking footprint.
+    le::SharedLayerMap shared;
+    shared.pct=std::make_shared<le::PctBackend>(argv[1],.32,100000,200000,
+        "{\"maturity_min_points\":1,\"robot_radius\":0.15,\"safety_margin\":0.0}");
+    std::vector<le::LayerPoint> points;
+    for(int x=-20;x<=12;++x)for(int y=-12;y<=12;++y)
+      for(double z:{0.,1.5})points.push_back({x*.1,y*.1,z});
+    shared.pct->append(points);shared.pct->refresh(1);shared.current_version.store(1);
+    std::unordered_map<le::Cell,int,le::CellHash> grid;
+    std::vector<le::XY> obstacles;le::Settings settings;
+    le::PlanningSnapshot snapshot{grid,obstacles,settings,{-1.,0.,.32},.32,true,nullptr,&shared,1,nullptr};
+    le::PlanningGoal goal;
+    goal.candidate.source=le::CandidateSource::layer_frontier;
+    goal.candidate.frontier={3.,0.,0.};goal.target={3.,0.};goal.observation={3.,0.};
+    goal.observation_xyz=le::Point{3.,0.,.32};goal.xy_tolerance=.15;
+    goal.layer_version=1;goal.request_layer=true;goal.request_occupancy=false;
+    goal.require_observation=false;goal.allow_partial=true;goal.collect_unknown_blockers=true;
+    const auto results=le::plan_candidates(goal,snapshot);
+    assert(results.size()==1 && results[0].usable() && results[0].partial);
+    const auto &end=results[0].xyz.back();
+    assert(end[0]>-.7 && end[0]<1.2);
+    assert(shared.pct->observation_task(1,"navigation_arrival",0,end,0.,.15).ready);
+    goal.minimum_stop_ground=.05;
+    assert(!le::plan_candidates(goal,snapshot)[0].usable());
+    goal.minimum_stop_ground=-.05;
+    assert(le::plan_candidates(goal,snapshot)[0].partial);
+    // Exercise the embedded Python boundary: only fallback stops are limited.
+    goal.minimum_stop_ground=.05;
+    for(auto mode:{le::ExplorationMode::flat,le::ExplorationMode::cross_layer})
+      for(bool observe:{false,true}) {
+        auto reachable=goal;reachable.mode=mode;reachable.require_observation=observe;
+        reachable.target=reachable.observation={.2,0.};
+        reachable.observation_xyz=le::Point{.2,0.,.32};
+        reachable.candidate.frontier={.2,0.,0.};
+        const auto full=le::plan_candidates(reachable,snapshot);
+        assert(full.size()==1 && full[0].usable() && !full[0].partial);
+        assert(std::abs(full[0].xyz.back()[0]-.2)<.01);
+      }
+    goal.minimum_stop_ground.reset();
+    goal.allow_partial=false;
+    const auto strict=le::plan_candidates(goal,snapshot);
+    assert(!strict[0].usable() && !strict[0].partial);
+    goal.candidate.source=le::CandidateSource::recovery;
+    goal.mode=le::ExplorationMode::recovery;
+    goal.recovery_request=le::RecoveryRequest::delegate;goal.validate_delegate_route=true;
+    goal.observation={.6,0.};goal.observation_xyz=le::Point{.6,0.,.32};
+    const auto observation_route=le::plan_candidates(goal,snapshot);
+    assert(observation_route.size()==1 && observation_route[0].usable() && observation_route[0].kind==le::PlannerKind::recovery_layer);
+    le::PathProcessor processor;
+    assert(processor.load(goal,observation_route[0],true,&snapshot));
+    const auto dispatch=processor.dispatch(10,snapshot.base);
+    assert(dispatch && dispatch->reference_points.size()>1);
+    assert(processor.waypoints().size()==1);
+    le::PctBlockerRecovery escaping;
+    le::PctRecoveryConstraints limits;
+    assert(!escaping.delegate(snapshot,1,limits,{{.6,0.,.32}},.15));
+    const auto escape=escaping.delegate(snapshot,1,limits,{{.6,0.,.32}},.15,false);
+    assert(escape && !escape->targeted && escape->position==*goal.observation_xyz);
+  }
+  {
     // When the recorded gap is beyond immediate viewpoints, advance only
     // toward it over admitted ground. Target elevation is not a footstep.
     le::SharedLayerMap shared;
@@ -76,7 +177,7 @@ int main(int argc,char **argv) {
   }
 
   {
-    // A pending surface inside the near blind region cannot be resolved by
+    // A genuinely unmeasured surface inside the near blind region cannot be resolved by
     // turning. Short actions are unavailable; the shared pose search must
     // still find a routed observation stance without relaxing arrival safety.
     le::SharedLayerMap shared;
@@ -84,7 +185,7 @@ int main(int argc,char **argv) {
                                              "{\"maturity_min_points\":1,\"allow_open_ceiling\":true,\"origin_z\":0.00001}");
     std::vector<le::LayerPoint> plane;
     for(int x=-30;x<=30;++x)for(int y=-30;y<=30;++y)
-      for(double z:{0.,1.5})plane.push_back({x*.1,y*.1,z});
+      for(double z:{0.,1.5})if(!(x==5 && y==0 && z==0.))plane.push_back({x*.1,y*.1,z});
     shared.pct->append(plane);shared.pct->refresh(1);shared.current_version.store(1);
     const le::Point base{0.,0.,.32};
     const std::vector<le::PctUnknownBlocker> blockers{{{.5,0.,.13},1,1}};
@@ -115,7 +216,8 @@ int main(int argc,char **argv) {
                                              "{\"maturity_min_points\":1,\"allow_open_ceiling\":true,\"origin_z\":0.00001}");
     std::vector<le::LayerPoint> plane;
     for(int x=-30;x<=30;++x)for(int y=-30;y<=30;++y)
-      if(x!=7 || y!=0)for(double z:{0.,1.5})plane.push_back({x*.1,y*.1,z});
+      if(x!=7 || y!=0)for(double z:{0.,1.5})
+        if(!(x==14 && y==0 && z==0.))plane.push_back({x*.1,y*.1,z});
     shared.pct->append(plane);shared.pct->refresh(1);shared.current_version.store(1);
     const le::Point base{0.,0.,.32};
     const std::vector<le::PctUnknownBlocker> blockers{{{1.4,0.,.13},1,1}};

@@ -1381,7 +1381,8 @@ class FrontierIndex:
                     entries[cid].update(frontier=list(target),cell=self.map.indices(target).astype(int).tolist())
             gain=max((v['gain'] for v in views),default=0)*self.map.settings.resolution
             entries[cid].update(observations=observations,gain=gain,observers_evaluated=True,
-                                observers_complete=complete,observation_yaws=[v['yaw'] for v in views])
+                                observers_complete=complete,observation_yaws=[v['yaw'] for v in views],
+                                observation_gains=[v['gain'] for v in views])
             if directional:
                 entries[cid]['direction_limited']=True
             if bounded_floor:

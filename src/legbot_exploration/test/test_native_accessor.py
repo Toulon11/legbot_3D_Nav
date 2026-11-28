@@ -15,6 +15,20 @@ def open_settings(**settings):
 
 
 class NativeAccessorTest(unittest.TestCase):
+    def test_progress_search_returns_only_checked_forward_stops(self):
+        search=self.astar()
+        search.init_accessor(20.,1,13,39,.1,1.,lambda k,row,col:(0. if col<=14 else 1e6,0.,0.))
+        start=np.asarray([0,2,6],dtype=np.int32);goal=np.asarray([0,35,6],dtype=np.int32)
+        stop=lambda k,row,col:col<=10 and row==6
+        self.assertFalse(search.search_towards(start,goal,0.,stop))
+        path=search.get_partial_result_matrix()
+        self.assertGreater(len(path),1)
+        np.testing.assert_array_equal(path[-1],[0,6,10])
+        self.assertLess(path[0,2],path[-1,2])
+        self.assertEqual(len(search.get_result_matrix()),0)
+        self.assertFalse(search.search_towards(start,goal,0.,lambda *args:False))
+        self.assertEqual(len(search.get_partial_result_matrix()),0)
+
     @classmethod
     def setUpClass(cls):
         native_wrapper()

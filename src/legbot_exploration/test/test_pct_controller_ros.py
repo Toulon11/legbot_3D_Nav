@@ -32,8 +32,11 @@ def main():
     source=Path(__file__).resolve().parents[1]
     os.environ['ROS_DOMAIN_ID']=str(150+os.getpid()%70)
     os.environ['ROS_LOG_DIR']=tempfile.mkdtemp(prefix='pct_controller_ros_')
+    publication_load_test='--publication-load' in sys.argv
     flat_escape_test='--flat-support-escape' in sys.argv
-    home_mission_test='--home-mission' in sys.argv
+    home_retry_test='--home-retry' in sys.argv
+    home_progress_test='--home-progress' in sys.argv
+    home_mission_test='--home-mission' in sys.argv or home_retry_test or home_progress_test
     completion_test='--completion' in sys.argv
     occupied_recovery_test='--recovery-occupied' in sys.argv
     recovery_test='--recovery' in sys.argv or occupied_recovery_test
@@ -41,7 +44,9 @@ def main():
     pending_test='--local-pending' in sys.argv
     cross_test='--cross-layer' in sys.argv
     floor_deferred_test='--floor-deferred' in sys.argv
-    floor_blacklist_test='--floor-blacklist' in sys.argv
+    stationary_frontier_test='--stationary-frontier' in sys.argv
+    route_resolved_test='--route-resolved' in sys.argv
+    floor_blacklist_test='--floor-blacklist' in sys.argv or route_resolved_test or stationary_frontier_test
     low_yield_floor_test='--low-yield-floor' in sys.argv
     expanded_global_first_test='--floor-global-first-after-local' in sys.argv
     ordinary_floor_trial='--ordinary-floor-trial' in sys.argv or low_yield_floor_test or expanded_global_first_test
@@ -59,12 +64,15 @@ def main():
     floor_ascent_handoff_test='--floor-ascent-handoff' in sys.argv
     floor_descent_arrival_test='--floor-descent-arrival' in sys.argv
     startup_low_body_test='--startup-low-body' in sys.argv
+    stair_start_refresh_test='--stair-start-refresh' in sys.argv
     multilevel_support_test='--multilevel-support' in sys.argv
-    stair_gap_test='--stair-gap-scan' in sys.argv
+    ascent_superseded_test='--ascent-superseded' in sys.argv
+    navigation_yield_test='--navigation-yield' in sys.argv or ascent_superseded_test
+    stair_gap_test='--stair-gap-scan' in sys.argv or navigation_yield_test
     platform_shift_test='--landing-shift' in sys.argv
     short_floor_test='--short-floor' in sys.argv or platform_shift_test
     floor_skip_test=('--floor-skip' in sys.argv or stair_reverse_test or stair_scout_test or
-                     stair_priority_test or stair_gap_test or short_floor_test or floor_ascent_handoff_test)
+                     stair_priority_test or stair_gap_test or short_floor_test or floor_ascent_handoff_test or stair_start_refresh_test)
     floor_exploration_test='--floor-exploration' in sys.argv
     fast_floor_test='--fast-floor' in sys.argv
     fast_floor_observation_test='--fast-floor-observation' in sys.argv
@@ -86,10 +94,15 @@ def main():
                  'legbot_explorer:no_frontier_hold:=0.2','legbot_explorer:max_voxels:=1',
                  'legbot_explorer:require_planner_occupancy:=true'):
         command+=['-p',item]
+    if publication_load_test:
+        command+=['-p','publish_period:=0.1','-p','full_snapshot_period:=0.35',
+                  '-p','online_layer_map:graph_preview_enabled:=false']
     if home_mission_test:
         command+=['-p','legbot_explorer:mission_return_home:=true',
                   '-p','legbot_explorer:mission_target_height:=0.0',
                   '-p','legbot_explorer:mission_home:=[-1.0,0.0,0.0]']
+        if home_retry_test:
+            command+=['-p','online_layer_map:pct_planning_budget_seconds:=0.000000001']
     if observation_test:
         command+=['-p','online_layer_map:graph_preview_enabled:=false','-p',
                   'legbot_explorer:odom_timeout:='+('0.25' if observation_timeout_test else '2.0')]
@@ -114,6 +127,9 @@ def main():
                   '-p','legbot_explorer:observation_frame_wait:=0.2',
                   '-p','online_layer_map:pct_fast_exploration:='+
                   str(fast_floor_test or fast_floor_observation_test).lower()]
+    if navigation_yield_test:
+        command+=['-p','online_layer_map:pct_ascent_lookahead_slices:=5']
+        if ascent_superseded_test:command+=['-p','online_layer_map:pct_landing_min_area:=100.0']
     if ordinary_floor_trial:
         command+=['-p','online_layer_map:pct_floor_global_review_enabled:=false']
     elif not bounded_review_test and (floor_deferred_test or floor_blacklist_test or floor_unavailable_test or
@@ -150,7 +166,7 @@ def main():
         rclpy.init();node=rclpy.create_node('pct_controller_test')
         qos=QoSProfile(depth=1,durability=DurabilityPolicy.TRANSIENT_LOCAL)
         states=[];goals=[];plans=[];waypoints=[];executions=[];markers=[];routes=[]
-        surfaces=[];map_states=[];activity=[];observation_events=[]
+        surfaces=[];map_states=[];activity=[];observation_events=[];surface_updates=[]
         def subscribe(kind,topic,storage,profile=qos,decode=False):
             node.create_subscription(kind,topic,lambda m:storage.append(json.loads(m.data) if decode else m),profile)
         subscribe(String,'/exploration/status',states,decode=True)
@@ -167,6 +183,7 @@ def main():
         subscribe(PathMessage,'/exploration/planned_path',routes)
         subscribe(PointCloud2,'/exploration/layers/planning_surfaces',surfaces)
         subscribe(String,'/exploration/layers/status',map_states,decode=True)
+        subscribe(String,'/exploration/layers/surface_updates',surface_updates,decode=True)
         base=node.create_publisher(Odometry,'/slam/global_odometry_base',10)
         sensor=node.create_publisher(Odometry,'/slam/odometry_lidar',10)
         cloud=node.create_publisher(PointCloud2,'/slam/global_cloud_registered',10)
@@ -234,6 +251,9 @@ def main():
                 # The footprint stays unknown even after four feet settle.
                 points=[(i*.1,j*.1,0.) for i in range(-35,36) for j in range(-25,26)
                         if math.hypot(i*.1,j*.1)>=.8]*3
+            if stair_start_refresh_test:
+                points=[(i*.1,j*.1,z) for i in range(-25,26) for j in range(-18,19)
+                        for z in (0.,1.5) if z>0 or math.hypot(i*.1,j*.1)>.65]*3
             if stair_priority_test:
                 points=[(i*.05,j*.05,0.) for i in range(-60,0) for j in range(-62,63)]
                 points.extend((i*.05,j*.05,z) for start,end,lo,hi,z in
@@ -243,7 +263,14 @@ def main():
             # checking the open-floor behavior. The upper boundary stays unknown.
             closed_lower=points+[(i*.1,j*.1,.30) for i in range(-22,23) for j in range(-22,23)
                                  if abs(i)==22 or abs(j)==22]*3
-            if home_mission_test:points=closed_lower
+            if route_resolved_test or stationary_frontier_test:
+                closed_lower=points+[(i*.1,j*.1,z*.1) for i in range(-22,23) for j in range(-22,23)
+                    if abs(i)==22 or abs(j)==22 for z in range(16)]*3
+            if home_mission_test:
+                points=points+[(i*.1,j*.1,z*.1) for i in range(-22,23) for j in range(-22,23)
+                               if abs(i)==22 or abs(j)==22 for z in range(16)]*3
+                if home_progress_test:
+                    points=[p for p in points if not(abs(p[0]+1.)<.001 and abs(p[1])<.001 and abs(p[2])<.001)]
             if flat_escape_test:
                 points=closed_lower+[(.3,j*.1,z*.1) for j in range(-10,11) for z in range(1,15)]*3
                 blocked[:]=[(.3,j*.1,.45) for j in range(-10,11)]
@@ -312,8 +339,10 @@ def main():
         base_speed=0.
         base_pause_until=0.
         if floor_test:base_position[:]=[0.,0.,.38]
+        if route_resolved_test:base_position[:]=[-1.3,0.,.38]
         if floor_descent_arrival_test:base_position[:]=[0.,0.,1.86]
         if startup_low_body_test:base_position[:]=[0.,0.,.084]
+        if stair_start_refresh_test:base_position[:]=[-1.5,0.,.38]
         if stair_priority_test:base_position[:]=[-1.6,0.,.38]
         if cross_test:base_position[:]=[-.4,0.,.38]
         def spin_until(condition,timeout=15):
@@ -353,12 +382,18 @@ def main():
                     sensor.publish(b);ready.publish(Bool(data=True))
                     rclpy.spin_once(node,timeout_sec=.02)
                     if t>=next_cloud:
-                        cloud.publish(point_cloud2.create_cloud_xyz32(a.header,points));next_cloud=t+.25
+                        measured=points
+                        if recovery_test or startup_low_body_test:
+                            # Offline fixtures need measured upper bounds;
+                            # laser range alone no longer initializes C_clear.
+                            ground=0. if startup_low_body_test else 1.5
+                            measured=points+[(x,y,ground+1.5) for x,y,z in points if abs(z-ground)<.001]
+                        cloud.publish(point_cloud2.create_cloud_xyz32(a.header,measured));next_cloud=t+(.01 if publication_load_test else .25)
                         if floor_test:
                             distant=[(8.05,8.05,.45)]
                             raw.publish(point_cloud2.create_cloud_xyz32(a.header,blocked if flat_escape_test else distant))
                             inflated.publish(point_cloud2.create_cloud_xyz32(a.header,blocked or distant))
-                    next_send=t+(.05 if observation_timeout_test else .08 if floor_test else .25)
+                    next_send=t+(.01 if publication_load_test else .05 if observation_timeout_test else .08 if floor_test else .25)
                 rclpy.spin_once(node,timeout_sec=.03)
                 if condition():
                     assert not node.get_publishers_info_by_topic('/go2/control_mode'), 'exploration published gait mode'
@@ -367,6 +402,67 @@ def main():
                     return
             raise AssertionError('timeout; last states='+str(states[-2:]))
         try:
+            if stationary_frontier_test:
+                spin_until(lambda:any(s['observation_task_active'] for s in states),15)
+                assert not requests,'safe current stance should not publish a navigation waypoint'
+                points += [(1.3,j*.1,z) for j in range(-1,3) for z in (0.,1.5)]*3
+                spin_until(lambda:bool(observation_events),10)
+                assert observation_events[0]['success'],observation_events
+                assert not requests,'in-place view unexpectedly became a positional route'
+                assert base_position==[0.,0.,.38]
+                print('PASS safe current stance starts observation without navigation; real new returns settle the original frontier')
+                return 0
+            if publication_load_test:
+                spin_until(lambda:len(surfaces)>=3 and len(surface_updates)>=8 and
+                    any(s.get('capture_from_writer') for s in map_states),20)
+                assert all(msg.width>0 and len(msg.data)==64*msg.width for msg in surfaces)
+                versions=[s['exported_version'] for s in map_states if s['inspection_valid']]
+                assert len(set(versions))>=3,versions
+                ready=[s for s in map_states if s['inspection_valid']]
+                assert max(s['lock_wait_ms'] for s in ready)<5000.,ready[-1]
+                print('PASS continued full clouds and versioned coverage under incoming cloud load; writer handoff used; '+
+                      json.dumps(dict(full_clouds=len(surfaces),updates=len(surface_updates),
+                          writer_captures=sum(s.get('capture_from_writer',False) for s in ready),
+                          maximum_capture_wait_ms=max(s['lock_wait_ms'] for s in ready))))
+                return 0
+            if route_resolved_test:
+                spin_until(lambda:bool(requests) and bool(goals),20)
+                goal_id=requests[0].goal_id
+                points += [(1.3,j*.1,z) for j in range(-1,3) for z in (0.,1.5)]*3
+                spin_until(lambda:any(any(abs(row[0]-1.3)<.01 and abs(row[1])<.01 and abs(row[2])<.01
+                    for row in update['coverage']) for update in surface_updates),12)
+                until=time.monotonic()+.5
+                spin_until(lambda:time.monotonic()>=until,2)
+                assert len(requests)==1 and not observed_turns
+                stage=0
+                def arrived():
+                    return bool(stage and requests[stage-1].has_xy_tolerance and any(
+                        e['goal_id']==goal_id and e['status']=='succeeded' and
+                        e['stage_index']==requests[stage-1].waypoint_index for e in executions))
+                while not arrived():
+                    spin_until(lambda:len(requests)>stage,5)
+                    request=requests[stage];assert request.goal_id==goal_id
+                    p=request.target.pose.position;base_position[:]=[p.x,p.y,p.z]
+                    forward(request.target)
+                    until=time.monotonic()+.3;spin_until(lambda:time.monotonic()>=until,2)
+                    ack.publish(request.target);complete.publish(Bool(data=True));stage+=1
+                    spin_until(lambda:len(requests)>stage or arrived(),6)
+                until=time.monotonic()+.3;spin_until(lambda:time.monotonic()>=until,2)
+                assert not observed_turns and not observation_events
+                assert not states[-1]['observation_task_active']
+                print('PASS resolved frontier keeps accepted route through arrival; no redundant scan or failed observation')
+                return 0
+            if stair_start_refresh_test:
+                spin_until(lambda:states and states[-1]['pct_floor']['number']==1,15)
+                base_position[:]=[0.,0.,.38]
+                spin_until(lambda:any(s['state']=='pct_stair_start_recovery' for s in states),15)
+                count=len(requests)
+                points += [(i*.1,j*.1,0.) for i in range(-7,8) for j in range(-7,8)]*3
+                spin_until(lambda:any(s['state']=='pct_blocker_start_recovered' and
+                    s.get('detail')=='fresh_measured_support' for s in states),15)
+                assert len(requests)==count,'passive origin repair invented a recovery motion'
+                print('PASS stair start repaired by measured returns exits recovery without a scan or motion')
+                return 0
             if flat_escape_test:
                 spin_until(lambda:bool(shifts),15)
                 action,sx,sy,tx,ty,_,kind=shifts[0].data.split('|')
@@ -383,22 +479,45 @@ def main():
                 print('PASS no-gap unsafe start uses validated short escape and resumes ordinary exploration')
                 return 0
             if home_mission_test:
-                for stage in range(12):
-                    spin_until(lambda:len(requests)>stage or (states and states[-1]['state']=='mission_complete'),15)
+                if home_retry_test:
+                    spin_until(lambda:sum(p['reason']=='pct_planning_timeout' for p in plans)>=2,20)
+                    failed=[p for p in plans if p['reason']=='pct_planning_timeout']
+                    assert failed[0]['attempt_id']!=failed[1]['attempt_id'],failed
+                    assert not requests and not states[-1]['mission']['returned_home']
+                    assert any(s['state']=='navigation_compute_retry' for s in states),states[-10:]
+                    assert not observed_turns and not shifts,'compute timeout alone triggered an observation action'
+                    assert not any(s['state'] in ('navigation_target_retired','navigation_start_recovery')
+                                   for s in states),states[-10:]
+                    print('PASS failed home candidate performs a fresh planner call on retry; no false completion')
+                    return 0
+                reached_segment=False
+                for stage in range(30 if home_progress_test else 12):
+                    spin_until(lambda:len(requests)>stage or (states and states[-1]['state']=='mission_complete'),30)
                     if states[-1]['state']=='mission_complete':break
                     request=requests[stage];p=request.target.pose.position
                     planned=next(g for g in goals if g['goal_id']==request.goal_id and g['attempt_id']==request.attempt_id)
-                    assert planned['selection_policy']=='pct_return_home',planned
+                    if not home_progress_test:assert planned['selection_policy']=='pct_return_home',planned
                     assert not states[-1]['mission']['returned_home'],states[-1]
+                    partial=next(p for p in plans if p['goal_id']==request.goal_id and
+                                 p['attempt_id']==request.attempt_id)['partial']
                     forward(request.target);base_position[:]=[p.x,p.y,p.z]
                     until=time.monotonic()+.4
                     spin_until(lambda:time.monotonic()>=until,2)
                     ack.publish(request.target);complete.publish(Bool(data=True))
+                    if home_progress_test and planned['selection_policy']=='pct_return_home' and partial:
+                        spin_until(lambda:any(s['state']=='navigation_segment_reached' for s in states),8)
+                        assert not states[-1]['mission']['returned_home']
+                        assert any(s.get('navigation_segment',{}).get('final_goal_pending') for s in states)
+                        assert not math.hypot(base_position[0]+1,base_position[1])<=.2
+                        points+=[(-1.,0.,0.)]*3
+                        reached_segment=True
                 spin_until(lambda:states[-1]['state']=='mission_complete',8)
                 result=states[-1]['mission']
                 assert result['exploration_finished'] and result['returned_home'],result
                 assert math.hypot(base_position[0]+1,base_position[1])<=.2,base_position
-                print('PASS target task exhaustion, verified return route, stop receipts and home completion')
+                if home_progress_test:assert reached_segment,'no partial route exercised'
+                print('PASS '+('safe partial arrival, measured gap closure, original home goal resumed and completed'
+                    if home_progress_test else 'target task exhaustion, verified return route, stop receipts and home completion'))
                 return 0
             if floor_descent_arrival_test:
                 loaded_feet=4
@@ -511,60 +630,89 @@ def main():
                     assert not observation_events,'passive hints must not start stair scan actions'
                     print('PASS ascending candidates are retained while ordinary floor exploration continues uninterrupted')
                     return 0
+                if navigation_yield_test:
+                    # The far upward goal has a real safe surface, separated
+                    # by a missing strip. Its partial approach stops on a broad
+                    # intermediate platform that still has ordinary work.
+                    points += ([(i*.1,j*.1,.13) for i in range(8,30) for j in range(-30,31)] +
+                               [(i*.1,j*.1,.52) for i in range(35,72) for j in range(-14,15)])*3
+                    points += [(x,y,1.5) for x,y,z in points if z!=1.5]
+                    index=0;first=None
+                    for _ in range(8):
+                        spin_until(lambda:len(requests)>index,15)
+                        request=requests[index];index+=1
+                        result=next(p for p in plans if p['goal_id']==request.goal_id and p['attempt_id']==request.attempt_id)
+                        forward(request.target);complete.publish(Bool(data=False))
+                        p=request.target.pose.position;base_position[:]=[p.x,p.y,p.z]
+                        until=time.monotonic()+.35;spin_until(lambda:time.monotonic()>=until,2)
+                        ack.publish(request.target);complete.publish(Bool(data=True))
+                        if result.get('partial'):
+                            first=request;break
+                    assert first is not None,'no partial platform approach exercised'
+                    assert first.target.pose.position.x<3.,first
+                    if ascent_superseded_test:
+                        # Model a verified recovery stop reached after the accepted
+                        # partial route. Pose Z alone must not settle the goal:
+                        # fresh downward returns establish its actual upper support.
+                        points += [(i*.1,j*.1,z) for i in range(37,64) for j in range(-16,17)
+                                   for z in (1.5,3.)]*3
+                        base_position[:]=[4.7,0.,1.88]
+                        # Height refresh can supersede the transient report in
+                        # this same callback; assert the persistent task state.
+                        spin_until(lambda:any(s.get('cross_layer_task',{}).get('reason')=='ascent_target_superseded' and
+                            not s['navigation_segment']['final_goal_pending'] for s in states),15)
+                        settled=next(s for s in states if s.get('cross_layer_task',{}).get('reason')=='ascent_target_superseded' and
+                                     not s['navigation_segment']['final_goal_pending'])
+                        assert not settled['navigation_segment']['final_goal_pending'],settled
+                        assert settled['navigation_segment']['deferred_targets']>=1,settled
+                        print('PASS measured higher safe support supersedes stale automatic ascent target')
+                        return 0
+                    spin_until(lambda:any(s['state']=='navigation_platform_handoff' for s in states),12)
+                    spin_until(lambda:any(s.get('pct_floor',{}).get('ordinary_started_wall') is not None
+                        and s.get('cross_layer_task',{}).get('phase')=='exploring_platform' for s in states),12)
+                    handed=next(s for s in states if s['state']=='navigation_platform_handoff')
+                    assert not handed['navigation_segment']['final_goal_pending'],handed
+                    assert handed['navigation_segment']['deferred_targets']>=1,handed
+                    assert not any(g['selection_policy']=='pct_upward_support' and g['goal_id']>first.goal_id
+                                   for g in goals),goals
+                    print('PASS partial route finishes, pending ascent yields to confirmed platform exploration')
+                    return 0
                 if stair_gap_test:
                     # Treads are shallower than the platform exploration
                     # depth, so this isolates ascent recovery.
                     stairs=[(i*.1,j*.1,.13*min(4,1+(i-8)//8)) for i in range(8,72)
                             for j in range(-10,11) if i!=20]
                     # An actually unmeasured strip interrupts the next tread.
-                    points=points+stairs*3
-                    index=0
-                    scan_complete=lambda:any(e['reason']=='stair_support_sweep_executed'
-                                             for e in observation_events)
-                    while not shifts and not scan_complete():
-                        spin_until(lambda:len(requests)>index or bool(shifts) or scan_complete(),12)
-                        if shifts or scan_complete():
-                            break
-                        request=requests[index]
-                        forward(request.target)
-                        p=request.target.pose.position
-                        assert p.x<2.0 and p.z<=.65, 'route crossed the unobserved strip'
-                        base_position[:]=[p.x,p.y,p.z]
-                        until=time.monotonic()+.35
+                    points += (stairs+[(x,y,1.5) for x,y,_ in stairs])*3
+                    index=shift_index=0;filled=False;deadline=time.monotonic()+40.
+                    while time.monotonic()<deadline:
+                        until=time.monotonic()+.1
                         spin_until(lambda:time.monotonic()>=until,2)
-                        ack.publish(request.target)
-                        index+=1
-                        assert index<10
-                    recorded_gap=any(s.get('detail')=='recorded_unknown_blocker' and
-                        any(abs(b['point'][0]-2.0)<.05 for b in s['pct_floor']['unknown_blockers'])
-                        for s in states)
-                    assert recorded_gap or any(
-                        p['reason'].startswith('arrival_') or p['reason']=='pct_route_disconnected'
-                        for p in plans),plans
-                    assert not any(e['status']=='failed' for e in executions),executions
-                    if shifts:
-                        action,sx,sy,tx,ty,heading,*kind=shifts[0].data.split('|')
-                        dx,dy=float(tx)-float(sx),float(ty)-float(sy)
-                        assert .20<=math.hypot(dx,dy)<=.60
-                        if kind==['shift']:
-                            # Transverse to the actual ascent, which can be
-                            # oblique to world X after a checked observation.
-                            ascent=states[-1]['cross_layer_task']['ascent_yaw']
-                            assert abs(dx*math.cos(ascent)+dy*math.sin(ascent))<.01
-                        else:
-                            assert dx*math.cos(float(heading))+dy*math.sin(float(heading))<0.
-                        base_position[:2]=[float(tx),float(ty)]
-                        shift_result.publish(String(data=action+'|succeeded'))
-                        spin_until(lambda:any(s['state']=='cross_layer_stair_gap_scan' for s in states),8)
-                    else:
-                        assert any(s['state']=='cross_layer_support_scan' for s in states)
-                    points=points+[(1.965+i*.015,-1.0+j*.02,.26)
-                                   for i in range(6) for j in range(101)]
-                    spin_until(scan_complete,8)
-                    spin_until(lambda:len(requests)>index,12)
-                    assert scan_complete(),observation_events
-                    assert any(p['usable'] and p['goal_id']==requests[index].goal_id for p in plans)
-                    print('PASS unobserved tread blocks advance until a scan supplies new returns')
+                        recorded_gap=any(any(abs(b['point'][0]-2.)<.05
+                            for b in s.get('pct_floor',{}).get('unknown_blockers',[])) for s in states)
+                        observing=any(s['state'] in ('cross_layer_support_scan','cross_layer_stair_gap_scan',
+                                                    'pct_blocker_scan') for s in states)
+                        if recorded_gap and observing and not filled:
+                            points += [(1.965+i*.015,-1.+j*.02,.26)
+                                       for i in range(6) for j in range(101)]
+                            filled=True
+                        if shift_index<len(shifts):
+                            action,sx,sy,tx,ty,heading,*kind=shifts[shift_index].data.split('|')
+                            assert .20<=math.hypot(float(tx)-float(sx),float(ty)-float(sy))<=.60+1e-6
+                            base_position[:2]=[float(tx),float(ty)]
+                            shift_result.publish(String(data=action+'|succeeded'));shift_index+=1
+                        if index>=len(requests):continue
+                        request=requests[index];p=request.target.pose.position
+                        if not filled:assert p.x<2. and p.z<=.65,'route crossed the unobserved strip'
+                        if filled and p.x>2.1:
+                            assert any(q['usable'] and q['goal_id']==request.goal_id for q in plans)
+                            print('PASS safe partial movement and targeted scan resume ascent after measured gap closure')
+                            return 0
+                        forward(request.target);complete.publish(Bool(data=False))
+                        base_position[:]=[p.x,p.y,p.z]
+                        until=time.monotonic()+.35;spin_until(lambda:time.monotonic()>=until,2)
+                        ack.publish(request.target);complete.publish(Bool(data=True));index+=1
+                    raise AssertionError('no ascent after gap repair; filled='+str(filled)+' state='+str(states[-1])[:2000])
                     return 0
                 if fast_floor_test:
                     spin_until(lambda:any(s['state']=='pct_waiting_for_ascent' for s in states),18)
@@ -1065,12 +1213,13 @@ def main():
                 print('PASS verified ascent continues without fixed side sweeps; lower routes stay excluded')
                 return 0
             if pending_test:
-                spin_until(lambda:any(s['state']=='pct_local_search_pending' for s in states),25)
+                spin_until(lambda:any(s['state'] in ('pct_local_search_pending','navigation_compute_retry') for s in states),25)
                 until=time.monotonic()+3.
                 spin_until(lambda:time.monotonic()>=until,5)
                 assert goals and all(g['selection_scope']=='local' for g in goals),goals
                 assert any(p['reason']=='pct_planning_timeout' for p in plans),plans
                 assert not waypoints,'timeouts must not dispatch partial routes'
+                assert not observed_turns,'compute timeout alone must not start a scan'
                 assert not any(s['state'] in ('pct_local_exhausted','pct_region_complete') for s in states),states
                 print('PASS local timeout stays pending; no global fallback or false completion')
                 return 0

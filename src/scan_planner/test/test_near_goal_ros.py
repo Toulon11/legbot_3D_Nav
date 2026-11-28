@@ -29,6 +29,7 @@ from visualization_msgs.msg import Marker
 
 def main():
     budget_test='--init-budget' in sys.argv
+    failure_clear_test='--failure-clear' in sys.argv
     rclpy.init()
     node = rclpy.create_node('near_goal_regression')
     statuses, failures, acks, commands, forwarded = [], [], [], [], []
@@ -45,6 +46,7 @@ def main():
     odom = node.create_publisher(Odometry, '/near_goal_test/odom', 20)
     request = node.create_publisher(GoalRequest, '/scan/waypoint_request', 10)
     cloud = node.create_publisher(PointCloud2, '/grid_map/cloud', 10)
+    external_failure=node.create_publisher(String,'/scan/goal_plan_failed',10)
     done = []
     node.create_subscription(Bool, '/scan/mission_complete', lambda m: done.append(m.data),
                              QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL))
@@ -133,6 +135,22 @@ def main():
                '--dwell-seconds', '0.30'])
         wait(lambda: odom.get_subscription_count() >= 3 and request.get_subscription_count() > 0)
         pump(1.2)  # FSM startup sleeps for one second before spinning callbacks.
+        if failure_clear_test:
+            stamp=send(1.0,.15)
+            wait(lambda:bool(local_targets),10)
+            external_failure.publish(String(data=str(stamp-1)+'|execution_timeout'))
+            pump(.2)
+            assert not records(stamp,'planner','terminated'),'stale failure canceled a new goal'
+            external_failure.publish(String(data=str(stamp)+'|execution_timeout'))
+            wait(lambda:bool(records(stamp,'planner','terminated')))
+            pump(.2)
+            count=len(local_targets);pump(.4)
+            assert len(local_targets)==count,'failed goal kept replanning'
+            next_stamp=send(.1,.15)
+            wait(lambda:bool(records(next_stamp,'planner','accepted')))
+            assert not records(next_stamp,'planner','terminated')
+            print('PASS real FSM: matched execution failure clears old planning; stale receipt cannot cancel new goal')
+            return 0
         if budget_test:
             stamp=send(.6,.15)
             wait(lambda:any(m.data==str(stamp)+'|initialization_budget_exhausted' for m in failures))
